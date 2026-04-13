@@ -1,0 +1,11 @@
+types:
+  Task:
+    required:
+    - title
+    - status
+  Project:
+    required:
+    - name
+  Person:
+    required:
+    - name
