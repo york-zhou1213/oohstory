@@ -430,7 +430,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
             Divider(height: 1, indent: 52, color: theme.colorScheme.onSurface.withValues(alpha: 0.06)),
             _settingsTile(theme, Icons.history, '清除阅读历史', onTap: _clearHistoryConfirm),
             Divider(height: 1, indent: 52, color: theme.colorScheme.onSurface.withValues(alpha: 0.06)),
-            _settingsTile(theme, Icons.info_outline_rounded, '关于', subtitle: 'OohStory v1.2.0', onTap: _showAbout),
+            _settingsTile(theme, Icons.info_outline_rounded, '关于', subtitle: 'OohStory v1.3.0', onTap: _showAbout),
           ],
         ),
       ),
@@ -739,7 +739,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     showAboutDialog(
       context: context,
       applicationName: 'OohStory',
-      applicationVersion: 'v1.2.0',
+      applicationVersion: 'v1.3.0',
       applicationIcon: Container(
         width: 48, height: 48,
         decoration: BoxDecoration(
