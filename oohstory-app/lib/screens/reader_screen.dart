@@ -254,7 +254,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
                     return Padding(
                       padding: const EdgeInsets.fromLTRB(24, 80, 24, 24),
                       child: Text(
-                        _chapter?.title ?? '',
+                        _chapter?.displayTitle ?? '',
                         style: TextStyle(
                           fontSize: _fontSize + 4,
                           fontWeight: FontWeight.bold,
@@ -318,7 +318,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
               IconButton(icon: const Icon(Icons.arrow_back, color: Colors.white), onPressed: () => Navigator.of(context).pop()),
               Expanded(
                 child: Text(
-                  _chapter?.title ?? '',
+                  _chapter?.displayTitle ?? '',
                   style: const TextStyle(color: Colors.white, fontSize: 16),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
@@ -427,7 +427,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   return ListTile(
                     dense: true,
                     selected: isCurrent,
-                    title: Text(ch.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    title: Text(ch.displayTitle, maxLines: 1, overflow: TextOverflow.ellipsis),
                     onTap: () {
                       Navigator.of(ctx).pop();
                       _tts.stop();

@@ -13,6 +13,7 @@ class LibraryScreen extends StatefulWidget {
 class _LibraryScreenState extends State<LibraryScreen> {
   final _api = ApiService();
   final _searchController = TextEditingController();
+  final _scrollController = ScrollController();
   List<Book> _books = [];
   List<String> _categories = [];
   String? _selectedCategory;
@@ -21,12 +22,20 @@ class _LibraryScreenState extends State<LibraryScreen> {
   int _totalPages = 1;
   bool _loading = true;
   bool _loadingMore = false;
+  bool _searchFocused = false;
 
   @override
   void initState() {
     super.initState();
     _loadCategories();
     _loadBooks();
+    _scrollController.addListener(_onScroll);
+  }
+
+  void _onScroll() {
+    if (_scrollController.position.pixels > _scrollController.position.maxScrollExtent - 300) {
+      _loadMore();
+    }
   }
 
   Future<void> _loadCategories() async {
@@ -45,10 +54,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
         sort: _sort,
         page: _page,
       );
-      final books = (data['books'] as List)
+      final books = ((data['items'] ?? data['books']) as List)
           .map((e) => Book.fromJson(e as Map<String, dynamic>))
           .toList();
-      final total = data['total_pages'] as int? ?? 1;
+      final total = data['page_count'] as int? ?? data['total_pages'] as int? ?? 1;
       if (mounted) {
         setState(() {
           if (append) {
@@ -80,79 +89,176 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return Column(
       children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-          child: TextField(
-            controller: _searchController,
-            decoration: InputDecoration(
-              hintText: '搜索书名或作者…',
-              prefixIcon: const Icon(Icons.search),
-              filled: true,
-              fillColor: Theme.of(context).colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
-              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
-              contentPadding: const EdgeInsets.symmetric(vertical: 0),
-              suffixIcon: _searchController.text.isNotEmpty
-                  ? IconButton(icon: const Icon(Icons.clear), onPressed: () { _searchController.clear(); _search(); })
-                  : null,
-            ),
-            onSubmitted: (_) => _search(),
-          ),
-        ),
-        if (_categories.isNotEmpty)
-          SizedBox(
-            height: 40,
-            child: ListView(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              children: [
-                _categoryChip('全部', null),
-                ..._categories.map((c) => _categoryChip(c, c)),
-              ],
-            ),
-          ),
-        const SizedBox(height: 8),
-        Expanded(
-          child: _loading
-              ? const Center(child: CircularProgressIndicator())
-              : _books.isEmpty
-                  ? const Center(child: Text('没有找到相关书籍'))
-                  : NotificationListener<ScrollNotification>(
-                      onNotification: (n) {
-                        if (n.metrics.pixels > n.metrics.maxScrollExtent - 200) _loadMore();
-                        return false;
-                      },
-                      child: GridView.builder(
-                        padding: const EdgeInsets.symmetric(horizontal: 16),
-                        gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-                          maxCrossAxisExtent: 200,
-                          childAspectRatio: 0.58,
-                          mainAxisSpacing: 12,
-                          crossAxisSpacing: 12,
-                        ),
-                        itemCount: _books.length + (_loadingMore ? 1 : 0),
-                        itemBuilder: (context, i) {
-                          if (i >= _books.length) return const Center(child: CircularProgressIndicator());
-                          return BookCard(book: _books[i]);
-                        },
-                      ),
-                    ),
-        ),
+        _buildSearchBar(theme),
+        if (_categories.isNotEmpty) _buildCategoryRow(theme),
+        _buildSortRow(theme),
+        Expanded(child: _buildBookGrid(theme)),
       ],
     );
   }
 
-  Widget _categoryChip(String label, String? value) {
+  Widget _buildSearchBar(ThemeData theme) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 8),
+      child: Focus(
+        onFocusChange: (f) => setState(() => _searchFocused = f),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          decoration: BoxDecoration(
+            color: theme.inputDecorationTheme.fillColor,
+            borderRadius: BorderRadius.circular(14),
+            boxShadow: _searchFocused
+                ? [BoxShadow(color: theme.colorScheme.primary.withValues(alpha: 0.15), blurRadius: 12, offset: const Offset(0, 2))]
+                : [],
+          ),
+          child: TextField(
+            controller: _searchController,
+            decoration: InputDecoration(
+              hintText: '搜索书名、作者…',
+              hintStyle: TextStyle(color: theme.colorScheme.onSurface.withValues(alpha: 0.35), fontSize: 14),
+              prefixIcon: Icon(Icons.search, size: 20, color: theme.colorScheme.onSurface.withValues(alpha: 0.4)),
+              filled: false,
+              border: InputBorder.none,
+              contentPadding: const EdgeInsets.symmetric(vertical: 14),
+              suffixIcon: _searchController.text.isNotEmpty
+                  ? IconButton(
+                      icon: Icon(Icons.clear, size: 18, color: theme.colorScheme.onSurface.withValues(alpha: 0.4)),
+                      onPressed: () { _searchController.clear(); _search(); },
+                    )
+                  : null,
+            ),
+            onSubmitted: (_) => _search(),
+            onChanged: (_) => setState(() {}),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCategoryRow(ThemeData theme) {
+    return SizedBox(
+      height: 38,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        children: [
+          _categoryChip(theme, '全部', null),
+          ..._categories.map((c) => _categoryChip(theme, c, c)),
+        ],
+      ),
+    );
+  }
+
+  Widget _categoryChip(ThemeData theme, String label, String? value) {
     final selected = _selectedCategory == value;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 4),
-      child: FilterChip(
-        label: Text(label),
-        selected: selected,
-        onSelected: (_) {
+      child: GestureDetector(
+        onTap: () {
           setState(() { _selectedCategory = value; _page = 1; });
           _loadBooks();
+        },
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 7),
+          decoration: BoxDecoration(
+            color: selected ? theme.colorScheme.primary : theme.chipTheme.backgroundColor,
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+              color: selected ? Colors.white : theme.colorScheme.onSurface.withValues(alpha: 0.7),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSortRow(ThemeData theme) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 8, 20, 4),
+      child: Row(
+        children: [
+          Text(
+            '共 ${_books.length} 本',
+            style: theme.textTheme.labelMedium?.copyWith(color: theme.colorScheme.onSurface.withValues(alpha: 0.5)),
+          ),
+          const Spacer(),
+          PopupMenuButton<String>(
+            initialValue: _sort,
+            onSelected: (v) {
+              setState(() { _sort = v; _page = 1; });
+              _loadBooks();
+            },
+            itemBuilder: (ctx) => const [
+              PopupMenuItem(value: 'title', child: Text('按书名')),
+              PopupMenuItem(value: 'latest', child: Text('最新更新')),
+              PopupMenuItem(value: 'word_count', child: Text('按字数')),
+            ],
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.sort, size: 16, color: theme.colorScheme.primary),
+                const SizedBox(width: 4),
+                Text(
+                  _sort == 'title' ? '按书名' : _sort == 'latest' ? '最新更新' : '按字数',
+                  style: TextStyle(fontSize: 12, color: theme.colorScheme.primary, fontWeight: FontWeight.w500),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBookGrid(ThemeData theme) {
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_books.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.search_off, size: 48, color: theme.colorScheme.onSurface.withValues(alpha: 0.2)),
+            const SizedBox(height: 12),
+            Text('没有找到相关书籍', style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.onSurface.withValues(alpha: 0.4))),
+          ],
+        ),
+      );
+    }
+
+    return RefreshIndicator(
+      onRefresh: () async {
+        _page = 1;
+        await _loadBooks();
+      },
+      child: GridView.builder(
+        controller: _scrollController,
+        padding: const EdgeInsets.fromLTRB(20, 8, 20, 100),
+        gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+          maxCrossAxisExtent: 160,
+          childAspectRatio: 0.56,
+          mainAxisSpacing: 16,
+          crossAxisSpacing: 12,
+        ),
+        itemCount: _books.length + (_loadingMore ? 1 : 0),
+        itemBuilder: (context, i) {
+          if (i >= _books.length) {
+            return const Center(child: Padding(
+              padding: EdgeInsets.all(16),
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ));
+          }
+          return BookCard(book: _books[i]);
         },
       ),
     );
@@ -162,6 +268,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   void dispose() {
     _api.dispose();
     _searchController.dispose();
+    _scrollController.dispose();
     super.dispose();
   }
 }

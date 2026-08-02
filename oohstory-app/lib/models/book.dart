@@ -26,14 +26,14 @@ class Book {
   });
 
   factory Book.fromJson(Map<String, dynamic> json) => Book(
-        id: json['id'] as String,
+        id: (json['public_id'] ?? json['id'] ?? '') as String,
         title: json['title'] as String? ?? '',
         author: json['author'] as String? ?? '',
-        description: json['description'] as String?,
+        description: json['summary'] as String? ?? json['description'] as String?,
         category: json['category'] as String?,
-        wordCount: json['word_count'] as int?,
-        chapterCount: json['chapter_count'] as int?,
-        status: json['status'] as String?,
+        wordCount: json['approx_word_count'] as int? ?? json['word_count'] as int?,
+        chapterCount: json['approx_chapter_count'] as int? ?? json['chapter_count'] as int?,
+        status: json['serialization_status'] as String? ?? json['status'] as String?,
         coverUrl: json['cover_url'] as String?,
         views: json['views'] as int?,
         likes: json['likes'] as int?,
@@ -42,25 +42,36 @@ class Book {
 
 class Chapter {
   final String id;
+  final String? label;
   final String title;
   final int position;
   final String? content;
   final int? wordCount;
+  final String? previousId;
+  final String? nextId;
 
   Chapter({
     required this.id,
+    this.label,
     required this.title,
     required this.position,
     this.content,
     this.wordCount,
+    this.previousId,
+    this.nextId,
   });
 
+  String get displayTitle => label != null && label!.isNotEmpty ? '$label $title' : title;
+
   factory Chapter.fromJson(Map<String, dynamic> json) => Chapter(
-        id: json['id'] as String,
+        id: json['id'].toString(),
+        label: json['label'] as String?,
         title: json['title'] as String? ?? '',
-        position: json['position'] as int? ?? 0,
+        position: json['position'] as int? ?? json['id'] as int? ?? 0,
         content: json['content'] as String?,
-        wordCount: json['word_count'] as int?,
+        wordCount: json['word_count'] as int? ?? json['byte_count'] as int?,
+        previousId: json['previous_id']?.toString(),
+        nextId: json['next_id']?.toString(),
       );
 }
 
@@ -74,6 +85,7 @@ class Deconstruction {
   final int completedChapters;
   final int totalChapters;
   final List<DeconstructionDoc> documents;
+  final List<DeconstructionSubdir> subdirectories;
 
   Deconstruction({
     required this.slug,
@@ -85,6 +97,7 @@ class Deconstruction {
     this.completedChapters = 0,
     this.totalChapters = 0,
     this.documents = const [],
+    this.subdirectories = const [],
   });
 
   bool get isCompleted => progressPercent >= 100;
@@ -104,6 +117,10 @@ class Deconstruction {
                 ?.map((e) => DeconstructionDoc.fromJson(e as Map<String, dynamic>))
                 .toList() ??
             [],
+        subdirectories: (json['subdirectories'] as List?)
+                ?.map((e) => DeconstructionSubdir.fromJson(e as Map<String, dynamic>))
+                .toList() ??
+            [],
       );
 }
 
@@ -118,6 +135,52 @@ class DeconstructionDoc {
         filename: json['filename'] as String? ?? '',
         label: json['label'] as String? ?? '',
         content: json['content'] as String?,
+      );
+}
+
+class DeconstructionSubdir {
+  final String name;
+  final String label;
+  final List<DeconstructionEntry> items;
+
+  DeconstructionSubdir({required this.name, required this.label, required this.items});
+
+  factory DeconstructionSubdir.fromJson(Map<String, dynamic> json) => DeconstructionSubdir(
+        name: json['name'] as String? ?? '',
+        label: json['label'] as String? ?? '',
+        items: (json['items'] as List?)
+                ?.map((e) => DeconstructionEntry.fromJson(e as Map<String, dynamic>))
+                .toList() ??
+            [],
+      );
+}
+
+class DeconstructionEntry {
+  final String? filename;
+  final String label;
+  final String type;
+  final String? name;
+  final List<DeconstructionEntry> items;
+
+  DeconstructionEntry({
+    this.filename,
+    required this.label,
+    required this.type,
+    this.name,
+    this.items = const [],
+  });
+
+  bool get isDirectory => type == 'directory';
+
+  factory DeconstructionEntry.fromJson(Map<String, dynamic> json) => DeconstructionEntry(
+        filename: json['filename'] as String?,
+        label: json['label'] as String? ?? '',
+        type: json['type'] as String? ?? 'file',
+        name: json['name'] as String?,
+        items: (json['items'] as List?)
+                ?.map((e) => DeconstructionEntry.fromJson(e as Map<String, dynamic>))
+                .toList() ??
+            [],
       );
 }
 

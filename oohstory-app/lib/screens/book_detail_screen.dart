@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
 import '../models/book.dart';
+import '../theme/app_theme.dart';
 import 'reader_screen.dart';
 
 class BookDetailScreen extends StatefulWidget {
@@ -17,6 +18,7 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
   List<Chapter> _chapters = [];
   bool _loading = true;
   bool _catalogExpanded = false;
+  bool _descExpanded = false;
 
   @override
   void initState() {
@@ -44,8 +46,16 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
 
   String _formatWordCount(int? count) {
     if (count == null) return '';
+    if (count >= 100000000) return '${(count / 100000000).toStringAsFixed(1)}亿字';
     if (count >= 10000) return '${(count / 10000).toStringAsFixed(1)}万字';
     return '$count字';
+  }
+
+  String _statusLabel(String? s) {
+    if (s == null) return '';
+    if (s == 'finished' || s == '完结') return '已完结';
+    if (s == 'ongoing' || s == '连载') return '连载中';
+    return s;
   }
 
   void _openReader(String chapterId) {
@@ -64,116 +74,311 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
     return Scaffold(
       body: CustomScrollView(
         slivers: [
-          SliverAppBar(
-            expandedHeight: 240,
-            pinned: true,
-            flexibleSpace: FlexibleSpaceBar(
-              background: Container(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [theme.colorScheme.primaryContainer, theme.scaffoldBackgroundColor],
-                  ),
-                ),
-                child: SafeArea(
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(20, 56, 20, 16),
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        ClipRRect(
-                          borderRadius: BorderRadius.circular(8),
-                          child: Image.network(
-                            _api.coverUrl(widget.bookId),
-                            width: 100,
-                            height: 140,
-                            fit: BoxFit.cover,
-                            errorBuilder: (_, __, ___) => Container(
-                              width: 100, height: 140,
-                              color: theme.colorScheme.surfaceContainerHighest,
-                              child: const Icon(Icons.book, size: 40),
+          _buildAppBar(theme, book),
+          SliverToBoxAdapter(child: _buildInfoSection(theme, book)),
+          if (book.description != null && book.description!.isNotEmpty)
+            SliverToBoxAdapter(child: _buildDescription(theme, book)),
+          SliverToBoxAdapter(child: _buildChapterHeader(theme)),
+          _buildChapterList(theme),
+          const SliverToBoxAdapter(child: SizedBox(height: 100)),
+        ],
+      ),
+      bottomNavigationBar: _buildBottomBar(theme),
+    );
+  }
+
+  Widget _buildAppBar(ThemeData theme, Book book) {
+    return SliverAppBar(
+      expandedHeight: 280,
+      pinned: true,
+      stretch: true,
+      backgroundColor: theme.appBarTheme.backgroundColor,
+      flexibleSpace: FlexibleSpaceBar(
+        background: Container(
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [Color(0xFF6C5CE7), Color(0xFF8B7CF6), Color(0xFFA29BFE)],
+            ),
+          ),
+          child: SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 56, 20, 20),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Hero(
+                    tag: 'book_cover_${widget.bookId}',
+                    child: Container(
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(12),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.3),
+                            blurRadius: 20,
+                            offset: const Offset(0, 8),
+                          ),
+                        ],
+                      ),
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(12),
+                        child: Image.network(
+                          _api.coverUrl(widget.bookId),
+                          width: 110,
+                          height: 155,
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, __, ___) => Container(
+                            width: 110, height: 155,
+                            decoration: BoxDecoration(
+                              gradient: LinearGradient(
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                                colors: [Colors.white.withValues(alpha: 0.2), Colors.white.withValues(alpha: 0.05)],
+                              ),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Center(
+                              child: Text(
+                                book.title.length > 4 ? book.title.substring(0, 4) : book.title,
+                                style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w700),
+                                textAlign: TextAlign.center,
+                              ),
                             ),
                           ),
                         ),
-                        const SizedBox(width: 16),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Text(book.title, style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold), maxLines: 2, overflow: TextOverflow.ellipsis),
-                              const SizedBox(height: 8),
-                              Text(book.author, style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
-                              const SizedBox(height: 8),
-                              Wrap(
-                                spacing: 8, runSpacing: 4,
-                                children: [
-                                  if (book.category != null) Chip(label: Text(book.category!, style: const TextStyle(fontSize: 12)), padding: EdgeInsets.zero, materialTapTargetSize: MaterialTapTargetSize.shrinkWrap),
-                                  if (book.status != null) Chip(label: Text(book.status!, style: const TextStyle(fontSize: 12)), padding: EdgeInsets.zero, materialTapTargetSize: MaterialTapTargetSize.shrinkWrap),
-                                ],
-                              ),
-                              const SizedBox(height: 8),
-                              Text('${_formatWordCount(book.wordCount)} · ${book.chapterCount ?? _chapters.length}章', style: theme.textTheme.bodySmall),
-                            ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 18),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          book.title,
+                          style: const TextStyle(
+                            fontSize: 22,
+                            fontWeight: FontWeight.w800,
+                            color: Colors.white,
+                            height: 1.2,
+                            letterSpacing: -0.3,
                           ),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          book.author,
+                          style: TextStyle(fontSize: 14, color: Colors.white.withValues(alpha: 0.8)),
+                        ),
+                        const SizedBox(height: 12),
+                        Wrap(
+                          spacing: 8, runSpacing: 6,
+                          children: [
+                            if (book.category != null)
+                              _tagBadge(book.category!),
+                            if (book.status != null)
+                              _tagBadge(_statusLabel(book.status)),
+                          ],
                         ),
                       ],
                     ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-          if (book.description != null && book.description!.isNotEmpty)
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Text(book.description!, style: theme.textTheme.bodyMedium?.copyWith(height: 1.6), maxLines: 6, overflow: TextOverflow.ellipsis),
-              ),
-            ),
-          SliverToBoxAdapter(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-              child: Row(
-                children: [
-                  Text('目录 (${_chapters.length}章)', style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold)),
-                  const Spacer(),
-                  TextButton(
-                    onPressed: () => setState(() => _catalogExpanded = !_catalogExpanded),
-                    child: Text(_catalogExpanded ? '收起' : '展开全部'),
                   ),
                 ],
               ),
             ),
           ),
-          SliverList(
-            delegate: SliverChildBuilderDelegate(
-              (context, i) {
-                final ch = _chapters[i];
-                return ListTile(
-                  dense: true,
-                  title: Text(ch.title, maxLines: 1, overflow: TextOverflow.ellipsis),
-                  trailing: ch.wordCount != null ? Text('${ch.wordCount}字', style: theme.textTheme.bodySmall) : null,
-                  onTap: () => _openReader(ch.id),
-                );
-              },
-              childCount: _catalogExpanded ? _chapters.length : _chapters.length.clamp(0, 20),
-            ),
-          ),
-          const SliverToBoxAdapter(child: SizedBox(height: 100)),
+        ),
+      ),
+    );
+  }
+
+  Widget _tagBadge(String label) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.18),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.2)),
+      ),
+      child: Text(label, style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w500)),
+    );
+  }
+
+  Widget _buildInfoSection(ThemeData theme, Book book) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 20, 20, 8),
+      child: Row(
+        children: [
+          _infoTile(theme, _formatWordCount(book.wordCount), '总字数'),
+          _divider(theme),
+          _infoTile(theme, '${book.chapterCount ?? _chapters.length}', '章节'),
+          _divider(theme),
+          _infoTile(theme, _statusLabel(book.status ?? ''), '状态'),
         ],
       ),
-      bottomNavigationBar: SafeArea(
+    );
+  }
+
+  Widget _infoTile(ThemeData theme, String value, String label) {
+    return Expanded(
+      child: Column(
+        children: [
+          Text(
+            value,
+            style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700, color: AppTheme.seedPurple),
+          ),
+          const SizedBox(height: 2),
+          Text(label, style: theme.textTheme.labelSmall?.copyWith(color: theme.colorScheme.onSurface.withValues(alpha: 0.45))),
+        ],
+      ),
+    );
+  }
+
+  Widget _divider(ThemeData theme) {
+    return Container(
+      width: 1, height: 28,
+      color: theme.colorScheme.onSurface.withValues(alpha: 0.08),
+    );
+  }
+
+  Widget _buildDescription(ThemeData theme, Book book) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('简介', style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 8),
+          GestureDetector(
+            onTap: () => setState(() => _descExpanded = !_descExpanded),
+            child: AnimatedCrossFade(
+              firstChild: Text(
+                book.description!,
+                style: theme.textTheme.bodyMedium?.copyWith(height: 1.6, color: theme.colorScheme.onSurface.withValues(alpha: 0.7)),
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
+              secondChild: Text(
+                book.description!,
+                style: theme.textTheme.bodyMedium?.copyWith(height: 1.6, color: theme.colorScheme.onSurface.withValues(alpha: 0.7)),
+              ),
+              crossFadeState: _descExpanded ? CrossFadeState.showSecond : CrossFadeState.showFirst,
+              duration: const Duration(milliseconds: 200),
+            ),
+          ),
+          if (!_descExpanded && (book.description?.length ?? 0) > 100)
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton(
+                onPressed: () => setState(() => _descExpanded = true),
+                style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(0, 32)),
+                child: Text('展开', style: TextStyle(fontSize: 12, color: AppTheme.seedPurple)),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildChapterHeader(ThemeData theme) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+      child: Row(
+        children: [
+          Text('目录', style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
+          const SizedBox(width: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            decoration: BoxDecoration(
+              color: AppTheme.seedPurple.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(
+              '${_chapters.length}章',
+              style: TextStyle(fontSize: 11, color: AppTheme.seedPurple, fontWeight: FontWeight.w600),
+            ),
+          ),
+          const Spacer(),
+          TextButton.icon(
+            onPressed: () => setState(() => _catalogExpanded = !_catalogExpanded),
+            icon: Icon(_catalogExpanded ? Icons.unfold_less : Icons.unfold_more, size: 16),
+            label: Text(_catalogExpanded ? '收起' : '展开全部', style: const TextStyle(fontSize: 12)),
+            style: TextButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 8)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildChapterList(ThemeData theme) {
+    final showCount = _catalogExpanded ? _chapters.length : _chapters.length.clamp(0, 20);
+    return SliverList(
+      delegate: SliverChildBuilderDelegate(
+        (context, i) {
+          final ch = _chapters[i];
+          return Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: ListTile(
+              dense: true,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              leading: Container(
+                width: 28, height: 28,
+                decoration: BoxDecoration(
+                  color: AppTheme.seedPurple.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(7),
+                ),
+                child: Center(
+                  child: Text(
+                    '${i + 1}',
+                    style: TextStyle(fontSize: 11, color: AppTheme.seedPurple, fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ),
+              title: Text(
+                ch.displayTitle,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w500),
+              ),
+              trailing: ch.wordCount != null
+                  ? Text(
+                      '${ch.wordCount}字',
+                      style: TextStyle(fontSize: 11, color: theme.colorScheme.onSurface.withValues(alpha: 0.4)),
+                    )
+                  : null,
+              onTap: () => _openReader(ch.id),
+            ),
+          );
+        },
+        childCount: showCount,
+      ),
+    );
+  }
+
+  Widget _buildBottomBar(ThemeData theme) {
+    return Container(
+      decoration: BoxDecoration(
+        color: theme.scaffoldBackgroundColor,
+        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.05), blurRadius: 10, offset: const Offset(0, -2))],
+      ),
+      child: SafeArea(
+        top: false,
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+          padding: const EdgeInsets.fromLTRB(20, 10, 20, 10),
           child: Row(
             children: [
               Expanded(
                 child: FilledButton.icon(
                   onPressed: _chapters.isNotEmpty ? () => _openReader(_chapters.first.id) : null,
-                  icon: const Icon(Icons.play_arrow),
+                  icon: const Icon(Icons.auto_stories, size: 18),
                   label: const Text('开始阅读'),
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                  ),
                 ),
               ),
             ],

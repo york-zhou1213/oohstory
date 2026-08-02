@@ -19,7 +19,12 @@ class ApiService {
 
   Future<List<String>> getCategories() async {
     final data = await _getJson('/api/v1/categories');
-    return (data['categories'] as List).cast<String>();
+    final list = (data['items'] ?? data['categories'] ?? []) as List;
+    return list.map((e) {
+      if (e is String) return e;
+      if (e is Map) return (e['name'] ?? '') as String;
+      return e.toString();
+    }).where((s) => s.isNotEmpty).toList();
   }
 
   Future<Map<String, dynamic>> getBooks({
@@ -36,7 +41,7 @@ class ApiService {
       'page_size': pageSize.toString(),
     };
     if (category != null && category.isNotEmpty) params['category'] = category;
-    if (status != null && status.isNotEmpty) params['status'] = status;
+    if (status != null && status.isNotEmpty) params['serialization'] = status;
     if (query != null && query.isNotEmpty) params['q'] = query;
     final uri = Uri.parse('$baseUrl/api/v1/books').replace(queryParameters: params);
     final response = await _client.get(uri);
@@ -56,7 +61,8 @@ class ApiService {
 
   Future<List<Chapter>> getChapters(String bookId) async {
     final data = await _getJson('/api/v1/books/$bookId/chapters');
-    return (data['chapters'] as List)
+    final list = (data['chapters'] ?? data['items'] ?? []) as List;
+    return list
         .map((e) => Chapter.fromJson(e as Map<String, dynamic>))
         .toList();
   }
@@ -64,6 +70,12 @@ class ApiService {
   Future<Chapter> getChapter(String bookId, String chapterId) async {
     final data = await _getJson('/api/v1/books/$bookId/chapters/$chapterId');
     return Chapter.fromJson(data);
+  }
+
+  String fullCoverUrl(String? relativePath) {
+    if (relativePath == null || relativePath.isEmpty) return '';
+    if (relativePath.startsWith('http')) return relativePath;
+    return '$baseUrl$relativePath';
   }
 
   Future<List<Deconstruction>> getDeconstructions() async {
@@ -75,6 +87,9 @@ class ApiService {
 
   Future<Map<String, dynamic>> getDeconstruction(String slug) =>
       _getJson('/api/v1/deconstructions/$slug');
+
+  Future<Map<String, dynamic>> getDeconstructionFile(String slug, String subpath) =>
+      _getJson('/api/v1/deconstructions/$slug/file/$subpath');
 
   Future<List<TtsVoice>> getTtsVoices() async {
     final data = await _getJson('/api/v1/tts/voices');
