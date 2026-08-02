@@ -3,6 +3,7 @@ import 'theme/app_theme.dart';
 import 'screens/home_screen.dart';
 import 'screens/library_screen.dart';
 import 'screens/deconstruction_screen.dart';
+import 'screens/profile_screen.dart';
 
 void main() {
   runApp(const OohStoryApp());
@@ -38,13 +39,14 @@ class _MainShellState extends State<MainShell> {
     HomeScreen(),
     LibraryScreen(),
     DeconstructionScreen(),
+    ProfileScreen(),
   ];
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(['发现', '书库', '拆书档案'][_currentIndex]),
+        title: Text(['发现', '书库', '拆书档案', '我的'][_currentIndex]),
       ),
       body: IndexedStack(
         index: _currentIndex,
@@ -57,6 +59,7 @@ class _MainShellState extends State<MainShell> {
           NavigationDestination(icon: Icon(Icons.explore), label: '发现'),
           NavigationDestination(icon: Icon(Icons.library_books), label: '书库'),
           NavigationDestination(icon: Icon(Icons.analytics), label: '拆书'),
+          NavigationDestination(icon: Icon(Icons.person), label: '我的'),
         ],
       ),
     );

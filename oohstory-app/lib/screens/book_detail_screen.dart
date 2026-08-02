@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
+import '../services/local_storage_service.dart';
 import '../models/book.dart';
 import '../theme/app_theme.dart';
 import 'reader_screen.dart';
@@ -14,11 +15,15 @@ class BookDetailScreen extends StatefulWidget {
 
 class _BookDetailScreenState extends State<BookDetailScreen> {
   final _api = ApiService();
+  final _storage = LocalStorageService();
   Book? _book;
   List<Chapter> _chapters = [];
   bool _loading = true;
   bool _catalogExpanded = false;
   bool _descExpanded = false;
+  bool _isFavorite = false;
+  bool _downloading = false;
+  int _downloadedCount = 0;
 
   @override
   void initState() {
@@ -27,6 +32,7 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
   }
 
   Future<void> _load() async {
+    await _storage.init();
     try {
       final results = await Future.wait([
         _api.getBook(widget.bookId),
@@ -37,10 +43,55 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
           _book = results[0] as Book;
           _chapters = results[1] as List<Chapter>;
           _loading = false;
+          _isFavorite = _storage.isFavorite(widget.bookId);
+          _downloadedCount = _storage.downloadedChapterCount(widget.bookId);
         });
       }
     } catch (_) {
       if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  void _toggleFavorite() {
+    if (_book == null) return;
+    _storage.toggleFavorite(_book!);
+    setState(() => _isFavorite = !_isFavorite);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(_isFavorite ? '已加入收藏' : '已取消收藏'),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 1),
+      ),
+    );
+  }
+
+  Future<void> _downloadAll() async {
+    if (_book == null || _downloading) return;
+    setState(() => _downloading = true);
+
+    int downloaded = 0;
+    for (final ch in _chapters) {
+      if (_storage.isChapterDownloaded(_book!.id, ch.id)) {
+        downloaded++;
+        continue;
+      }
+      try {
+        final full = await _api.getChapter(_book!.id, ch.id);
+        if (full.content != null && full.content!.isNotEmpty) {
+          await _storage.downloadChapter(_book!, full, full.content!);
+          downloaded++;
+          if (mounted) setState(() => _downloadedCount = downloaded);
+        }
+      } catch (_) {}
+    }
+    if (mounted) {
+      setState(() => _downloading = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('下载完成，共$downloaded章'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
     }
   }
 
@@ -60,7 +111,7 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
 
   void _openReader(String chapterId) {
     Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => ReaderScreen(bookId: widget.bookId, chapterId: chapterId, chapters: _chapters),
+      builder: (_) => ReaderScreen(bookId: widget.bookId, chapterId: chapterId, chapters: _chapters, book: _book),
     ));
   }
 
@@ -367,9 +418,29 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
       child: SafeArea(
         top: false,
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 10, 20, 10),
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
           child: Row(
             children: [
+              _bottomIconBtn(
+                icon: _isFavorite ? Icons.favorite : Icons.favorite_border,
+                label: _isFavorite ? '已收藏' : '收藏',
+                color: _isFavorite ? AppTheme.accentPink : theme.colorScheme.onSurface.withValues(alpha: 0.6),
+                onTap: _toggleFavorite,
+              ),
+              const SizedBox(width: 4),
+              _bottomIconBtn(
+                icon: _downloading ? Icons.downloading : Icons.download_outlined,
+                label: _downloading
+                    ? '$_downloadedCount/${_chapters.length}'
+                    : _downloadedCount > 0
+                        ? '$_downloadedCount章'
+                        : '下载',
+                color: _downloadedCount > 0
+                    ? const Color(0xFF00B894)
+                    : theme.colorScheme.onSurface.withValues(alpha: 0.6),
+                onTap: _downloading ? null : _downloadAll,
+              ),
+              const SizedBox(width: 8),
               Expanded(
                 child: FilledButton.icon(
                   onPressed: _chapters.isNotEmpty ? () => _openReader(_chapters.first.id) : null,
@@ -383,6 +454,24 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
               ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+
+  Widget _bottomIconBtn({required IconData icon, required String label, required Color color, VoidCallback? onTap}) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(10),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 22, color: color),
+            const SizedBox(height: 2),
+            Text(label, style: TextStyle(fontSize: 10, color: color, fontWeight: FontWeight.w500)),
+          ],
         ),
       ),
     );

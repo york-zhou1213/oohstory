@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import '../models/book.dart';
 import '../services/api_service.dart';
+import '../services/local_storage_service.dart';
 import '../services/reading_progress.dart' show ReadingProgressService;
 import '../services/tts_service.dart';
 
@@ -11,12 +12,14 @@ class ReaderScreen extends StatefulWidget {
   final String bookId;
   final String chapterId;
   final List<Chapter> chapters;
+  final Book? book;
 
   const ReaderScreen({
     super.key,
     required this.bookId,
     required this.chapterId,
     required this.chapters,
+    this.book,
   });
 
   @override
@@ -26,6 +29,7 @@ class ReaderScreen extends StatefulWidget {
 class _ReaderScreenState extends State<ReaderScreen> {
   final _api = ApiService();
   final _progress = ReadingProgressService();
+  final _storage = LocalStorageService();
   late TtsService _tts;
   final ItemScrollController _scrollCtrl = ItemScrollController();
   final ItemPositionsListener _positionsListener = ItemPositionsListener.create();
@@ -65,13 +69,23 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   Future<void> _loadSettings() async {
     await _progress.init();
+    await _storage.init();
   }
 
   Future<void> _loadChapter() async {
     setState(() => _loading = true);
     try {
-      final ch = await _api.getChapter(widget.bookId, _currentChapterId);
-      final content = ch.content ?? '';
+      String content;
+      final cached = await _storage.getDownloadedContent(widget.bookId, _currentChapterId);
+      Chapter ch;
+      if (cached != null) {
+        final idx = widget.chapters.indexWhere((c) => c.id == _currentChapterId);
+        ch = idx >= 0 ? widget.chapters[idx] : await _api.getChapter(widget.bookId, _currentChapterId);
+        content = cached;
+      } else {
+        ch = await _api.getChapter(widget.bookId, _currentChapterId);
+        content = ch.content ?? '';
+      }
       final paras = content.split(RegExp(r'\n+')).where((p) => p.trim().isNotEmpty).toList();
       if (mounted) {
         setState(() {
@@ -81,6 +95,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
           _ttsHighlight = -1;
         });
         _progress.save(widget.bookId, _currentChapterId, 0.0);
+        if (widget.book != null) {
+          _storage.recordRead(widget.book!, _currentChapterId, ch.displayTitle);
+        }
       }
     } catch (_) {
       if (mounted) setState(() => _loading = false);
