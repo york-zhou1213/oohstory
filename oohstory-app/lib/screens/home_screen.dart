@@ -156,7 +156,7 @@ class _HomeScreenState extends State<HomeScreen> {
           SliverToBoxAdapter(child: _buildSearchBar(theme, isDark)),
           if (_lastRead != null)
             SliverToBoxAdapter(child: _buildContinueReading(theme, isDark)),
-          SliverToBoxAdapter(child: _buildStats(theme, isDark)),
+          // stats removed
           if (_recommendations.isNotEmpty) ...[
             SliverToBoxAdapter(child: _sectionHeader(theme, '人气推荐', '每日精选', Icons.local_fire_department_rounded)),
             SliverToBoxAdapter(child: _buildHorizontalBookScroll(theme, _recommendations)),
@@ -708,79 +708,80 @@ class _HomeScreenState extends State<HomeScreen> {
     return GestureDetector(
       onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => BookDetailScreen(bookId: book.id))),
       child: Container(
-        margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+        margin: const EdgeInsets.fromLTRB(12, 6, 12, 0),
         decoration: BoxDecoration(
-          color: isDark ? const Color(0xFF1A1A2E) : Colors.white,
+          gradient: isDark ? null : const LinearGradient(
+            begin: Alignment.topLeft, end: Alignment.bottomRight,
+            colors: [Color(0xFFF4FAFF), Color(0xFFEAF5FF), Color(0xFFDBEEFF)],
+          ),
+          color: isDark ? const Color(0xFF1A1A2E) : null,
           borderRadius: BorderRadius.circular(12),
           border: Border.all(color: isDark ? Colors.white10 : const Color(0xFFDBEAFA)),
           boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.06), blurRadius: 12, offset: const Offset(0, 4))],
         ),
         child: Column(
           children: [
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                ClipRRect(
-                  borderRadius: const BorderRadius.only(topLeft: Radius.circular(12), bottomLeft: Radius.circular(12)),
-                  child: AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 400),
-                    child: Image.network(
-                      coverUrl,
-                      key: ValueKey(book.id),
-                      width: 120,
-                      height: 150,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, __, ___) => Container(
-                        width: 120, height: 150,
-                        decoration: BoxDecoration(
-                          gradient: LinearGradient(
-                            begin: Alignment.topLeft, end: Alignment.bottomRight,
-                            colors: [theme.colorScheme.primaryContainer, theme.colorScheme.tertiaryContainer],
+            IntrinsicHeight(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  ClipRRect(
+                    borderRadius: const BorderRadius.only(topLeft: Radius.circular(12)),
+                    child: AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 400),
+                      child: Image.network(
+                        coverUrl,
+                        key: ValueKey(book.id),
+                        width: 120,
+                        fit: BoxFit.cover,
+                        errorBuilder: (_, __, ___) => Container(
+                          width: 120,
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              begin: Alignment.topLeft, end: Alignment.bottomRight,
+                              colors: [theme.colorScheme.primaryContainer, theme.colorScheme.tertiaryContainer],
+                            ),
                           ),
+                          child: Center(child: Text(book.title.length > 2 ? book.title.substring(0, 2) : book.title, style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: theme.colorScheme.onPrimaryContainer))),
                         ),
-                        child: Center(child: Text(book.title.length > 2 ? book.title.substring(0, 2) : book.title, style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: theme.colorScheme.onPrimaryContainer))),
                       ),
                     ),
                   ),
-                ),
-                Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(children: [
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-                            decoration: BoxDecoration(
-                              color: AppTheme.seedPurple.withValues(alpha: 0.12),
-                              borderRadius: BorderRadius.circular(4),
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(children: [
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                              decoration: BoxDecoration(
+                                color: AppTheme.seedPurple.withValues(alpha: 0.12),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(book.category ?? '小说', style: TextStyle(fontSize: 9, fontWeight: FontWeight.w700, color: AppTheme.seedPurple)),
                             ),
-                            child: Text(book.category ?? '小说', style: TextStyle(fontSize: 9, fontWeight: FontWeight.w700, color: AppTheme.seedPurple)),
-                          ),
-                          const SizedBox(width: 6),
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                            decoration: BoxDecoration(color: statusBg, borderRadius: BorderRadius.circular(4)),
-                            child: Text(statusText, style: TextStyle(fontSize: 8, fontWeight: FontWeight.w700, color: statusColor)),
-                          ),
-                        ]),
-                        const SizedBox(height: 6),
-                        Text(book.title, maxLines: 1, overflow: TextOverflow.ellipsis, style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700, fontSize: 15, letterSpacing: -0.01)),
-                        const SizedBox(height: 4),
-                        Text(
-                          [book.author, if (book.wordCount != null) _formatWordCount(book.wordCount!), if (book.chapterCount != null) '${book.chapterCount}章'].join(' · '),
-                          style: TextStyle(fontSize: 10, color: theme.colorScheme.onSurface.withValues(alpha: 0.5)),
-                        ),
-                        if (book.description != null && book.description!.isNotEmpty) ...[
+                            const SizedBox(width: 6),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                              decoration: BoxDecoration(color: statusBg, borderRadius: BorderRadius.circular(4)),
+                              child: Text(statusText, style: TextStyle(fontSize: 8, fontWeight: FontWeight.w700, color: statusColor)),
+                            ),
+                          ]),
                           const SizedBox(height: 6),
-                          Text(book.description!, maxLines: 2, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 11, height: 1.4, color: theme.colorScheme.onSurface.withValues(alpha: 0.6))),
+                          Text(book.title, maxLines: 1, overflow: TextOverflow.ellipsis, style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700, fontSize: 15, letterSpacing: -0.01)),
+                          const SizedBox(height: 4),
+                          Text(
+                            [book.author, if (book.wordCount != null) _formatWordCount(book.wordCount!), if (book.chapterCount != null) '${book.chapterCount}章'].join(' · '),
+                            style: TextStyle(fontSize: 10, color: theme.colorScheme.onSurface.withValues(alpha: 0.5)),
+                          ),
                         ],
-                      ],
+                      ),
                     ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
             if (heroBooks.length > 1)
               Padding(
@@ -799,8 +800,8 @@ class _HomeScreenState extends State<HomeScreen> {
                         duration: const Duration(milliseconds: 200),
                         opacity: isActive ? 1.0 : 0.4,
                         child: Container(
-                          width: 22, height: 30,
-                          margin: EdgeInsets.only(right: i < heroBooks.length - 1 ? 4 : 0),
+                          width: 20, height: 27,
+                          margin: EdgeInsets.only(right: i < heroBooks.length - 1 ? 2 : 0),
                           decoration: BoxDecoration(
                             borderRadius: BorderRadius.circular(3),
                             border: Border.all(color: isActive ? AppTheme.seedPurple : Colors.transparent, width: 1.5),

@@ -6,6 +6,9 @@ import '../services/reading_progress.dart';
 import '../theme/app_theme.dart';
 import 'book_detail_screen.dart';
 import 'local_reader_screen.dart';
+import 'bookshelf_page.dart';
+import 'history_page.dart';
+import 'favorites_page.dart';
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -247,35 +250,48 @@ class _ProfileScreenState extends State<ProfileScreen> {
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
       child: Row(
         children: [
-          _statCard(theme, cardColor, '${_history.length}', '已读', Icons.auto_stories, const Color(0xFF6C5CE7)),
+          _statCard(theme, cardColor, '${_history.length}', '已读', Icons.auto_stories, const Color(0xFF6C5CE7),
+            onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const HistoryPage())).then((_) => _refresh())),
           const SizedBox(width: 10),
-          _statCard(theme, cardColor, '${_favorites.length}', '收藏', Icons.favorite, const Color(0xFFFD79A8)),
+          _statCard(theme, cardColor, '${_favorites.length}', '收藏', Icons.favorite, const Color(0xFFFD79A8),
+            onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const FavoritesPage())).then((_) => _refresh())),
           const SizedBox(width: 10),
-          _statCard(theme, cardColor, '${_localBooks.length}', '书架', Icons.shelves, const Color(0xFF00B894)),
+          _statCard(theme, cardColor, '${_localBooks.length}', '书架', Icons.shelves, const Color(0xFF00B894),
+            onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const BookshelfPage())).then((_) => _refresh())),
         ],
       ),
     );
   }
 
-  Widget _statCard(ThemeData theme, Color cardColor, String value, String label, IconData icon, Color accent) {
+  Widget _statCard(ThemeData theme, Color cardColor, String value, String label, IconData icon, Color accent, {VoidCallback? onTap}) {
     return Expanded(
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 16),
-        decoration: BoxDecoration(
-          color: cardColor,
-          borderRadius: BorderRadius.circular(14),
-          boxShadow: [
-            BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 8, offset: const Offset(0, 2)),
-          ],
-        ),
-        child: Column(
-          children: [
-            Icon(icon, color: accent, size: 22),
-            const SizedBox(height: 6),
-            Text(value, style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: accent)),
-            const SizedBox(height: 2),
-            Text(label, style: TextStyle(fontSize: 11, color: theme.colorScheme.onSurface.withValues(alpha: 0.5))),
-          ],
+      child: GestureDetector(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          decoration: BoxDecoration(
+            color: cardColor,
+            borderRadius: BorderRadius.circular(14),
+            boxShadow: [
+              BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 8, offset: const Offset(0, 2)),
+            ],
+          ),
+          child: Column(
+            children: [
+              Icon(icon, color: accent, size: 22),
+              const SizedBox(height: 6),
+              Text(value, style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: accent)),
+              const SizedBox(height: 2),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(label, style: TextStyle(fontSize: 11, color: theme.colorScheme.onSurface.withValues(alpha: 0.5))),
+                  const SizedBox(width: 2),
+                  Icon(Icons.chevron_right, size: 14, color: theme.colorScheme.onSurface.withValues(alpha: 0.3)),
+                ],
+              ),
+            ],
+          ),
         ),
       ),
     );
