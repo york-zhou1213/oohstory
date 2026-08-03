@@ -19,6 +19,11 @@ String heroSynopsisFor(Book book) {
       : description;
 }
 
+String heroChapterCountLabelFor(Book book) {
+  final count = book.chapterCount;
+  return '${count != null && count > 0 ? count : '?'}章';
+}
+
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
@@ -1110,8 +1115,7 @@ class _HomeScreenState extends State<HomeScreen> {
                               book.author,
                               if (book.wordCount != null)
                                 _formatWordCount(book.wordCount!),
-                              if (book.chapterCount != null)
-                                '${book.chapterCount}章',
+                              heroChapterCountLabelFor(book),
                             ].join(' · '),
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
