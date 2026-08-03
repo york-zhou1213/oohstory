@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:file_picker/file_picker.dart';
 import '../services/api_service.dart';
 import '../services/local_storage_service.dart';
 import '../services/reading_progress.dart';
 import '../theme/app_theme.dart';
 import 'book_detail_screen.dart';
+import 'local_reader_screen.dart';
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -21,6 +23,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   List<HistoryEntry> _history = [];
   List<BookMeta> _favorites = [];
   List<DownloadedBookInfo> _downloads = [];
+  List<LocalBookInfo> _localBooks = [];
   int _totalDownloadSize = 0;
 
   @override
@@ -41,6 +44,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
       _history = _storage.getHistory();
       _favorites = _storage.getFavorites();
       _downloads = _storage.getDownloadedBooks();
+      _localBooks = _storage.getLocalBooks();
     });
     _storage.totalDownloadSize().then((size) {
       if (mounted) setState(() => _totalDownloadSize = size);
@@ -51,6 +55,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
     Navigator.of(context)
         .push(MaterialPageRoute(builder: (_) => BookDetailScreen(bookId: bookId)))
         .then((_) => _refresh());
+  }
+
+  void _openLocalBook(LocalBookInfo book) {
+    Navigator.of(context)
+        .push(MaterialPageRoute(builder: (_) => LocalReaderScreen(book: book)));
   }
 
   String _formatSize(int bytes) {
@@ -70,6 +79,36 @@ class _ProfileScreenState extends State<ProfileScreen> {
     return '${dt.month}月${dt.day}日';
   }
 
+  Future<void> _importLocalBook() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['txt'],
+      allowMultiple: false,
+    );
+    if (result == null || result.files.isEmpty) return;
+    final file = result.files.first;
+    if (file.path == null) return;
+
+    try {
+      await _storage.importLocalBook(file.path!, file.name);
+      _refresh();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('已导入「${file.name.replaceAll(RegExp(r'\.(txt|TXT)$'), '')}」'),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('导入失败: $e'), behavior: SnackBarBehavior.floating),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!_initialized) return const Center(child: CircularProgressIndicator());
@@ -82,23 +121,70 @@ class _ProfileScreenState extends State<ProfileScreen> {
         slivers: [
           SliverToBoxAdapter(child: _buildHeader(theme, isDark)),
           SliverToBoxAdapter(child: _buildStatsRow(theme, isDark)),
-          if (_history.isNotEmpty) ...[
-            _buildSectionHeader(theme, '继续阅读', Icons.menu_book_rounded, onSeeAll: () => _showHistorySheet(context)),
-            SliverToBoxAdapter(child: _buildReadingShelf(theme, isDark)),
-          ],
-          if (_favorites.isNotEmpty) ...[
-            _buildSectionHeader(theme, '我的收藏', Icons.favorite_rounded, count: _favorites.length, onSeeAll: () => _showFavoritesSheet(context)),
-            SliverToBoxAdapter(child: _buildFavoritesGrid(theme, isDark)),
-          ],
-          if (_downloads.isNotEmpty) ...[
-            _buildSectionHeader(theme, '离线下载', Icons.download_done_rounded, count: _downloads.fold<int>(0, (s, d) => s + d.chapters.length)),
-            SliverToBoxAdapter(child: _buildDownloadsList(theme, isDark)),
-          ],
+
+          // 我的书架 (local books)
+          _buildSectionHeader(theme, '我的书架', Icons.library_books_rounded,
+            count: _localBooks.length,
+            action: _importLocalBook,
+            actionLabel: '导入',
+            actionIcon: Icons.add_rounded,
+          ),
+          SliverToBoxAdapter(child: _buildBookshelf(theme, isDark)),
+
+          // 继续阅读
+          _buildSectionHeader(theme, '继续阅读', Icons.menu_book_rounded,
+            count: _history.length,
+            onSeeAll: _history.isNotEmpty ? () => _showHistorySheet(context) : null,
+          ),
+          SliverToBoxAdapter(child: _history.isNotEmpty
+            ? _buildReadingShelf(theme, isDark)
+            : _emptyHint(theme, '还没有阅读记录', '去书库逛逛吧'),
+          ),
+
+          // 我的收藏
+          _buildSectionHeader(theme, '我的收藏', Icons.favorite_rounded,
+            count: _favorites.length,
+            onSeeAll: _favorites.isNotEmpty ? () => _showFavoritesSheet(context) : null,
+          ),
+          SliverToBoxAdapter(child: _favorites.isNotEmpty
+            ? _buildFavoritesGrid(theme, isDark)
+            : _emptyHint(theme, '还没有收藏', '浏览书籍时点击收藏按钮'),
+          ),
+
+          // 离线下载
+          _buildSectionHeader(theme, '离线下载', Icons.download_done_rounded,
+            count: _downloads.fold<int>(0, (s, d) => s + d.chapters.length),
+          ),
+          SliverToBoxAdapter(child: _downloads.isNotEmpty
+            ? _buildDownloadsList(theme, isDark)
+            : _emptyHint(theme, '还没有下载', '在书籍详情页点击下载按钮'),
+          ),
+
           SliverToBoxAdapter(child: _buildSettingsSection(theme, isDark)),
-          if (_history.isEmpty && _favorites.isEmpty && _downloads.isEmpty)
-            SliverToBoxAdapter(child: _buildEmptyState(theme)),
           const SliverToBoxAdapter(child: SizedBox(height: 100)),
         ],
+      ),
+    );
+  }
+
+  Widget _emptyHint(ThemeData theme, String title, String subtitle) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 24),
+        decoration: BoxDecoration(
+          color: theme.brightness == Brightness.dark ? const Color(0xFF1E1E30) : const Color(0xFFF8F8FC),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Column(
+          children: [
+            Icon(Icons.inbox_outlined, size: 28, color: theme.colorScheme.onSurface.withValues(alpha: 0.15)),
+            const SizedBox(height: 8),
+            Text(title, style: TextStyle(fontSize: 13, color: theme.colorScheme.onSurface.withValues(alpha: 0.4))),
+            const SizedBox(height: 2),
+            Text(subtitle, style: TextStyle(fontSize: 11, color: theme.colorScheme.onSurface.withValues(alpha: 0.25))),
+          ],
+        ),
       ),
     );
   }
@@ -165,7 +251,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
           const SizedBox(width: 10),
           _statCard(theme, cardColor, '${_favorites.length}', '收藏', Icons.favorite, const Color(0xFFFD79A8)),
           const SizedBox(width: 10),
-          _statCard(theme, cardColor, '${_downloads.fold(0, (int s, d) => s + d.chapters.length)}', '下载', Icons.download_done, const Color(0xFF00B894)),
+          _statCard(theme, cardColor, '${_localBooks.length}', '书架', Icons.shelves, const Color(0xFF00B894)),
         ],
       ),
     );
@@ -195,7 +281,13 @@ class _ProfileScreenState extends State<ProfileScreen> {
     );
   }
 
-  SliverToBoxAdapter _buildSectionHeader(ThemeData theme, String title, IconData icon, {int? count, VoidCallback? onSeeAll}) {
+  SliverToBoxAdapter _buildSectionHeader(ThemeData theme, String title, IconData icon, {
+    int? count,
+    VoidCallback? onSeeAll,
+    VoidCallback? action,
+    String? actionLabel,
+    IconData? actionIcon,
+  }) {
     return SliverToBoxAdapter(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(20, 20, 16, 8),
@@ -216,6 +308,17 @@ class _ProfileScreenState extends State<ProfileScreen> {
               ),
             ],
             const Spacer(),
+            if (action != null)
+              TextButton.icon(
+                onPressed: action,
+                icon: Icon(actionIcon ?? Icons.add, size: 16),
+                label: Text(actionLabel ?? '添加', style: const TextStyle(fontSize: 12)),
+                style: TextButton.styleFrom(
+                  foregroundColor: AppTheme.seedPurple,
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  minimumSize: const Size(0, 32),
+                ),
+              ),
             if (onSeeAll != null)
               TextButton(
                 onPressed: onSeeAll,
@@ -224,6 +327,156 @@ class _ProfileScreenState extends State<ProfileScreen> {
               ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildBookshelf(ThemeData theme, bool isDark) {
+    if (_localBooks.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
+        child: GestureDetector(
+          onTap: _importLocalBook,
+          child: Container(
+            padding: const EdgeInsets.symmetric(vertical: 28),
+            decoration: BoxDecoration(
+              color: isDark ? const Color(0xFF1E1E30) : const Color(0xFFF8F8FC),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: AppTheme.seedPurple.withValues(alpha: 0.15),
+                width: 1.5,
+                strokeAlign: BorderSide.strokeAlignInside,
+              ),
+            ),
+            child: Column(
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: AppTheme.seedPurple.withValues(alpha: 0.08),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(Icons.add_rounded, size: 28, color: AppTheme.seedPurple.withValues(alpha: 0.6)),
+                ),
+                const SizedBox(height: 10),
+                Text('导入本地小说', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: theme.colorScheme.onSurface.withValues(alpha: 0.5))),
+                const SizedBox(height: 4),
+                Text('支持 TXT 格式', style: TextStyle(fontSize: 11, color: theme.colorScheme.onSurface.withValues(alpha: 0.3))),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    return SizedBox(
+      height: 180,
+      child: ListView.builder(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        itemCount: _localBooks.length + 1,
+        itemBuilder: (context, i) {
+          if (i == _localBooks.length) {
+            return GestureDetector(
+              onTap: _importLocalBook,
+              child: Container(
+                width: 100,
+                margin: const EdgeInsets.only(left: 8),
+                child: Column(
+                  children: [
+                    Container(
+                      height: 130,
+                      decoration: BoxDecoration(
+                        color: isDark ? const Color(0xFF2A2A40) : const Color(0xFFF0F0F5),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: AppTheme.seedPurple.withValues(alpha: 0.15)),
+                      ),
+                      child: Center(
+                        child: Icon(Icons.add_rounded, size: 32, color: AppTheme.seedPurple.withValues(alpha: 0.4)),
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text('导入更多', style: TextStyle(fontSize: 11, color: theme.colorScheme.onSurface.withValues(alpha: 0.4))),
+                  ],
+                ),
+              ),
+            );
+          }
+
+          final book = _localBooks[i];
+          return GestureDetector(
+            onTap: () => _openLocalBook(book),
+            onLongPress: () => _showDeleteLocalBookDialog(book),
+            child: Container(
+              width: 110,
+              margin: EdgeInsets.only(right: i < _localBooks.length - 1 ? 12 : 0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    height: 130,
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: [
+                          Color.lerp(AppTheme.seedPurple, Colors.blue, (i * 0.15) % 1.0) ?? AppTheme.seedPurple,
+                          Color.lerp(const Color(0xFFA29BFE), Colors.teal, (i * 0.2) % 1.0) ?? const Color(0xFFA29BFE),
+                        ],
+                      ),
+                      borderRadius: BorderRadius.circular(10),
+                      boxShadow: [
+                        BoxShadow(color: Colors.black.withValues(alpha: 0.1), blurRadius: 8, offset: const Offset(0, 3)),
+                      ],
+                    ),
+                    child: Stack(
+                      children: [
+                        Center(
+                          child: Padding(
+                            padding: const EdgeInsets.all(10),
+                            child: Text(
+                              book.title,
+                              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Colors.white, height: 1.3),
+                              textAlign: TextAlign.center,
+                              maxLines: 3,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ),
+                        Positioned(
+                          bottom: 6, right: 6,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.3),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Text(
+                              'TXT',
+                              style: TextStyle(fontSize: 8, color: Colors.white.withValues(alpha: 0.8), fontWeight: FontWeight.w600),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    book.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600, fontSize: 12),
+                  ),
+                  Text(
+                    _formatSize(book.fileSize),
+                    maxLines: 1,
+                    style: TextStyle(fontSize: 10, color: theme.colorScheme.onSurface.withValues(alpha: 0.4)),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
       ),
     );
   }
@@ -430,7 +683,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
             Divider(height: 1, indent: 52, color: theme.colorScheme.onSurface.withValues(alpha: 0.06)),
             _settingsTile(theme, Icons.history, '清除阅读历史', onTap: _clearHistoryConfirm),
             Divider(height: 1, indent: 52, color: theme.colorScheme.onSurface.withValues(alpha: 0.06)),
-            _settingsTile(theme, Icons.info_outline_rounded, '关于', subtitle: 'OohStory v1.3.0', onTap: _showAbout),
+            _settingsTile(theme, Icons.info_outline_rounded, '关于', subtitle: 'OohStory v1.3.3', onTap: _showAbout),
           ],
         ),
       ),
@@ -447,27 +700,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
       trailing: Icon(Icons.chevron_right, size: 18, color: theme.colorScheme.onSurface.withValues(alpha: 0.3)),
       onTap: onTap,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-    );
-  }
-
-  Widget _buildEmptyState(ThemeData theme) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 60),
-      child: Column(
-        children: [
-          Icon(Icons.auto_stories_outlined, size: 64, color: theme.colorScheme.onSurface.withValues(alpha: 0.15)),
-          const SizedBox(height: 16),
-          Text(
-            '还没有阅读记录',
-            style: TextStyle(fontSize: 15, color: theme.colorScheme.onSurface.withValues(alpha: 0.4)),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            '去书库逛逛，开始你的阅读之旅',
-            style: TextStyle(fontSize: 13, color: theme.colorScheme.onSurface.withValues(alpha: 0.3)),
-          ),
-        ],
-      ),
     );
   }
 
@@ -511,6 +743,28 @@ class _ProfileScreenState extends State<ProfileScreen> {
               Navigator.pop(ctx);
             },
             child: const Text('确定'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showDeleteLocalBookDialog(LocalBookInfo book) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除书籍'),
+        content: Text('确定要从书架中删除「${book.title}」吗？'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          FilledButton(
+            onPressed: () async {
+              await _storage.deleteLocalBook(book.id);
+              _refresh();
+              Navigator.pop(ctx);
+            },
+            style: FilledButton.styleFrom(backgroundColor: Colors.red.shade400),
+            child: const Text('删除'),
           ),
         ],
       ),
@@ -739,7 +993,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     showAboutDialog(
       context: context,
       applicationName: 'OohStory',
-      applicationVersion: 'v1.3.0',
+      applicationVersion: 'v1.3.3',
       applicationIcon: Container(
         width: 48, height: 48,
         decoration: BoxDecoration(

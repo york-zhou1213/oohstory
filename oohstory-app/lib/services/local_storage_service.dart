@@ -125,10 +125,43 @@ class DownloadedChapterInfo {
       );
 }
 
+class LocalBookInfo {
+  final String id;
+  final String title;
+  final String fileName;
+  final int fileSize;
+  final int addedAt;
+
+  LocalBookInfo({
+    required this.id,
+    required this.title,
+    required this.fileName,
+    required this.fileSize,
+    required this.addedAt,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'fileName': fileName,
+        'fileSize': fileSize,
+        'addedAt': addedAt,
+      };
+
+  factory LocalBookInfo.fromJson(Map<String, dynamic> json) => LocalBookInfo(
+        id: json['id'] as String,
+        title: json['title'] as String? ?? '',
+        fileName: json['fileName'] as String? ?? '',
+        fileSize: json['fileSize'] as int? ?? 0,
+        addedAt: json['addedAt'] as int? ?? 0,
+      );
+}
+
 class LocalStorageService {
   static const _favKey = 'oohstory_favorites';
   static const _histKey = 'oohstory_history';
   static const _dlIndexKey = 'oohstory_downloads_index';
+  static const _localBooksKey = 'oohstory_local_books';
 
   late SharedPreferences _prefs;
   bool _initialized = false;
@@ -328,5 +361,63 @@ class LocalStorageService {
     _prefs.remove(_dlIndexKey);
     final dir = await _downloadDir();
     if (await dir.exists()) await dir.delete(recursive: true);
+  }
+
+  // ─── Local Books (imported TXT) ───
+
+  Future<Directory> _localBooksDir() async {
+    final appDir = await getApplicationDocumentsDirectory();
+    final dir = Directory('${appDir.path}/local_books');
+    if (!await dir.exists()) await dir.create(recursive: true);
+    return dir;
+  }
+
+  List<LocalBookInfo> getLocalBooks() {
+    final raw = _prefs.getString(_localBooksKey);
+    if (raw == null) return [];
+    final list = jsonDecode(raw) as List;
+    return list.map((e) => LocalBookInfo.fromJson(e as Map<String, dynamic>)).toList()
+      ..sort((a, b) => b.addedAt.compareTo(a.addedAt));
+  }
+
+  void _saveLocalBooks(List<LocalBookInfo> books) {
+    _prefs.setString(_localBooksKey, jsonEncode(books.map((b) => b.toJson()).toList()));
+  }
+
+  Future<LocalBookInfo> importLocalBook(String filePath, String fileName) async {
+    final source = File(filePath);
+    final content = await source.readAsString();
+    final id = 'local_${DateTime.now().millisecondsSinceEpoch}';
+    final title = fileName.replaceAll(RegExp(r'\.(txt|TXT)$'), '');
+    final dir = await _localBooksDir();
+    final dest = File('${dir.path}/$id.txt');
+    await dest.writeAsString(content);
+    final info = LocalBookInfo(
+      id: id,
+      title: title,
+      fileName: fileName,
+      fileSize: content.length,
+      addedAt: DateTime.now().millisecondsSinceEpoch,
+    );
+    final books = getLocalBooks();
+    books.insert(0, info);
+    _saveLocalBooks(books);
+    return info;
+  }
+
+  Future<String?> getLocalBookContent(String bookId) async {
+    final dir = await _localBooksDir();
+    final file = File('${dir.path}/$bookId.txt');
+    if (await file.exists()) return file.readAsString();
+    return null;
+  }
+
+  Future<void> deleteLocalBook(String bookId) async {
+    final books = getLocalBooks();
+    books.removeWhere((b) => b.id == bookId);
+    _saveLocalBooks(books);
+    final dir = await _localBooksDir();
+    final file = File('${dir.path}/$bookId.txt');
+    if (await file.exists()) await file.delete();
   }
 }

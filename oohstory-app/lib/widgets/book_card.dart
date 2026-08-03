@@ -25,6 +25,14 @@ class BookCard extends StatelessWidget {
             child: Container(
               decoration: BoxDecoration(
                 borderRadius: BorderRadius.circular(12),
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [
+                    theme.colorScheme.primaryContainer.withValues(alpha: 0.3),
+                    theme.colorScheme.tertiaryContainer.withValues(alpha: 0.3),
+                  ],
+                ),
                 boxShadow: [
                   BoxShadow(
                     color: Colors.black.withValues(alpha: 0.08),
@@ -40,7 +48,8 @@ class BookCard extends StatelessWidget {
                   children: [
                     Image.network(
                       coverUrl,
-                      fit: BoxFit.cover,
+                      fit: BoxFit.fitWidth,
+                      alignment: Alignment.topCenter,
                       errorBuilder: (_, __, ___) => Container(
                         decoration: BoxDecoration(
                           gradient: LinearGradient(

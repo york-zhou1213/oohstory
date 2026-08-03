@@ -189,19 +189,30 @@ class Volume {
   final String title;
   final List<int> chapterIds;
   final int illustrationCount;
+  final String coverPath;
+  final List<String> illustrationPaths;
 
   Volume({
     required this.id,
     required this.title,
     required this.chapterIds,
     this.illustrationCount = 0,
+    this.coverPath = '',
+    this.illustrationPaths = const [],
   });
+
+  bool get hasCover => coverPath.isNotEmpty;
 
   factory Volume.fromJson(Map<String, dynamic> json) => Volume(
         id: json['id'] as int? ?? 0,
         title: json['title'] as String? ?? '',
         chapterIds: (json['chapter_ids'] as List?)?.map((e) => e as int).toList() ?? [],
         illustrationCount: json['illustration_count'] as int? ?? 0,
+        coverPath: json['cover_path'] as String? ?? '',
+        illustrationPaths: (json['illustration_paths'] as List?)
+                ?.map((e) => e as String)
+                .toList() ??
+            [],
       );
 }
 

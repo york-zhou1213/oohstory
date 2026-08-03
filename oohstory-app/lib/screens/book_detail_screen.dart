@@ -5,6 +5,7 @@ import '../services/reading_progress.dart';
 import '../models/book.dart';
 import '../theme/app_theme.dart';
 import 'reader_screen.dart';
+import 'volume_detail_screen.dart';
 
 class BookDetailScreen extends StatefulWidget {
   final String bookId;
@@ -425,19 +426,128 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
     for (final ch in _chapters) {
       chapterMap[int.tryParse(ch.id) ?? 0] = ch;
     }
-    return SliverList(
-      delegate: SliverChildBuilderDelegate(
-        (context, volIdx) {
-          final vol = _volumes[volIdx];
-          return _VolumeAccordion(
+    return SliverPadding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      sliver: SliverGrid(
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 3,
+          childAspectRatio: 0.55,
+          mainAxisSpacing: 12,
+          crossAxisSpacing: 10,
+        ),
+        delegate: SliverChildBuilderDelegate(
+          (context, volIdx) {
+            final vol = _volumes[volIdx];
+            final volChapters = vol.chapterIds
+                .map((cid) => chapterMap[cid])
+                .whereType<Chapter>()
+                .toList();
+            return _buildVolumeCard(theme, vol, volChapters);
+          },
+          childCount: _volumes.length,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildVolumeCard(ThemeData theme, Volume vol, List<Chapter> volChapters) {
+    return GestureDetector(
+      onTap: () {
+        Navigator.of(context).push(MaterialPageRoute(
+          builder: (_) => VolumeDetailScreen(
+            bookId: widget.bookId,
             volume: vol,
-            chapterMap: chapterMap,
-            theme: theme,
-            onChapterTap: _openReader,
-            initiallyExpanded: volIdx == 0,
-          );
-        },
-        childCount: _volumes.length,
+            chapters: volChapters,
+            book: _book,
+          ),
+        ));
+      },
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(10),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.08),
+                    blurRadius: 8,
+                    offset: const Offset(0, 3),
+                  ),
+                ],
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: vol.hasCover
+                    ? Image.network(
+                        _api.illustrationUrl(widget.bookId, vol.coverPath),
+                        fit: BoxFit.cover,
+                        width: double.infinity,
+                        errorBuilder: (_, __, ___) =>
+                            _volumePlaceholder(theme, vol),
+                      )
+                    : _volumePlaceholder(theme, vol),
+              ),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            vol.title,
+            style: theme.textTheme.bodySmall?.copyWith(
+              fontWeight: FontWeight.w600,
+              fontSize: 11,
+              height: 1.2,
+            ),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+          Text(
+            '${vol.chapterIds.length}章',
+            style: TextStyle(
+              fontSize: 10,
+              color: theme.colorScheme.onSurface.withValues(alpha: 0.5),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _volumePlaceholder(ThemeData theme, Volume vol) {
+    return Container(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            AppTheme.seedPurple.withValues(alpha: 0.15),
+            AppTheme.seedPurple.withValues(alpha: 0.05),
+          ],
+        ),
+      ),
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.menu_book_rounded,
+                size: 28,
+                color: AppTheme.seedPurple.withValues(alpha: 0.4)),
+            const SizedBox(height: 4),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6),
+              child: Text(
+                '第${vol.id}卷',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: AppTheme.seedPurple.withValues(alpha: 0.6),
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -529,110 +639,3 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
   }
 }
 
-class _VolumeAccordion extends StatefulWidget {
-  final Volume volume;
-  final Map<int, Chapter> chapterMap;
-  final ThemeData theme;
-  final void Function(String chapterId) onChapterTap;
-  final bool initiallyExpanded;
-
-  const _VolumeAccordion({
-    required this.volume,
-    required this.chapterMap,
-    required this.theme,
-    required this.onChapterTap,
-    this.initiallyExpanded = false,
-  });
-
-  @override
-  State<_VolumeAccordion> createState() => _VolumeAccordionState();
-}
-
-class _VolumeAccordionState extends State<_VolumeAccordion> {
-  late bool _expanded;
-
-  @override
-  void initState() {
-    super.initState();
-    _expanded = widget.initiallyExpanded;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final vol = widget.volume;
-    final theme = widget.theme;
-    final illustLabel = vol.illustrationCount > 0 ? ' · ${vol.illustrationCount} 插画' : '';
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-      child: Container(
-        decoration: BoxDecoration(
-          border: Border.all(color: theme.colorScheme.outlineVariant.withValues(alpha: 0.5)),
-          borderRadius: BorderRadius.circular(10),
-        ),
-        clipBehavior: Clip.antiAlias,
-        child: Column(
-          children: [
-            InkWell(
-              onTap: () => setState(() => _expanded = !_expanded),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                color: AppTheme.seedPurple.withValues(alpha: 0.04),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        vol.title,
-                        style: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600, fontSize: 14),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    Text(
-                      '${vol.chapterIds.length} 章$illustLabel',
-                      style: TextStyle(fontSize: 12, color: theme.colorScheme.onSurface.withValues(alpha: 0.5)),
-                    ),
-                    const SizedBox(width: 4),
-                    Icon(
-                      _expanded ? Icons.expand_less : Icons.expand_more,
-                      size: 20,
-                      color: theme.colorScheme.onSurface.withValues(alpha: 0.4),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            if (_expanded)
-              ...vol.chapterIds.map((cid) {
-                final ch = widget.chapterMap[cid];
-                if (ch == null) return const SizedBox.shrink();
-                return InkWell(
-                  onTap: () => widget.onChapterTap(ch.id),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            ch.displayTitle,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: theme.textTheme.bodySmall?.copyWith(fontSize: 13),
-                          ),
-                        ),
-                        if (ch.wordCount != null)
-                          Text(
-                            '${ch.wordCount}字',
-                            style: TextStyle(fontSize: 11, color: theme.colorScheme.onSurface.withValues(alpha: 0.4)),
-                          ),
-                      ],
-                    ),
-                  ),
-                );
-              }),
-          ],
-        ),
-      ),
-    );
-  }
-}
