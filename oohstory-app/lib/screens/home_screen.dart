@@ -727,11 +727,11 @@ class _HomeScreenState extends State<HomeScreen> {
                     child: Image.network(
                       coverUrl,
                       key: ValueKey(book.id),
-                      width: 110,
+                      width: 120,
                       height: 150,
                       fit: BoxFit.cover,
                       errorBuilder: (_, __, ___) => Container(
-                        width: 110, height: 150,
+                        width: 120, height: 150,
                         decoration: BoxDecoration(
                           gradient: LinearGradient(
                             begin: Alignment.topLeft, end: Alignment.bottomRight,
