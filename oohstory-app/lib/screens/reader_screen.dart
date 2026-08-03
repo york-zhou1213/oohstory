@@ -65,6 +65,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   void initState() {
     super.initState();
     _tts = TtsService(_api);
+    _tts.mode = 'smart';
     _currentChapterId = widget.chapterId;
     _currentChapterIdx = widget.chapters.indexWhere((c) => c.id == _currentChapterId);
     if (_currentChapterIdx < 0) _currentChapterIdx = 0;
