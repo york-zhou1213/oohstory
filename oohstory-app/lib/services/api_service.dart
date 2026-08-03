@@ -31,9 +31,10 @@ class ApiService {
     String? category,
     String? status,
     String? query,
-    String sort = 'title',
+    String? words,
+    String sort = 'recent',
     int page = 1,
-    int pageSize = 24,
+    int pageSize = 48,
   }) async {
     final params = <String, String>{
       'sort': sort,
@@ -43,6 +44,7 @@ class ApiService {
     if (category != null && category.isNotEmpty) params['category'] = category;
     if (status != null && status.isNotEmpty) params['serialization'] = status;
     if (query != null && query.isNotEmpty) params['q'] = query;
+    if (words != null && words.isNotEmpty) params['words'] = words;
     final uri = Uri.parse('$baseUrl/api/v1/books').replace(queryParameters: params);
     final response = await _client.get(uri);
     if (response.statusCode != 200) throw ApiException('请求失败', response.statusCode);
@@ -59,13 +61,22 @@ class ApiService {
 
   String coverUrl(String bookId) => '$baseUrl/api/v1/books/$bookId/cover';
 
-  Future<List<Chapter>> getChapters(String bookId) async {
+  Future<ChapterCatalog> getChapterCatalog(String bookId) async {
     final data = await _getJson('/api/v1/books/$bookId/chapters');
     final list = (data['chapters'] ?? data['items'] ?? []) as List;
-    return list
-        .map((e) => Chapter.fromJson(e as Map<String, dynamic>))
-        .toList();
+    final chapters = list.map((e) => Chapter.fromJson(e as Map<String, dynamic>)).toList();
+    final volList = (data['volumes'] as List?) ?? [];
+    final volumes = volList.map((e) => Volume.fromJson(e as Map<String, dynamic>)).toList();
+    return ChapterCatalog(chapters: chapters, volumes: volumes);
   }
+
+  Future<List<Chapter>> getChapters(String bookId) async {
+    final catalog = await getChapterCatalog(bookId);
+    return catalog.chapters;
+  }
+
+  String illustrationUrl(String bookId, String subpath) =>
+      '$baseUrl/api/v1/books/$bookId/illustrations/${Uri.encodeFull(subpath)}';
 
   Future<Chapter> getChapter(String bookId, String chapterId) async {
     final data = await _getJson('/api/v1/books/$bookId/chapters/$chapterId');

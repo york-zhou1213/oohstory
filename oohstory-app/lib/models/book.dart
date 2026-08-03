@@ -184,6 +184,36 @@ class DeconstructionEntry {
       );
 }
 
+class Volume {
+  final int id;
+  final String title;
+  final List<int> chapterIds;
+  final int illustrationCount;
+
+  Volume({
+    required this.id,
+    required this.title,
+    required this.chapterIds,
+    this.illustrationCount = 0,
+  });
+
+  factory Volume.fromJson(Map<String, dynamic> json) => Volume(
+        id: json['id'] as int? ?? 0,
+        title: json['title'] as String? ?? '',
+        chapterIds: (json['chapter_ids'] as List?)?.map((e) => e as int).toList() ?? [],
+        illustrationCount: json['illustration_count'] as int? ?? 0,
+      );
+}
+
+class ChapterCatalog {
+  final List<Chapter> chapters;
+  final List<Volume> volumes;
+
+  ChapterCatalog({required this.chapters, this.volumes = const []});
+
+  bool get hasVolumes => volumes.isNotEmpty;
+}
+
 class TtsVoice {
   final String key;
   final String label;

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../services/api_service.dart';
 import '../services/local_storage_service.dart';
+import '../services/reading_progress.dart';
 import '../models/book.dart';
 import '../theme/app_theme.dart';
 import 'reader_screen.dart';
@@ -16,14 +17,17 @@ class BookDetailScreen extends StatefulWidget {
 class _BookDetailScreenState extends State<BookDetailScreen> {
   final _api = ApiService();
   final _storage = LocalStorageService();
+  final _progress = ReadingProgressService();
   Book? _book;
   List<Chapter> _chapters = [];
+  List<Volume> _volumes = [];
   bool _loading = true;
   bool _catalogExpanded = false;
   bool _descExpanded = false;
   bool _isFavorite = false;
   bool _downloading = false;
   int _downloadedCount = 0;
+  ReadingProgress? _savedProgress;
 
   @override
   void initState() {
@@ -33,18 +37,22 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
 
   Future<void> _load() async {
     await _storage.init();
+    await _progress.init();
     try {
       final results = await Future.wait([
         _api.getBook(widget.bookId),
-        _api.getChapters(widget.bookId),
+        _api.getChapterCatalog(widget.bookId),
       ]);
       if (mounted) {
+        final catalog = results[1] as ChapterCatalog;
         setState(() {
           _book = results[0] as Book;
-          _chapters = results[1] as List<Chapter>;
+          _chapters = catalog.chapters;
+          _volumes = catalog.volumes;
           _loading = false;
           _isFavorite = _storage.isFavorite(widget.bookId);
           _downloadedCount = _storage.downloadedChapterCount(widget.bookId);
+          _savedProgress = _progress.get(widget.bookId);
         });
       }
     } catch (_) {
@@ -335,11 +343,12 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
   }
 
   Widget _buildChapterHeader(ThemeData theme) {
+    final label = _volumes.isNotEmpty ? '${_volumes.length}卷 · ${_chapters.length}章' : '${_chapters.length}章';
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
       child: Row(
         children: [
-          Text('目录', style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
+          Text(_volumes.isNotEmpty ? '分卷目录' : '目录', style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
           const SizedBox(width: 8),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -348,23 +357,25 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
               borderRadius: BorderRadius.circular(8),
             ),
             child: Text(
-              '${_chapters.length}章',
+              label,
               style: TextStyle(fontSize: 11, color: AppTheme.seedPurple, fontWeight: FontWeight.w600),
             ),
           ),
           const Spacer(),
-          TextButton.icon(
-            onPressed: () => setState(() => _catalogExpanded = !_catalogExpanded),
-            icon: Icon(_catalogExpanded ? Icons.unfold_less : Icons.unfold_more, size: 16),
-            label: Text(_catalogExpanded ? '收起' : '展开全部', style: const TextStyle(fontSize: 12)),
-            style: TextButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 8)),
-          ),
+          if (_volumes.isEmpty)
+            TextButton.icon(
+              onPressed: () => setState(() => _catalogExpanded = !_catalogExpanded),
+              icon: Icon(_catalogExpanded ? Icons.unfold_less : Icons.unfold_more, size: 16),
+              label: Text(_catalogExpanded ? '收起' : '展开全部', style: const TextStyle(fontSize: 12)),
+              style: TextButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 8)),
+            ),
         ],
       ),
     );
   }
 
   Widget _buildChapterList(ThemeData theme) {
+    if (_volumes.isNotEmpty) return _buildVolumeList(theme);
     final showCount = _catalogExpanded ? _chapters.length : _chapters.length.clamp(0, 20);
     return SliverList(
       delegate: SliverChildBuilderDelegate(
@@ -409,6 +420,28 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
     );
   }
 
+  Widget _buildVolumeList(ThemeData theme) {
+    final chapterMap = <int, Chapter>{};
+    for (final ch in _chapters) {
+      chapterMap[int.tryParse(ch.id) ?? 0] = ch;
+    }
+    return SliverList(
+      delegate: SliverChildBuilderDelegate(
+        (context, volIdx) {
+          final vol = _volumes[volIdx];
+          return _VolumeAccordion(
+            volume: vol,
+            chapterMap: chapterMap,
+            theme: theme,
+            onChapterTap: _openReader,
+            initiallyExpanded: volIdx == 0,
+          );
+        },
+        childCount: _volumes.length,
+      ),
+    );
+  }
+
   Widget _buildBottomBar(ThemeData theme) {
     return Container(
       decoration: BoxDecoration(
@@ -443,9 +476,21 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
               const SizedBox(width: 8),
               Expanded(
                 child: FilledButton.icon(
-                  onPressed: _chapters.isNotEmpty ? () => _openReader(_chapters.first.id) : null,
-                  icon: const Icon(Icons.auto_stories, size: 18),
-                  label: const Text('开始阅读'),
+                  onPressed: _chapters.isNotEmpty
+                      ? () {
+                          if (_savedProgress != null &&
+                              _chapters.any((c) => c.id == _savedProgress!.chapterId)) {
+                            _openReader(_savedProgress!.chapterId);
+                          } else {
+                            _openReader(_chapters.first.id);
+                          }
+                        }
+                      : null,
+                  icon: Icon(
+                    _savedProgress != null ? Icons.play_arrow_rounded : Icons.auto_stories,
+                    size: 18,
+                  ),
+                  label: Text(_savedProgress != null ? '继续阅读' : '开始阅读'),
                   style: FilledButton.styleFrom(
                     padding: const EdgeInsets.symmetric(vertical: 14),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
@@ -481,5 +526,113 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
   void dispose() {
     _api.dispose();
     super.dispose();
+  }
+}
+
+class _VolumeAccordion extends StatefulWidget {
+  final Volume volume;
+  final Map<int, Chapter> chapterMap;
+  final ThemeData theme;
+  final void Function(String chapterId) onChapterTap;
+  final bool initiallyExpanded;
+
+  const _VolumeAccordion({
+    required this.volume,
+    required this.chapterMap,
+    required this.theme,
+    required this.onChapterTap,
+    this.initiallyExpanded = false,
+  });
+
+  @override
+  State<_VolumeAccordion> createState() => _VolumeAccordionState();
+}
+
+class _VolumeAccordionState extends State<_VolumeAccordion> {
+  late bool _expanded;
+
+  @override
+  void initState() {
+    super.initState();
+    _expanded = widget.initiallyExpanded;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final vol = widget.volume;
+    final theme = widget.theme;
+    final illustLabel = vol.illustrationCount > 0 ? ' · ${vol.illustrationCount} 插画' : '';
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      child: Container(
+        decoration: BoxDecoration(
+          border: Border.all(color: theme.colorScheme.outlineVariant.withValues(alpha: 0.5)),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Column(
+          children: [
+            InkWell(
+              onTap: () => setState(() => _expanded = !_expanded),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                color: AppTheme.seedPurple.withValues(alpha: 0.04),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        vol.title,
+                        style: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600, fontSize: 14),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    Text(
+                      '${vol.chapterIds.length} 章$illustLabel',
+                      style: TextStyle(fontSize: 12, color: theme.colorScheme.onSurface.withValues(alpha: 0.5)),
+                    ),
+                    const SizedBox(width: 4),
+                    Icon(
+                      _expanded ? Icons.expand_less : Icons.expand_more,
+                      size: 20,
+                      color: theme.colorScheme.onSurface.withValues(alpha: 0.4),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            if (_expanded)
+              ...vol.chapterIds.map((cid) {
+                final ch = widget.chapterMap[cid];
+                if (ch == null) return const SizedBox.shrink();
+                return InkWell(
+                  onTap: () => widget.onChapterTap(ch.id),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            ch.displayTitle,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.bodySmall?.copyWith(fontSize: 13),
+                          ),
+                        ),
+                        if (ch.wordCount != null)
+                          Text(
+                            '${ch.wordCount}字',
+                            style: TextStyle(fontSize: 11, color: theme.colorScheme.onSurface.withValues(alpha: 0.4)),
+                          ),
+                      ],
+                    ),
+                  ),
+                );
+              }),
+          ],
+        ),
+      ),
+    );
   }
 }

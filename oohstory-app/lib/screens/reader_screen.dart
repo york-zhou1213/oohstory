@@ -7,6 +7,7 @@ import '../services/api_service.dart';
 import '../services/local_storage_service.dart';
 import '../services/reading_progress.dart' show ReadingProgressService;
 import '../services/tts_service.dart';
+import '../theme/app_theme.dart';
 
 class ReaderScreen extends StatefulWidget {
   final String bookId;
@@ -34,8 +35,11 @@ class _ReaderScreenState extends State<ReaderScreen> {
   final ItemScrollController _scrollCtrl = ItemScrollController();
   final ItemPositionsListener _positionsListener = ItemPositionsListener.create();
 
+  static final _illustPattern = RegExp(r'^\[illustration:(.+)\]$');
+
   Chapter? _chapter;
-  List<String> _paragraphs = [];
+  List<_ReaderItem> _items = [];
+  List<String> _ttsParagraphs = [];
   bool _loading = true;
   bool _showControls = true;
   int _ttsHighlight = -1;
@@ -47,6 +51,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   double _lineHeight = 1.8;
   bool _darkMode = false;
   bool _ttsPlaying = false;
+  double _readProgress = 0.0;
 
   final List<Color> _bgColors = [
     const Color(0xFFF5F1E8),
@@ -65,6 +70,25 @@ class _ReaderScreenState extends State<ReaderScreen> {
     if (_currentChapterIdx < 0) _currentChapterIdx = 0;
     _loadChapter();
     _loadSettings();
+    _positionsListener.itemPositions.addListener(_updateReadProgress);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final isDark = Theme.of(context).brightness == Brightness.dark;
+      if (isDark && _bgIndex == 0) {
+        setState(() { _bgIndex = 3; _darkMode = true; });
+      }
+    });
+  }
+
+  void _updateReadProgress() {
+    final positions = _positionsListener.itemPositions.value;
+    if (positions.isEmpty || _items.isEmpty) return;
+    final maxIndex = positions.map((p) => p.index).reduce((a, b) => a > b ? a : b);
+    final totalItems = _items.length + 2;
+    final progress = (maxIndex / (totalItems - 1)).clamp(0.0, 1.0);
+    if ((_readProgress - progress).abs() > 0.005) {
+      setState(() => _readProgress = progress);
+      _progress.save(widget.bookId, _currentChapterId, progress);
+    }
   }
 
   Future<void> _loadSettings() async {
@@ -86,13 +110,26 @@ class _ReaderScreenState extends State<ReaderScreen> {
         ch = await _api.getChapter(widget.bookId, _currentChapterId);
         content = ch.content ?? '';
       }
-      final paras = content.split(RegExp(r'\n+')).where((p) => p.trim().isNotEmpty).toList();
+      final lines = content.split(RegExp(r'\n+')).where((p) => p.trim().isNotEmpty).toList();
+      final items = <_ReaderItem>[];
+      final ttsParas = <String>[];
+      for (final line in lines) {
+        final m = _illustPattern.firstMatch(line);
+        if (m != null) {
+          items.add(_ReaderItem.illustration(m.group(1)!));
+        } else {
+          items.add(_ReaderItem.text(line, ttsParas.length));
+          ttsParas.add(line);
+        }
+      }
       if (mounted) {
         setState(() {
           _chapter = ch;
-          _paragraphs = paras;
+          _items = items;
+          _ttsParagraphs = ttsParas;
           _loading = false;
           _ttsHighlight = -1;
+          _readProgress = 0.0;
         });
         _progress.save(widget.bookId, _currentChapterId, 0.0);
         if (widget.book != null) {
@@ -132,11 +169,14 @@ class _ReaderScreenState extends State<ReaderScreen> {
       _tts.stop();
       setState(() { _ttsPlaying = false; _ttsHighlight = -1; });
     } else {
-      _tts.buildPlan(_paragraphs);
+      _tts.buildPlan(_ttsParagraphs);
       _tts.onParagraphChange = (idx) {
         if (mounted) {
           setState(() => _ttsHighlight = idx);
-          _scrollCtrl.scrollTo(index: idx + 1, duration: const Duration(milliseconds: 300));
+          final scrollIdx = _items.indexWhere((item) => item.ttsIndex == idx);
+          if (scrollIdx >= 0) {
+            _scrollCtrl.scrollTo(index: scrollIdx + 1, duration: const Duration(milliseconds: 300));
+          }
         }
       };
       _tts.onComplete = () {
@@ -257,15 +297,20 @@ class _ReaderScreenState extends State<ReaderScreen> {
       backgroundColor: bg,
       body: GestureDetector(
         onTap: _toggleControls,
+        onHorizontalDragEnd: (details) {
+          if (details.primaryVelocity == null) return;
+          if (details.primaryVelocity! < -300) _nextChapter();
+          if (details.primaryVelocity! > 300) _prevChapter();
+        },
         child: Stack(
           children: [
             if (_loading)
               const Center(child: CircularProgressIndicator())
-            else
+            else ...[
               ScrollablePositionedList.builder(
                 itemScrollController: _scrollCtrl,
                 itemPositionsListener: _positionsListener,
-                itemCount: _paragraphs.length + 2,
+                itemCount: _items.length + 2,
                 itemBuilder: (context, index) {
                   if (index == 0) {
                     return Padding(
@@ -281,12 +326,37 @@ class _ReaderScreenState extends State<ReaderScreen> {
                       ),
                     );
                   }
-                  if (index == _paragraphs.length + 1) {
+                  if (index == _items.length + 1) {
                     return _buildChapterNav(textColor);
                   }
-                  final paraIdx = index - 1;
-                  final text = _paragraphs[paraIdx];
-                  final isHighlighted = paraIdx == _ttsHighlight;
+                  final item = _items[index - 1];
+                  if (item.isIllustration) {
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(8),
+                        child: Image.network(
+                          _api.illustrationUrl(widget.bookId, item.illustPath!),
+                          fit: BoxFit.contain,
+                          loadingBuilder: (_, child, progress) {
+                            if (progress == null) return child;
+                            return Container(
+                              height: 200,
+                              alignment: Alignment.center,
+                              child: CircularProgressIndicator(
+                                value: progress.expectedTotalBytes != null
+                                    ? progress.cumulativeBytesLoaded / progress.expectedTotalBytes!
+                                    : null,
+                                strokeWidth: 2,
+                              ),
+                            );
+                          },
+                          errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                        ),
+                      ),
+                    );
+                  }
+                  final isHighlighted = item.ttsIndex >= 0 && item.ttsIndex == _ttsHighlight;
                   return Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 2),
                     child: Container(
@@ -298,7 +368,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
                           : null,
                       padding: const EdgeInsets.symmetric(vertical: 2),
                       child: Text(
-                        text.startsWith('　') ? text : '　　$text',
+                        item.text!.startsWith('　') ? item.text! : '　　${item.text!}',
                         style: TextStyle(
                           fontSize: _fontSize,
                           height: _lineHeight,
@@ -309,6 +379,16 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   );
                 },
               ),
+            ],
+            Positioned(
+              top: 0, left: 0, right: 0,
+              child: LinearProgressIndicator(
+                value: _readProgress,
+                minHeight: 2,
+                backgroundColor: Colors.transparent,
+                valueColor: AlwaysStoppedAnimation(AppTheme.seedPurple.withValues(alpha: 0.5)),
+              ),
+            ),
             if (_showControls) _buildTopBar(),
             if (_showControls) _buildBottomBar(),
           ],
@@ -341,6 +421,21 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
+              if (_readProgress > 0)
+                Padding(
+                  padding: const EdgeInsets.only(right: 12),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      '${(_readProgress * 100).round()}%',
+                      style: TextStyle(color: Colors.white.withValues(alpha: 0.8), fontSize: 12, fontWeight: FontWeight.w500),
+                    ),
+                  ),
+                ),
             ],
           ),
         ),
@@ -376,7 +471,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 ),
                 IconButton(
                   icon: Icon(_ttsPlaying ? Icons.stop : Icons.headphones, color: Colors.white),
-                  onPressed: _paragraphs.isNotEmpty ? _toggleTts : null,
+                  onPressed: _ttsParagraphs.isNotEmpty ? _toggleTts : null,
                 ),
                 IconButton(
                   icon: const Icon(Icons.settings, color: Colors.white),
@@ -465,9 +560,26 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   @override
   void dispose() {
+    _positionsListener.itemPositions.removeListener(_updateReadProgress);
     _tts.dispose();
     _api.dispose();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();
   }
+}
+
+class _ReaderItem {
+  final String? text;
+  final String? illustPath;
+  final int ttsIndex;
+
+  _ReaderItem._({this.text, this.illustPath, this.ttsIndex = -1});
+
+  factory _ReaderItem.text(String text, int ttsIndex) =>
+      _ReaderItem._(text: text, ttsIndex: ttsIndex);
+
+  factory _ReaderItem.illustration(String path) =>
+      _ReaderItem._(illustPath: path);
+
+  bool get isIllustration => illustPath != null;
 }
