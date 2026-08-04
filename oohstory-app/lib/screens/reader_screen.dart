@@ -7,6 +7,7 @@ import '../services/api_service.dart';
 import '../services/local_storage_service.dart';
 import '../services/reading_progress.dart' show ReadingProgressService;
 import '../services/tts_service.dart';
+import '../main.dart' show ttsHandler;
 import '../theme/app_theme.dart';
 
 class ReaderScreen extends StatefulWidget {
@@ -64,7 +65,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   @override
   void initState() {
     super.initState();
-    _tts = TtsService(_api);
+    _tts = TtsService(_api, ttsHandler);
     _tts.mode = 'smart';
     _currentChapterId = widget.chapterId;
     _currentChapterIdx = widget.chapters.indexWhere((c) => c.id == _currentChapterId);
@@ -170,6 +171,11 @@ class _ReaderScreenState extends State<ReaderScreen> {
       _tts.stop();
       setState(() { _ttsPlaying = false; _ttsHighlight = -1; });
     } else {
+      _tts.bookTitle = widget.book?.title;
+      _tts.chapterTitle = _chapter?.displayTitle;
+      _tts.authorName = widget.book?.author;
+      _tts.onSkipPrev = _prevChapter;
+      _tts.onSkipNext = _nextChapter;
       _tts.buildPlan(_ttsParagraphs);
       _tts.onParagraphChange = (idx) {
         if (mounted) {

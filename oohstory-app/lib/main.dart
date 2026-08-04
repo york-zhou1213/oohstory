@@ -1,11 +1,25 @@
 import 'package:flutter/material.dart';
+import 'package:audio_service/audio_service.dart';
 import 'theme/app_theme.dart';
 import 'screens/home_screen.dart';
 import 'screens/library_screen.dart';
 import 'screens/deconstruction_screen.dart';
 import 'screens/profile_screen.dart';
+import 'services/tts_audio_handler.dart';
 
-void main() {
+late TtsAudioHandler ttsHandler;
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  ttsHandler = await AudioService.init(
+    builder: () => TtsAudioHandler(),
+    config: AudioServiceConfig(
+      androidNotificationChannelId: 'com.oohstory.app.tts',
+      androidNotificationChannelName: '听书',
+      androidNotificationOngoing: true,
+      androidStopForegroundOnPause: false,
+    ),
+  );
   runApp(const OohStoryApp());
 }
 

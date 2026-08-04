@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:just_audio/just_audio.dart';
 import 'api_service.dart';
+import 'tts_audio_handler.dart';
 
 class EmotionResult {
   final String pitch;
@@ -10,25 +11,36 @@ class EmotionResult {
 
 class TtsService {
   final ApiService _api;
-  final AudioPlayer _player = AudioPlayer();
+  final TtsAudioHandler _handler;
+  late final AudioPlayer _player;
   String voice = 'nuanxi';
   String narrator = 'mocheng';
   String mode = 'normal';
   double baseRate = 1.0;
   bool active = false;
 
+  String? bookTitle;
+  String? chapterTitle;
+  String? authorName;
+
   List<_TtsItem> _plan = [];
   int _currentIndex = -1;
   StreamSubscription<PlayerState>? _stateSub;
   void Function(int paraIdx)? onParagraphChange;
   void Function()? onComplete;
+  void Function()? onSkipPrev;
+  void Function()? onSkipNext;
 
   static const _femalePool = ['nuanxi', 'lingxian', 'shuanger', 'yanzhi'];
   static const _malePool = ['kuangyun', 'qingyan', 'tongzhen', 'mocheng'];
   static const _cantonesePool = ['wanqing', 'muyao', 'yueming'];
   static const _hokkienPool = ['qianyu', 'ruoxi', 'hanfeng'];
 
-  TtsService(this._api);
+  TtsService(this._api, this._handler) {
+    _player = _handler.player;
+    _handler.onSkipPrev = () { onSkipPrev?.call(); };
+    _handler.onSkipNext = () { onSkipNext?.call(); };
+  }
 
   static EmotionResult detectEmotion(String text) {
     e(String p, int r) => EmotionResult(p, r);
@@ -238,6 +250,11 @@ class TtsService {
   Future<void> play({int fromIndex = 0}) async {
     active = true;
     _currentIndex = fromIndex;
+    _handler.updateMetadata(
+      title: chapterTitle ?? '听书',
+      album: bookTitle ?? '',
+      artist: authorName ?? 'OOH Story',
+    );
     await _playAt(_currentIndex);
   }
 
@@ -267,16 +284,15 @@ class TtsService {
 
   void stop() {
     active = false;
-    _player.stop();
+    _handler.stop();
   }
 
-  void pause() => _player.pause();
-  void resume() => _player.play();
+  void pause() => _handler.pause();
+  void resume() => _handler.play();
 
   void dispose() {
     active = false;
     _stateSub?.cancel();
-    _player.dispose();
   }
 }
 
