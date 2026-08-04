@@ -1,7 +1,7 @@
 name: oohstory
 description: "OOH Story - 免费中文小说阅读与深度拆书"
 publish_to: 'none'
-version: 1.6.3+15
+version: 1.7.4+20
 
 environment:
   sdk: ^3.8.1
@@ -23,6 +23,8 @@ dependencies:
   audio_service: ^0.18.17
   scrollable_positioned_list: ^0.3.8
   file_picker: ^8.3.7
+  flutter_secure_storage: ^9.2.4
+  google_sign_in: ^6.2.2
 
 dev_dependencies:
   flutter_test:

@@ -5,6 +5,7 @@ import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import '../models/book.dart';
 import '../services/api_service.dart';
 import '../services/local_storage_service.dart';
+import '../services/account_service.dart';
 import '../services/reading_progress.dart' show ReadingProgressService;
 import '../services/tts_service.dart';
 import '../main.dart' show ttsHandler;
@@ -34,7 +35,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
   final _storage = LocalStorageService();
   late TtsService _tts;
   final ItemScrollController _scrollCtrl = ItemScrollController();
-  final ItemPositionsListener _positionsListener = ItemPositionsListener.create();
+  final ItemPositionsListener _positionsListener =
+      ItemPositionsListener.create();
 
   static final _illustPattern = RegExp(r'^\[illustration:(.+)\]$');
 
@@ -68,7 +70,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
     _tts = TtsService(_api, ttsHandler);
     _tts.mode = 'smart';
     _currentChapterId = widget.chapterId;
-    _currentChapterIdx = widget.chapters.indexWhere((c) => c.id == _currentChapterId);
+    _currentChapterIdx = widget.chapters.indexWhere(
+      (c) => c.id == _currentChapterId,
+    );
     if (_currentChapterIdx < 0) _currentChapterIdx = 0;
     _loadChapter();
     _loadSettings();
@@ -76,7 +80,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final isDark = Theme.of(context).brightness == Brightness.dark;
       if (isDark && _bgIndex == 0) {
-        setState(() { _bgIndex = 3; _darkMode = true; });
+        setState(() {
+          _bgIndex = 3;
+          _darkMode = true;
+        });
       }
     });
   }
@@ -84,7 +91,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
   void _updateReadProgress() {
     final positions = _positionsListener.itemPositions.value;
     if (positions.isEmpty || _items.isEmpty) return;
-    final maxIndex = positions.map((p) => p.index).reduce((a, b) => a > b ? a : b);
+    final maxIndex = positions
+        .map((p) => p.index)
+        .reduce((a, b) => a > b ? a : b);
     final totalItems = _items.length + 2;
     final progress = (maxIndex / (totalItems - 1)).clamp(0.0, 1.0);
     if ((_readProgress - progress).abs() > 0.005) {
@@ -102,17 +111,27 @@ class _ReaderScreenState extends State<ReaderScreen> {
     setState(() => _loading = true);
     try {
       String content;
-      final cached = await _storage.getDownloadedContent(widget.bookId, _currentChapterId);
+      final cached = await _storage.getDownloadedContent(
+        widget.bookId,
+        _currentChapterId,
+      );
       Chapter ch;
       if (cached != null) {
-        final idx = widget.chapters.indexWhere((c) => c.id == _currentChapterId);
-        ch = idx >= 0 ? widget.chapters[idx] : await _api.getChapter(widget.bookId, _currentChapterId);
+        final idx = widget.chapters.indexWhere(
+          (c) => c.id == _currentChapterId,
+        );
+        ch = idx >= 0
+            ? widget.chapters[idx]
+            : await _api.getChapter(widget.bookId, _currentChapterId);
         content = cached;
       } else {
         ch = await _api.getChapter(widget.bookId, _currentChapterId);
         content = ch.content ?? '';
       }
-      final lines = content.split(RegExp(r'\n+')).where((p) => p.trim().isNotEmpty).toList();
+      final lines = content
+          .split(RegExp(r'\n+'))
+          .where((p) => p.trim().isNotEmpty)
+          .toList();
       final items = <_ReaderItem>[];
       final ttsParas = <String>[];
       for (final line in lines) {
@@ -136,6 +155,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
         _progress.save(widget.bookId, _currentChapterId, 0.0);
         if (widget.book != null) {
           _storage.recordRead(widget.book!, _currentChapterId, ch.displayTitle);
+          if (AccountService.instance.isSignedIn) {
+            await AccountService.instance.mergeLocalState(_storage);
+          }
         }
       }
     } catch (_) {
@@ -169,7 +191,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
   void _toggleTts() {
     if (_ttsPlaying) {
       _tts.stop();
-      setState(() { _ttsPlaying = false; _ttsHighlight = -1; });
+      setState(() {
+        _ttsPlaying = false;
+        _ttsHighlight = -1;
+      });
     } else {
       _tts.bookTitle = widget.book?.title;
       _tts.chapterTitle = _chapter?.displayTitle;
@@ -182,16 +207,32 @@ class _ReaderScreenState extends State<ReaderScreen> {
           setState(() => _ttsHighlight = idx);
           final scrollIdx = _items.indexWhere((item) => item.ttsIndex == idx);
           if (scrollIdx >= 0) {
-            _scrollCtrl.scrollTo(index: scrollIdx + 1, duration: const Duration(milliseconds: 300));
+            _scrollCtrl.scrollTo(
+              index: scrollIdx + 1,
+              duration: const Duration(milliseconds: 300),
+            );
           }
         }
       };
       _tts.onComplete = () {
-        if (mounted) setState(() { _ttsPlaying = false; _ttsHighlight = -1; });
+        if (mounted) {
+          setState(() {
+            _ttsPlaying = false;
+            _ttsHighlight = -1;
+          });
+        }
       };
       _tts.play();
       setState(() => _ttsPlaying = true);
     }
+  }
+
+  Future<void> _rebuildActiveTtsPlan() async {
+    if (!_ttsPlaying || !_tts.active || _ttsParagraphs.isEmpty) return;
+    final paragraph = _tts.currentParagraphIndex;
+    _tts.stop();
+    _tts.buildPlan(_ttsParagraphs, startParagraph: paragraph);
+    await _tts.play();
   }
 
   void _showSettingsSheet() {
@@ -246,26 +287,32 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 children: [
                   const Text('背景'),
                   const SizedBox(width: 16),
-                  ...List.generate(_bgColors.length, (i) => Padding(
-                    padding: const EdgeInsets.only(right: 8),
-                    child: GestureDetector(
-                      onTap: () {
-                        setSheetState(() => _bgIndex = i);
-                        setState(() => _darkMode = i == _bgColors.length - 1);
-                      },
-                      child: Container(
-                        width: 36, height: 36,
-                        decoration: BoxDecoration(
-                          color: _bgColors[i],
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                            color: _bgIndex == i ? Theme.of(context).colorScheme.primary : Colors.grey.shade300,
-                            width: _bgIndex == i ? 2.5 : 1,
+                  ...List.generate(
+                    _bgColors.length,
+                    (i) => Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: GestureDetector(
+                        onTap: () {
+                          setSheetState(() => _bgIndex = i);
+                          setState(() => _darkMode = i == _bgColors.length - 1);
+                        },
+                        child: Container(
+                          width: 36,
+                          height: 36,
+                          decoration: BoxDecoration(
+                            color: _bgColors[i],
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: _bgIndex == i
+                                  ? Theme.of(context).colorScheme.primary
+                                  : Colors.grey.shade300,
+                              width: _bgIndex == i ? 2.5 : 1,
+                            ),
                           ),
                         ),
                       ),
                     ),
-                  )),
+                  ),
                 ],
               ),
               const SizedBox(height: 12),
@@ -282,6 +329,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
                       onChanged: (v) {
                         setSheetState(() => _tts.baseRate = v);
                       },
+                      onChangeEnd: (_) => _rebuildActiveTtsPlan(),
                     ),
                   ),
                   Text('${_tts.baseRate.toStringAsFixed(1)}x'),
@@ -298,7 +346,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
   @override
   Widget build(BuildContext context) {
     final bg = _bgColors[_bgIndex];
-    final textColor = _darkMode ? Colors.white.withValues(alpha: 0.85) : const Color(0xFF333333);
+    final textColor = _darkMode
+        ? Colors.white.withValues(alpha: 0.85)
+        : const Color(0xFF333333);
 
     return Scaffold(
       backgroundColor: bg,
@@ -339,7 +389,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   final item = _items[index - 1];
                   if (item.isIllustration) {
                     return Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(8),
                         child: Image.network(
@@ -352,7 +405,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
                               alignment: Alignment.center,
                               child: CircularProgressIndicator(
                                 value: progress.expectedTotalBytes != null
-                                    ? progress.cumulativeBytesLoaded / progress.expectedTotalBytes!
+                                    ? progress.cumulativeBytesLoaded /
+                                          progress.expectedTotalBytes!
                                     : null,
                                 strokeWidth: 2,
                               ),
@@ -363,19 +417,28 @@ class _ReaderScreenState extends State<ReaderScreen> {
                       ),
                     );
                   }
-                  final isHighlighted = item.ttsIndex >= 0 && item.ttsIndex == _ttsHighlight;
+                  final isHighlighted =
+                      item.ttsIndex >= 0 && item.ttsIndex == _ttsHighlight;
                   return Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 2),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 24,
+                      vertical: 2,
+                    ),
                     child: Container(
                       decoration: isHighlighted
                           ? BoxDecoration(
-                              color: Theme.of(context).colorScheme.primaryContainer.withValues(alpha: 0.3),
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .primaryContainer
+                                  .withValues(alpha: 0.3),
                               borderRadius: BorderRadius.circular(4),
                             )
                           : null,
                       padding: const EdgeInsets.symmetric(vertical: 2),
                       child: Text(
-                        item.text!.startsWith('　') ? item.text! : '　　${item.text!}',
+                        item.text!.startsWith('　')
+                            ? item.text!
+                            : '　　${item.text!}',
                         style: TextStyle(
                           fontSize: _fontSize,
                           height: _lineHeight,
@@ -388,12 +451,16 @@ class _ReaderScreenState extends State<ReaderScreen> {
               ),
             ],
             Positioned(
-              top: 0, left: 0, right: 0,
+              top: 0,
+              left: 0,
+              right: 0,
               child: LinearProgressIndicator(
                 value: _readProgress,
                 minHeight: 2,
                 backgroundColor: Colors.transparent,
-                valueColor: AlwaysStoppedAnimation(AppTheme.seedPurple.withValues(alpha: 0.5)),
+                valueColor: AlwaysStoppedAnimation(
+                  AppTheme.seedPurple.withValues(alpha: 0.5),
+                ),
               ),
             ),
             if (_showControls) _buildTopBar(),
@@ -406,7 +473,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   Widget _buildTopBar() {
     return Positioned(
-      top: 0, left: 0, right: 0,
+      top: 0,
+      left: 0,
+      right: 0,
       child: Container(
         decoration: BoxDecoration(
           gradient: LinearGradient(
@@ -419,7 +488,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
           bottom: false,
           child: Row(
             children: [
-              IconButton(icon: const Icon(Icons.arrow_back, color: Colors.white), onPressed: () => Navigator.of(context).pop()),
+              IconButton(
+                icon: const Icon(Icons.arrow_back, color: Colors.white),
+                onPressed: () => Navigator.of(context).pop(),
+              ),
               Expanded(
                 child: Text(
                   _chapter?.displayTitle ?? '',
@@ -432,14 +504,21 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 Padding(
                   padding: const EdgeInsets.only(right: 12),
                   child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 3,
+                    ),
                     decoration: BoxDecoration(
                       color: Colors.white.withValues(alpha: 0.15),
                       borderRadius: BorderRadius.circular(8),
                     ),
                     child: Text(
                       '${(_readProgress * 100).round()}%',
-                      style: TextStyle(color: Colors.white.withValues(alpha: 0.8), fontSize: 12, fontWeight: FontWeight.w500),
+                      style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.8),
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500,
+                      ),
                     ),
                   ),
                 ),
@@ -452,7 +531,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   Widget _buildBottomBar() {
     return Positioned(
-      bottom: 0, left: 0, right: 0,
+      bottom: 0,
+      left: 0,
+      right: 0,
       child: Container(
         decoration: BoxDecoration(
           gradient: LinearGradient(
@@ -477,7 +558,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   onPressed: _showCatalog,
                 ),
                 IconButton(
-                  icon: Icon(_ttsPlaying ? Icons.stop : Icons.headphones, color: Colors.white),
+                  icon: Icon(
+                    _ttsPlaying ? Icons.stop : Icons.headphones,
+                    color: Colors.white,
+                  ),
                   onPressed: _ttsParagraphs.isNotEmpty ? _toggleTts : null,
                 ),
                 IconButton(
@@ -486,7 +570,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 ),
                 IconButton(
                   icon: const Icon(Icons.skip_next, color: Colors.white),
-                  onPressed: _currentChapterIdx < widget.chapters.length - 1 ? _nextChapter : null,
+                  onPressed: _currentChapterIdx < widget.chapters.length - 1
+                      ? _nextChapter
+                      : null,
                 ),
               ],
             ),
@@ -508,7 +594,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 child: const Text('上一章'),
               ),
             ),
-          if (_currentChapterIdx > 0 && _currentChapterIdx < widget.chapters.length - 1)
+          if (_currentChapterIdx > 0 &&
+              _currentChapterIdx < widget.chapters.length - 1)
             const SizedBox(width: 16),
           if (_currentChapterIdx < widget.chapters.length - 1)
             Expanded(
@@ -546,11 +633,18 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   return ListTile(
                     dense: true,
                     selected: isCurrent,
-                    title: Text(ch.displayTitle, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    title: Text(
+                      ch.displayTitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
                     onTap: () {
                       Navigator.of(ctx).pop();
                       _tts.stop();
-                      setState(() { _ttsPlaying = false; _ttsHighlight = -1; });
+                      setState(() {
+                        _ttsPlaying = false;
+                        _ttsHighlight = -1;
+                      });
                       _currentChapterIdx = i;
                       _currentChapterId = ch.id;
                       _loadChapter();

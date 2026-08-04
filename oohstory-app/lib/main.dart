@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:audio_service/audio_service.dart';
 import 'theme/app_theme.dart';
@@ -6,11 +8,13 @@ import 'screens/library_screen.dart';
 import 'screens/deconstruction_screen.dart';
 import 'screens/profile_screen.dart';
 import 'services/tts_audio_handler.dart';
+import 'services/account_service.dart';
 
 late TtsAudioHandler ttsHandler;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await AccountService.instance.initialize();
   ttsHandler = await AudioService.init(
     builder: () => TtsAudioHandler(),
     config: AudioServiceConfig(
@@ -46,18 +50,23 @@ class SplashScreen extends StatefulWidget {
   State<SplashScreen> createState() => _SplashScreenState();
 }
 
-class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderStateMixin {
+class _SplashScreenState extends State<SplashScreen>
+    with SingleTickerProviderStateMixin {
   late AnimationController _controller;
   late Animation<double> _fadeIn;
+  Timer? _navigationTimer;
 
   @override
   void initState() {
     super.initState();
-    _controller = AnimationController(vsync: this, duration: const Duration(milliseconds: 800));
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 800),
+    );
     _fadeIn = CurvedAnimation(parent: _controller, curve: Curves.easeIn);
     _controller.forward();
 
-    Future.delayed(const Duration(milliseconds: 1500), () {
+    _navigationTimer = Timer(const Duration(milliseconds: 1500), () {
       if (mounted) {
         Navigator.of(context).pushReplacement(
           PageRouteBuilder(
@@ -74,6 +83,7 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
 
   @override
   void dispose() {
+    _navigationTimer?.cancel();
     _controller.dispose();
     super.dispose();
   }
@@ -101,7 +111,11 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
                     color: Colors.white.withValues(alpha: 0.15),
                     borderRadius: BorderRadius.circular(24),
                   ),
-                  child: const Icon(Icons.auto_stories, color: Colors.white, size: 48),
+                  child: const Icon(
+                    Icons.auto_stories,
+                    color: Colors.white,
+                    size: 48,
+                  ),
                 ),
                 const SizedBox(height: 24),
                 const Text(
@@ -150,13 +164,8 @@ class _MainShellState extends State<MainShell> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: Text(['发现', '书库', '拆书档案', '我的'][_currentIndex]),
-      ),
-      body: IndexedStack(
-        index: _currentIndex,
-        children: _screens,
-      ),
+      appBar: AppBar(title: Text(['发现', '书库', '拆书档案', '我的'][_currentIndex])),
+      body: IndexedStack(index: _currentIndex, children: _screens),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _currentIndex,
         onDestinationSelected: (i) => setState(() => _currentIndex = i),

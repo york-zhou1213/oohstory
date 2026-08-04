@@ -20,28 +20,28 @@ class BookMeta {
   });
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'title': title,
-        'author': author,
-        'coverUrl': coverUrl,
-        'timestamp': timestamp,
-      };
+    'id': id,
+    'title': title,
+    'author': author,
+    'coverUrl': coverUrl,
+    'timestamp': timestamp,
+  };
 
   factory BookMeta.fromJson(Map<String, dynamic> json) => BookMeta(
-        id: json['id'] as String,
-        title: json['title'] as String? ?? '',
-        author: json['author'] as String? ?? '',
-        coverUrl: json['coverUrl'] as String?,
-        timestamp: json['timestamp'] as int? ?? 0,
-      );
+    id: json['id'] as String,
+    title: json['title'] as String? ?? '',
+    author: json['author'] as String? ?? '',
+    coverUrl: json['coverUrl'] as String?,
+    timestamp: json['timestamp'] as int? ?? 0,
+  );
 
   factory BookMeta.fromBook(Book book) => BookMeta(
-        id: book.id,
-        title: book.title,
-        author: book.author,
-        coverUrl: book.coverUrl,
-        timestamp: DateTime.now().millisecondsSinceEpoch,
-      );
+    id: book.id,
+    title: book.title,
+    author: book.author,
+    coverUrl: book.coverUrl,
+    timestamp: DateTime.now().millisecondsSinceEpoch,
+  );
 }
 
 class HistoryEntry {
@@ -58,18 +58,18 @@ class HistoryEntry {
   });
 
   Map<String, dynamic> toJson() => {
-        'book': book.toJson(),
-        'lastChapterId': lastChapterId,
-        'lastChapterTitle': lastChapterTitle,
-        'lastReadAt': lastReadAt,
-      };
+    'book': book.toJson(),
+    'lastChapterId': lastChapterId,
+    'lastChapterTitle': lastChapterTitle,
+    'lastReadAt': lastReadAt,
+  };
 
   factory HistoryEntry.fromJson(Map<String, dynamic> json) => HistoryEntry(
-        book: BookMeta.fromJson(json['book'] as Map<String, dynamic>),
-        lastChapterId: json['lastChapterId'] as String? ?? '',
-        lastChapterTitle: json['lastChapterTitle'] as String? ?? '',
-        lastReadAt: json['lastReadAt'] as int? ?? 0,
-      );
+    book: BookMeta.fromJson(json['book'] as Map<String, dynamic>),
+    lastChapterId: json['lastChapterId'] as String? ?? '',
+    lastChapterTitle: json['lastChapterTitle'] as String? ?? '',
+    lastReadAt: json['lastReadAt'] as int? ?? 0,
+  );
 }
 
 class DownloadedBookInfo {
@@ -80,14 +80,19 @@ class DownloadedBookInfo {
   DownloadedBookInfo({required this.book, required this.chapters});
 
   Map<String, dynamic> toJson() => {
-        'book': book.toJson(),
-        'chapters': chapters.map((c) => c.toJson()).toList(),
-      };
+    'book': book.toJson(),
+    'chapters': chapters.map((c) => c.toJson()).toList(),
+  };
 
-  factory DownloadedBookInfo.fromJson(Map<String, dynamic> json) => DownloadedBookInfo(
+  factory DownloadedBookInfo.fromJson(Map<String, dynamic> json) =>
+      DownloadedBookInfo(
         book: BookMeta.fromJson(json['book'] as Map<String, dynamic>),
-        chapters: (json['chapters'] as List?)
-                ?.map((e) => DownloadedChapterInfo.fromJson(e as Map<String, dynamic>))
+        chapters:
+            (json['chapters'] as List?)
+                ?.map(
+                  (e) =>
+                      DownloadedChapterInfo.fromJson(e as Map<String, dynamic>),
+                )
                 .toList() ??
             [],
       );
@@ -109,14 +114,15 @@ class DownloadedChapterInfo {
   });
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'title': title,
-        'position': position,
-        'size': size,
-        'downloadedAt': downloadedAt,
-      };
+    'id': id,
+    'title': title,
+    'position': position,
+    'size': size,
+    'downloadedAt': downloadedAt,
+  };
 
-  factory DownloadedChapterInfo.fromJson(Map<String, dynamic> json) => DownloadedChapterInfo(
+  factory DownloadedChapterInfo.fromJson(Map<String, dynamic> json) =>
+      DownloadedChapterInfo(
         id: json['id'] as String,
         title: json['title'] as String? ?? '',
         position: json['position'] as int? ?? 0,
@@ -141,20 +147,20 @@ class LocalBookInfo {
   });
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'title': title,
-        'fileName': fileName,
-        'fileSize': fileSize,
-        'addedAt': addedAt,
-      };
+    'id': id,
+    'title': title,
+    'fileName': fileName,
+    'fileSize': fileSize,
+    'addedAt': addedAt,
+  };
 
   factory LocalBookInfo.fromJson(Map<String, dynamic> json) => LocalBookInfo(
-        id: json['id'] as String,
-        title: json['title'] as String? ?? '',
-        fileName: json['fileName'] as String? ?? '',
-        fileSize: json['fileSize'] as int? ?? 0,
-        addedAt: json['addedAt'] as int? ?? 0,
-      );
+    id: json['id'] as String,
+    title: json['title'] as String? ?? '',
+    fileName: json['fileName'] as String? ?? '',
+    fileSize: json['fileSize'] as int? ?? 0,
+    addedAt: json['addedAt'] as int? ?? 0,
+  );
 }
 
 class LocalStorageService {
@@ -178,7 +184,9 @@ class LocalStorageService {
     final raw = _prefs.getString(_favKey);
     if (raw == null) return [];
     final list = jsonDecode(raw) as List;
-    return list.map((e) => BookMeta.fromJson(e as Map<String, dynamic>)).toList()
+    return list
+        .map((e) => BookMeta.fromJson(e as Map<String, dynamic>))
+        .toList()
       ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
   }
 
@@ -213,7 +221,9 @@ class LocalStorageService {
     final raw = _prefs.getString(_histKey);
     if (raw == null) return [];
     final list = jsonDecode(raw) as List;
-    return list.map((e) => HistoryEntry.fromJson(e as Map<String, dynamic>)).toList()
+    return list
+        .map((e) => HistoryEntry.fromJson(e as Map<String, dynamic>))
+        .toList()
       ..sort((a, b) => b.lastReadAt.compareTo(a.lastReadAt));
   }
 
@@ -230,17 +240,86 @@ class LocalStorageService {
       ),
     );
     if (history.length > 50) history.removeRange(50, history.length);
-    _prefs.setString(_histKey, jsonEncode(history.map((e) => e.toJson()).toList()));
+    _prefs.setString(
+      _histKey,
+      jsonEncode(history.map((e) => e.toJson()).toList()),
+    );
   }
 
   void removeFromHistory(String bookId) {
     final history = getHistory();
     history.removeWhere((e) => e.book.id == bookId);
-    _prefs.setString(_histKey, jsonEncode(history.map((e) => e.toJson()).toList()));
+    _prefs.setString(
+      _histKey,
+      jsonEncode(history.map((e) => e.toJson()).toList()),
+    );
   }
 
   void clearHistory() {
     _prefs.remove(_histKey);
+  }
+
+  /// Merge server-owned history and favorites without deleting newer local
+  /// entries. Private local files remain device-only by design.
+  void mergeCloudState(Map<String, dynamic> cloud) {
+    final favorites = {for (final item in getFavorites()) item.id: item};
+    for (final raw in (cloud['favorites'] as List? ?? const [])) {
+      final item = Map<String, dynamic>.from(raw as Map);
+      final timestamp =
+          DateTime.tryParse(
+            item['updated_at'] as String? ?? '',
+          )?.millisecondsSinceEpoch ??
+          0;
+      final candidate = BookMeta(
+        id: item['book_id'] as String? ?? '',
+        title: item['title'] as String? ?? '',
+        author: item['author'] as String? ?? '',
+        coverUrl: item['cover_url'] as String?,
+        timestamp: timestamp,
+      );
+      final previous = favorites[candidate.id];
+      if (candidate.id.isNotEmpty &&
+          (previous == null || candidate.timestamp >= previous.timestamp)) {
+        favorites[candidate.id] = candidate;
+      }
+    }
+    _prefs.setString(
+      _favKey,
+      jsonEncode(favorites.values.map((item) => item.toJson()).toList()),
+    );
+
+    final history = {for (final item in getHistory()) item.book.id: item};
+    for (final raw in (cloud['history'] as List? ?? const [])) {
+      final item = Map<String, dynamic>.from(raw as Map);
+      final timestamp =
+          DateTime.tryParse(
+            item['updated_at'] as String? ?? '',
+          )?.millisecondsSinceEpoch ??
+          0;
+      final candidate = HistoryEntry(
+        book: BookMeta(
+          id: item['book_id'] as String? ?? '',
+          title: item['title'] as String? ?? '',
+          author: item['author'] as String? ?? '',
+          coverUrl: item['cover_url'] as String?,
+          timestamp: timestamp,
+        ),
+        lastChapterId: (item['chapter_id'] ?? 1).toString(),
+        lastChapterTitle: '',
+        lastReadAt: timestamp,
+      );
+      final previous = history[candidate.book.id];
+      if (candidate.book.id.isNotEmpty &&
+          (previous == null || candidate.lastReadAt >= previous.lastReadAt)) {
+        history[candidate.book.id] = candidate;
+      }
+    }
+    final mergedHistory = history.values.toList()
+      ..sort((left, right) => right.lastReadAt.compareTo(left.lastReadAt));
+    _prefs.setString(
+      _histKey,
+      jsonEncode(mergedHistory.take(500).map((item) => item.toJson()).toList()),
+    );
   }
 
   // ─── Downloads ───
@@ -256,11 +335,17 @@ class LocalStorageService {
     final raw = _prefs.getString(_dlIndexKey);
     if (raw == null) return {};
     final map = jsonDecode(raw) as Map<String, dynamic>;
-    return map.map((k, v) => MapEntry(k, DownloadedBookInfo.fromJson(v as Map<String, dynamic>)));
+    return map.map(
+      (k, v) =>
+          MapEntry(k, DownloadedBookInfo.fromJson(v as Map<String, dynamic>)),
+    );
   }
 
   void _saveDownloadIndex(Map<String, DownloadedBookInfo> index) {
-    _prefs.setString(_dlIndexKey, jsonEncode(index.map((k, v) => MapEntry(k, v.toJson()))));
+    _prefs.setString(
+      _dlIndexKey,
+      jsonEncode(index.map((k, v) => MapEntry(k, v.toJson()))),
+    );
   }
 
   List<DownloadedBookInfo> getDownloadedBooks() {
@@ -280,7 +365,11 @@ class LocalStorageService {
     return index[bookId]?.chapters.length ?? 0;
   }
 
-  Future<void> downloadChapter(Book book, Chapter chapter, String content) async {
+  Future<void> downloadChapter(
+    Book book,
+    Chapter chapter,
+    String content,
+  ) async {
     final dir = await _downloadDir();
     final file = File('${dir.path}/${book.id}_${chapter.id}.txt');
     await file.writeAsString(content);
@@ -376,15 +465,23 @@ class LocalStorageService {
     final raw = _prefs.getString(_localBooksKey);
     if (raw == null) return [];
     final list = jsonDecode(raw) as List;
-    return list.map((e) => LocalBookInfo.fromJson(e as Map<String, dynamic>)).toList()
+    return list
+        .map((e) => LocalBookInfo.fromJson(e as Map<String, dynamic>))
+        .toList()
       ..sort((a, b) => b.addedAt.compareTo(a.addedAt));
   }
 
   void _saveLocalBooks(List<LocalBookInfo> books) {
-    _prefs.setString(_localBooksKey, jsonEncode(books.map((b) => b.toJson()).toList()));
+    _prefs.setString(
+      _localBooksKey,
+      jsonEncode(books.map((b) => b.toJson()).toList()),
+    );
   }
 
-  Future<LocalBookInfo> importLocalBook(String filePath, String fileName) async {
+  Future<LocalBookInfo> importLocalBook(
+    String filePath,
+    String fileName,
+  ) async {
     final source = File(filePath);
     final content = await source.readAsString();
     final id = 'local_${DateTime.now().millisecondsSinceEpoch}';

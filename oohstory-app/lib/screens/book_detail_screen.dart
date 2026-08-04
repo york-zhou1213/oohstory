@@ -2,10 +2,12 @@ import 'package:flutter/material.dart';
 import '../services/api_service.dart';
 import '../services/local_storage_service.dart';
 import '../services/reading_progress.dart';
+import '../services/account_service.dart';
 import '../models/book.dart';
 import '../theme/app_theme.dart';
 import 'reader_screen.dart';
 import 'volume_detail_screen.dart';
+import 'auth_screen.dart';
 
 class BookDetailScreen extends StatefulWidget {
   final String bookId;
@@ -26,6 +28,7 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
   bool _catalogExpanded = false;
   bool _descExpanded = false;
   bool _isFavorite = false;
+  bool _inCloudShelf = false;
   bool _downloading = false;
   int _downloadedCount = 0;
   ReadingProgress? _savedProgress;
@@ -52,6 +55,10 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
           _volumes = catalog.volumes;
           _loading = false;
           _isFavorite = _storage.isFavorite(widget.bookId);
+          _inCloudShelf = AccountService.instance.contains(
+            'bookshelf',
+            widget.bookId,
+          );
           _downloadedCount = _storage.downloadedChapterCount(widget.bookId);
           _savedProgress = _progress.get(widget.bookId);
         });
@@ -61,10 +68,20 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
     }
   }
 
-  void _toggleFavorite() {
+  Future<void> _toggleFavorite() async {
     if (_book == null) return;
     _storage.toggleFavorite(_book!);
     setState(() => _isFavorite = !_isFavorite);
+    if (AccountService.instance.isSignedIn) {
+      try {
+        await AccountService.instance.setBookCollection(
+          'favorites',
+          _book!,
+          _isFavorite,
+        );
+      } catch (_) {}
+    }
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(_isFavorite ? '已加入收藏' : '已取消收藏'),
@@ -72,6 +89,33 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
         duration: const Duration(seconds: 1),
       ),
     );
+  }
+
+  Future<void> _toggleCloudShelf() async {
+    if (_book == null) return;
+    if (!AccountService.instance.isSignedIn) {
+      final signedIn = await Navigator.of(
+        context,
+      ).push<bool>(MaterialPageRoute(builder: (_) => const AuthScreen()));
+      if (signedIn != true || !mounted) return;
+    }
+    try {
+      await AccountService.instance.setBookCollection(
+        'bookshelf',
+        _book!,
+        !_inCloudShelf,
+      );
+      if (mounted) setState(() => _inCloudShelf = !_inCloudShelf);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(error.toString()),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    }
   }
 
   Future<void> _downloadAll() async {
@@ -106,7 +150,8 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
 
   String _formatWordCount(int? count) {
     if (count == null) return '';
-    if (count >= 100000000) return '${(count / 100000000).toStringAsFixed(1)}亿字';
+    if (count >= 100000000)
+      return '${(count / 100000000).toStringAsFixed(1)}亿字';
     if (count >= 10000) return '${(count / 10000).toStringAsFixed(1)}万字';
     return '$count字';
   }
@@ -119,15 +164,27 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
   }
 
   void _openReader(String chapterId) {
-    Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => ReaderScreen(bookId: widget.bookId, chapterId: chapterId, chapters: _chapters, book: _book),
-    ));
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ReaderScreen(
+          bookId: widget.bookId,
+          chapterId: chapterId,
+          chapters: _chapters,
+          book: _book,
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) return const Scaffold(body: Center(child: CircularProgressIndicator()));
-    if (_book == null) return Scaffold(appBar: AppBar(), body: const Center(child: Text('书籍不存在')));
+    if (_loading)
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    if (_book == null)
+      return Scaffold(
+        appBar: AppBar(),
+        body: const Center(child: Text('书籍不存在')),
+      );
     final book = _book!;
     final theme = Theme.of(context);
 
@@ -189,19 +246,29 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
                           height: 155,
                           fit: BoxFit.cover,
                           errorBuilder: (_, __, ___) => Container(
-                            width: 110, height: 155,
+                            width: 110,
+                            height: 155,
                             decoration: BoxDecoration(
                               gradient: LinearGradient(
                                 begin: Alignment.topLeft,
                                 end: Alignment.bottomRight,
-                                colors: [Colors.white.withValues(alpha: 0.2), Colors.white.withValues(alpha: 0.05)],
+                                colors: [
+                                  Colors.white.withValues(alpha: 0.2),
+                                  Colors.white.withValues(alpha: 0.05),
+                                ],
                               ),
                               borderRadius: BorderRadius.circular(12),
                             ),
                             child: Center(
                               child: Text(
-                                book.title.length > 4 ? book.title.substring(0, 4) : book.title,
-                                style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w700),
+                                book.title.length > 4
+                                    ? book.title.substring(0, 4)
+                                    : book.title,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.w700,
+                                ),
                                 textAlign: TextAlign.center,
                               ),
                             ),
@@ -231,11 +298,15 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
                         const SizedBox(height: 8),
                         Text(
                           book.author,
-                          style: TextStyle(fontSize: 14, color: Colors.white.withValues(alpha: 0.8)),
+                          style: TextStyle(
+                            fontSize: 14,
+                            color: Colors.white.withValues(alpha: 0.8),
+                          ),
                         ),
                         const SizedBox(height: 12),
                         Wrap(
-                          spacing: 8, runSpacing: 6,
+                          spacing: 8,
+                          runSpacing: 6,
                           children: [
                             if (book.category != null)
                               _tagBadge(book.category!),
@@ -263,7 +334,14 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
         borderRadius: BorderRadius.circular(6),
         border: Border.all(color: Colors.white.withValues(alpha: 0.2)),
       ),
-      child: Text(label, style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w500)),
+      child: Text(
+        label,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 11,
+          fontWeight: FontWeight.w500,
+        ),
+      ),
     );
   }
 
@@ -288,10 +366,18 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
         children: [
           Text(
             value,
-            style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700, color: AppTheme.seedPurple),
+            style: theme.textTheme.titleSmall?.copyWith(
+              fontWeight: FontWeight.w700,
+              color: AppTheme.seedPurple,
+            ),
           ),
           const SizedBox(height: 2),
-          Text(label, style: theme.textTheme.labelSmall?.copyWith(color: theme.colorScheme.onSurface.withValues(alpha: 0.45))),
+          Text(
+            label,
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: theme.colorScheme.onSurface.withValues(alpha: 0.45),
+            ),
+          ),
         ],
       ),
     );
@@ -299,7 +385,8 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
 
   Widget _divider(ThemeData theme) {
     return Container(
-      width: 1, height: 28,
+      width: 1,
+      height: 28,
       color: theme.colorScheme.onSurface.withValues(alpha: 0.08),
     );
   }
@@ -310,22 +397,35 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('简介', style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
+          Text(
+            '简介',
+            style: theme.textTheme.titleSmall?.copyWith(
+              fontWeight: FontWeight.w700,
+            ),
+          ),
           const SizedBox(height: 8),
           GestureDetector(
             onTap: () => setState(() => _descExpanded = !_descExpanded),
             child: AnimatedCrossFade(
               firstChild: Text(
                 book.description!,
-                style: theme.textTheme.bodyMedium?.copyWith(height: 1.6, color: theme.colorScheme.onSurface.withValues(alpha: 0.7)),
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  height: 1.6,
+                  color: theme.colorScheme.onSurface.withValues(alpha: 0.7),
+                ),
                 maxLines: 3,
                 overflow: TextOverflow.ellipsis,
               ),
               secondChild: Text(
                 book.description!,
-                style: theme.textTheme.bodyMedium?.copyWith(height: 1.6, color: theme.colorScheme.onSurface.withValues(alpha: 0.7)),
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  height: 1.6,
+                  color: theme.colorScheme.onSurface.withValues(alpha: 0.7),
+                ),
               ),
-              crossFadeState: _descExpanded ? CrossFadeState.showSecond : CrossFadeState.showFirst,
+              crossFadeState: _descExpanded
+                  ? CrossFadeState.showSecond
+                  : CrossFadeState.showFirst,
               duration: const Duration(milliseconds: 200),
             ),
           ),
@@ -334,8 +434,14 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
               alignment: Alignment.centerRight,
               child: TextButton(
                 onPressed: () => setState(() => _descExpanded = true),
-                style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(0, 32)),
-                child: Text('展开', style: TextStyle(fontSize: 12, color: AppTheme.seedPurple)),
+                style: TextButton.styleFrom(
+                  padding: EdgeInsets.zero,
+                  minimumSize: const Size(0, 32),
+                ),
+                child: Text(
+                  '展开',
+                  style: TextStyle(fontSize: 12, color: AppTheme.seedPurple),
+                ),
               ),
             ),
         ],
@@ -344,12 +450,19 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
   }
 
   Widget _buildChapterHeader(ThemeData theme) {
-    final label = _volumes.isNotEmpty ? '${_volumes.length}卷 · ${_chapters.length}章' : '${_chapters.length}章';
+    final label = _volumes.isNotEmpty
+        ? '${_volumes.length}卷 · ${_chapters.length}章'
+        : '${_chapters.length}章';
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
       child: Row(
         children: [
-          Text(_volumes.isNotEmpty ? '分卷目录' : '目录', style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
+          Text(
+            _volumes.isNotEmpty ? '分卷目录' : '目录',
+            style: theme.textTheme.titleSmall?.copyWith(
+              fontWeight: FontWeight.w700,
+            ),
+          ),
           const SizedBox(width: 8),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -359,16 +472,29 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
             ),
             child: Text(
               label,
-              style: TextStyle(fontSize: 11, color: AppTheme.seedPurple, fontWeight: FontWeight.w600),
+              style: TextStyle(
+                fontSize: 11,
+                color: AppTheme.seedPurple,
+                fontWeight: FontWeight.w600,
+              ),
             ),
           ),
           const Spacer(),
           if (_volumes.isEmpty)
             TextButton.icon(
-              onPressed: () => setState(() => _catalogExpanded = !_catalogExpanded),
-              icon: Icon(_catalogExpanded ? Icons.unfold_less : Icons.unfold_more, size: 16),
-              label: Text(_catalogExpanded ? '收起' : '展开全部', style: const TextStyle(fontSize: 12)),
-              style: TextButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 8)),
+              onPressed: () =>
+                  setState(() => _catalogExpanded = !_catalogExpanded),
+              icon: Icon(
+                _catalogExpanded ? Icons.unfold_less : Icons.unfold_more,
+                size: 16,
+              ),
+              label: Text(
+                _catalogExpanded ? '收起' : '展开全部',
+                style: const TextStyle(fontSize: 12),
+              ),
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+              ),
             ),
         ],
       ),
@@ -377,47 +503,58 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
 
   Widget _buildChapterList(ThemeData theme) {
     if (_volumes.isNotEmpty) return _buildVolumeList(theme);
-    final showCount = _catalogExpanded ? _chapters.length : _chapters.length.clamp(0, 20);
+    final showCount = _catalogExpanded
+        ? _chapters.length
+        : _chapters.length.clamp(0, 20);
     return SliverList(
-      delegate: SliverChildBuilderDelegate(
-        (context, i) {
-          final ch = _chapters[i];
-          return Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            child: ListTile(
-              dense: true,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-              leading: Container(
-                width: 28, height: 28,
-                decoration: BoxDecoration(
-                  color: AppTheme.seedPurple.withValues(alpha: 0.08),
-                  borderRadius: BorderRadius.circular(7),
-                ),
-                child: Center(
-                  child: Text(
-                    '${i + 1}',
-                    style: TextStyle(fontSize: 11, color: AppTheme.seedPurple, fontWeight: FontWeight.w600),
+      delegate: SliverChildBuilderDelegate((context, i) {
+        final ch = _chapters[i];
+        return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          child: ListTile(
+            dense: true,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10),
+            ),
+            leading: Container(
+              width: 28,
+              height: 28,
+              decoration: BoxDecoration(
+                color: AppTheme.seedPurple.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(7),
+              ),
+              child: Center(
+                child: Text(
+                  '${i + 1}',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: AppTheme.seedPurple,
+                    fontWeight: FontWeight.w600,
                   ),
                 ),
               ),
-              title: Text(
-                ch.displayTitle,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w500),
-              ),
-              trailing: ch.wordCount != null
-                  ? Text(
-                      '${ch.wordCount}字',
-                      style: TextStyle(fontSize: 11, color: theme.colorScheme.onSurface.withValues(alpha: 0.4)),
-                    )
-                  : null,
-              onTap: () => _openReader(ch.id),
             ),
-          );
-        },
-        childCount: showCount,
-      ),
+            title: Text(
+              ch.displayTitle,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            trailing: ch.wordCount != null
+                ? Text(
+                    '${ch.wordCount}字',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: theme.colorScheme.onSurface.withValues(alpha: 0.4),
+                    ),
+                  )
+                : null,
+            onTap: () => _openReader(ch.id),
+          ),
+        );
+      }, childCount: showCount),
     );
   }
 
@@ -435,32 +572,35 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
           mainAxisSpacing: 12,
           crossAxisSpacing: 10,
         ),
-        delegate: SliverChildBuilderDelegate(
-          (context, volIdx) {
-            final vol = _volumes[volIdx];
-            final volChapters = vol.chapterIds
-                .map((cid) => chapterMap[cid])
-                .whereType<Chapter>()
-                .toList();
-            return _buildVolumeCard(theme, vol, volChapters);
-          },
-          childCount: _volumes.length,
-        ),
+        delegate: SliverChildBuilderDelegate((context, volIdx) {
+          final vol = _volumes[volIdx];
+          final volChapters = vol.chapterIds
+              .map((cid) => chapterMap[cid])
+              .whereType<Chapter>()
+              .toList();
+          return _buildVolumeCard(theme, vol, volChapters);
+        }, childCount: _volumes.length),
       ),
     );
   }
 
-  Widget _buildVolumeCard(ThemeData theme, Volume vol, List<Chapter> volChapters) {
+  Widget _buildVolumeCard(
+    ThemeData theme,
+    Volume vol,
+    List<Chapter> volChapters,
+  ) {
     return GestureDetector(
       onTap: () {
-        Navigator.of(context).push(MaterialPageRoute(
-          builder: (_) => VolumeDetailScreen(
-            bookId: widget.bookId,
-            volume: vol,
-            chapters: volChapters,
-            book: _book,
+        Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => VolumeDetailScreen(
+              bookId: widget.bookId,
+              volume: vol,
+              chapters: volChapters,
+              book: _book,
+            ),
           ),
-        ));
+        );
       },
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -530,9 +670,11 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.menu_book_rounded,
-                size: 28,
-                color: AppTheme.seedPurple.withValues(alpha: 0.4)),
+            Icon(
+              Icons.menu_book_rounded,
+              size: 28,
+              color: AppTheme.seedPurple.withValues(alpha: 0.4),
+            ),
             const SizedBox(height: 4),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 6),
@@ -556,7 +698,13 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
     return Container(
       decoration: BoxDecoration(
         color: theme.scaffoldBackgroundColor,
-        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.05), blurRadius: 10, offset: const Offset(0, -2))],
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.05),
+            blurRadius: 10,
+            offset: const Offset(0, -2),
+          ),
+        ],
       ),
       child: SafeArea(
         top: false,
@@ -567,17 +715,30 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
               _bottomIconBtn(
                 icon: _isFavorite ? Icons.favorite : Icons.favorite_border,
                 label: _isFavorite ? '已收藏' : '收藏',
-                color: _isFavorite ? AppTheme.accentPink : theme.colorScheme.onSurface.withValues(alpha: 0.6),
+                color: _isFavorite
+                    ? AppTheme.accentPink
+                    : theme.colorScheme.onSurface.withValues(alpha: 0.6),
                 onTap: _toggleFavorite,
               ),
               const SizedBox(width: 4),
               _bottomIconBtn(
-                icon: _downloading ? Icons.downloading : Icons.download_outlined,
+                icon: _inCloudShelf ? Icons.bookmark : Icons.bookmark_border,
+                label: _inCloudShelf ? '已在书架' : '书架',
+                color: _inCloudShelf
+                    ? const Color(0xFF00B894)
+                    : theme.colorScheme.onSurface.withValues(alpha: 0.6),
+                onTap: _toggleCloudShelf,
+              ),
+              const SizedBox(width: 4),
+              _bottomIconBtn(
+                icon: _downloading
+                    ? Icons.downloading
+                    : Icons.download_outlined,
                 label: _downloading
                     ? '$_downloadedCount/${_chapters.length}'
                     : _downloadedCount > 0
-                        ? '$_downloadedCount章'
-                        : '下载',
+                    ? '$_downloadedCount章'
+                    : '下载',
                 color: _downloadedCount > 0
                     ? const Color(0xFF00B894)
                     : theme.colorScheme.onSurface.withValues(alpha: 0.6),
@@ -589,7 +750,9 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
                   onPressed: _chapters.isNotEmpty
                       ? () {
                           if (_savedProgress != null &&
-                              _chapters.any((c) => c.id == _savedProgress!.chapterId)) {
+                              _chapters.any(
+                                (c) => c.id == _savedProgress!.chapterId,
+                              )) {
                             _openReader(_savedProgress!.chapterId);
                           } else {
                             _openReader(_chapters.first.id);
@@ -597,13 +760,17 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
                         }
                       : null,
                   icon: Icon(
-                    _savedProgress != null ? Icons.play_arrow_rounded : Icons.auto_stories,
+                    _savedProgress != null
+                        ? Icons.play_arrow_rounded
+                        : Icons.auto_stories,
                     size: 18,
                   ),
                   label: Text(_savedProgress != null ? '继续阅读' : '开始阅读'),
                   style: FilledButton.styleFrom(
                     padding: const EdgeInsets.symmetric(vertical: 14),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
                   ),
                 ),
               ),
@@ -614,7 +781,12 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
     );
   }
 
-  Widget _bottomIconBtn({required IconData icon, required String label, required Color color, VoidCallback? onTap}) {
+  Widget _bottomIconBtn({
+    required IconData icon,
+    required String label,
+    required Color color,
+    VoidCallback? onTap,
+  }) {
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(10),
@@ -625,7 +797,14 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
           children: [
             Icon(icon, size: 22, color: color),
             const SizedBox(height: 2),
-            Text(label, style: TextStyle(fontSize: 10, color: color, fontWeight: FontWeight.w500)),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 10,
+                color: color,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
           ],
         ),
       ),
@@ -638,4 +817,3 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
     super.dispose();
   }
 }
-
