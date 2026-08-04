@@ -29,7 +29,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   bool _searchFocused = false;
 
   static const _sortOptions = [
-    ('recent', '最新上架'),
+    ('recent', '最近入库'),
     ('title', '按书名'),
     ('long', '长篇优先'),
   ];

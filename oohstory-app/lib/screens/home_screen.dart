@@ -240,7 +240,7 @@ class _HomeScreenState extends State<HomeScreen> {
           SliverToBoxAdapter(
             child: _sectionHeader(
               theme,
-              '最新上架',
+              '新书入库',
               '持续更新',
               Icons.auto_awesome_rounded,
             ),
