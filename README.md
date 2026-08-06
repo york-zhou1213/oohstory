@@ -1,8 +1,32 @@
-# OOH Story
+<p align="center">
+  <img src="static/icon-192.png" width="112" height="112" alt="OOH Story">
+</p>
 
-OOH Story 是一套可自托管的中文电子书平台。这个开源仓库包含 Web Reader、独立运维后台、书库 Backend/Worker、MySQL 数据库迁移，以及 Flutter 移动端源码。
+<h1 align="center">OOH Story</h1>
+
+<p align="center">
+  可自托管的中文电子书阅读、管理与移动端平台
+</p>
+
+<p align="center">
+  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-0f766e">
+  <img alt="Python 3.12+" src="https://img.shields.io/badge/Python-3.12%2B-3776AB">
+  <img alt="Flutter" src="https://img.shields.io/badge/Flutter-stable-02569B">
+  <img alt="MySQL 8.4" src="https://img.shields.io/badge/MySQL-8.4-4479A1">
+</p>
+
+OOH Story 是一套数据自持有、可从空环境部署的中文电子书平台。仓库包含 Web Reader、独立运维后台、书库 Backend/Worker、MySQL 数据库迁移，以及 Flutter Android/iOS 客户端源码。
 
 > 仓库只提供程序代码与品牌静态资源，不包含小说正文、用户数据、数据库备份、签名安装包、私钥或生产凭据。部署者必须确保内容具备合法的使用和发布权。
+
+## 主要能力
+
+- **跨端阅读**：响应式 Web、PWA 与 Flutter 客户端，共用书库、账户和阅读进度接口。
+- **阅读体验**：章节目录、轻小说分卷与插图、听书、继续阅读、收藏、书架和阅读记录。
+- **社区互动**：段落评论、用户身份与阅读等级、评论点赞、通知和投稿中心。
+- **书库管理**：书籍上下架、主封面与分卷封面、目录索引、同步任务、审计与恢复记录。
+- **内容安全**：投稿格式检查、恶意文件检查、评论内容过滤和公开接口权限隔离。
+- **完整自托管**：MySQL、Redis、Reader、Admin 可通过 Compose 从空环境启动；正文与用户数据始终由部署者自行持有。
 
 ## 仓库结构
 
@@ -11,6 +35,21 @@ OOH Story 是一套可自托管的中文电子书平台。这个开源仓库包�
 - `mobile/`：Flutter Android/iOS 客户端源码。
 - `scripts/`：本地空书库、Compose 凭据、数据库验收和敏感信息门禁。
 - `compose.yaml`：MySQL 8.4、Redis 7、Reader、Admin 的本地完整栈。
+
+## 运行架构
+
+```text
+Browser / PWA ─┐
+               ├─> Reader API ──> MySQL 书目与公共统计
+Flutter App ───┘       │
+                       ├────────> SQLite 账户与阅读数据
+                       └────────> 部署者提供的书库目录
+
+Admin ────────────────> Reader API / MySQL / Redis
+Backend & Workers ────> MySQL / Redis / 书库目录
+```
+
+Compose 默认只把 Reader、Admin 和 MySQL 发布到 `127.0.0.1`，Redis 仅存在于内部网络；生产环境应在 Reader 前配置 TLS 反向代理，Admin 继续保持回环或受控内网访问。
 
 ## 一条命令从空环境启动
 
@@ -96,13 +135,13 @@ python3 -m venv .venv
 
 python3 -m venv admin/.venv
 admin/.venv/bin/python -m pip install './admin[test]'
-PYTHONPATH=admin/src admin/.venv/bin/python -m pytest -q admin/tests
+(cd admin && PYTHONPATH=src .venv/bin/python -m pytest -q tests)
 
 node --check static/app.js
 python scripts/check_repository_secrets.py .
 ```
 
-GitHub Actions 另外会在真实 MySQL 8.4 服务中执行空库初始化、拒绝二次 `init.sql`、验证迁移器安全跳过已应用 revision，并对 Flutter 执行 analyze/test。
+GitHub Actions 另外会在真实 MySQL 8.4 服务中执行空库初始化、拒绝二次 `init.sql`、验证迁移器安全跳过已应用 revision，并对 Flutter 执行 analyze、单元测试和 Android Debug APK 构建。
 
 ## 配置与安全
 
