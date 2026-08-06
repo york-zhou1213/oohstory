@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll OOH Story reader-submission AI review queue
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=30s
+AccuracySec=5s
+Persistent=true
+Unit=oohstory-submission-review.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,37 @@
+[Unit]
+Description=OOH Story isolated reader-submission AI reviewer
+After=network-online.target remote-fs.target
+Wants=network-online.target
+RequiresMountsFor=/srv/oohstory/library
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/oohstory-reader/submission-review.env
+User=oohstory
+Group=oohstory
+WorkingDirectory=/opt/oohstory-reader
+Environment=PYTHONUNBUFFERED=1
+Environment=OOHSTORY_STATE_ROOT=/var/lib/oohstory-reader
+Environment=OOHSTORY_USER_UPLOAD_ROOT=/var/lib/oohstory-reader/user-uploads
+Environment=OOHSTORY_SUBMISSION_HANDOFF_ROOT=/srv/oohstory/library/全局索引/用户投稿队列
+ExecStart=/opt/oohstory-reader/.venv/bin/python -m app.review_worker --once
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=false
+LockPersonality=true
+UMask=0007
+ReadOnlyPaths=/opt/oohstory-reader
+ReadWritePaths=/var/lib/oohstory-reader
+ReadWritePaths=/srv/oohstory/library/全局索引/用户投稿队列

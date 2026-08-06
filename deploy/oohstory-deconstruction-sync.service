@@ -1,0 +1,27 @@
+[Unit]
+Description=Publish allowlisted OOH Story deconstruction documents
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/oohstory-sync-public-deconstructions
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+ReadOnlyPaths=/srv/oohstory/library/全局拆书库
+ReadWritePaths=/srv/oohstory-deconstructions
+UMask=0022
