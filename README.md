@@ -19,6 +19,19 @@ OOH Story 是一套数据自持有、可从空环境部署的中文电子书平�
 
 > 仓库只提供程序代码与品牌静态资源，不包含小说正文、用户数据、数据库备份、签名安装包、私钥或生产凭据。部署者必须确保内容具备合法的使用和发布权。
 
+## 界面预览
+
+<p align="center">
+  <img src="docs/screenshots/web-home.png" width="49%" alt="OOH Story 桌面端首页">
+  <img src="docs/screenshots/web-book-detail.png" width="49%" alt="OOH Story 书籍详情页">
+</p>
+<p align="center">
+  <img src="docs/screenshots/web-reader.png" width="64%" alt="OOH Story 桌面端阅读器">
+  <img src="docs/screenshots/mobile-home.png" width="27%" alt="OOH Story 手机版首页">
+</p>
+
+> 展示图使用 OOH Story 自有示例封面、书名与正文，不包含正式书库作品、用户资料或后台数据。
+
 ## 主要能力
 
 - **跨端阅读**：响应式 Web、PWA 与 Flutter 客户端，共用书库、账户和阅读进度接口。
@@ -26,15 +39,16 @@ OOH Story 是一套数据自持有、可从空环境部署的中文电子书平�
 - **社区互动**：段落评论、用户身份与阅读等级、评论点赞、通知和投稿中心。
 - **书库管理**：书籍上下架、主封面与分卷封面、目录索引、同步任务、审计与恢复记录。
 - **内容安全**：投稿格式检查、恶意文件检查、评论内容过滤和公开接口权限隔离。
-- **完整自托管**：MySQL、Redis、Reader、Admin 可通过 Compose 从空环境启动；正文与用户数据始终由部署者自行持有。
+- **完整自托管**：正式部署采用 Linux、systemd、Nginx、MySQL 与 Redis；正文和用户数据始终由部署者自行持有。
 
 ## 仓库结构
 
 - `app/`、`static/`：Reader、账户、阅读记录、评论、投稿与 Web UI。
 - `admin/`：OOHStory Admin、书库引擎、任务脚本、001–022 MySQL 迁移和 systemd 模板。
 - `mobile/`：Flutter Android/iOS 客户端源码。
-- `scripts/`：本地空书库、Compose 凭据、数据库验收和敏感信息门禁。
-- `compose.yaml`：MySQL 8.4、Redis 7、Reader、Admin 的本地完整栈。
+- `scripts/`：本地空书库、数据库验收、可选 Compose 沙盒和敏感信息门禁。
+- `deploy/`、`admin/deploy/`：原生 Linux 的 systemd、Nginx、MySQL 与 Redis 部署模板。
+- `compose.yaml`：仅用于本地体验和 CI 验收的可选沙盒。
 
 ## 运行架构
 
@@ -49,9 +63,40 @@ Admin ────────────────> Reader API / MySQL / Red
 Backend & Workers ────> MySQL / Redis / 书库目录
 ```
 
-Compose 默认只把 Reader、Admin 和 MySQL 发布到 `127.0.0.1`，Redis 仅存在于内部网络；生产环境应在 Reader 前配置 TLS 反向代理，Admin 继续保持回环或受控内网访问。
+项目的正式运行架构不依赖 Docker：Reader 与 Admin 由 systemd 管理，Nginx 负责公开 Reader 的 TLS 入口，Admin 始终保持回环或受控内网访问，MySQL/Redis 作为宿主机服务运行。完整步骤见[原生 Linux 部署指南](docs/HOST_DEPLOYMENT.md)。
 
-## 一条命令从空环境启动
+## 本地快速预览 Reader
+
+只体验 Web Reader 时不需要 Docker、MySQL 或 Redis：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
+./scripts/init_local_library.py
+cp .env.example .env
+set -a
+. ./.env
+set +a
+.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8091
+```
+
+这条路径使用本地 SQLite 空书库。后续可导入自己有权使用的正文、目录和封面；程序不会下载或附带任何作品。
+
+## 正式部署（不使用 Docker）
+
+正式部署沿用项目原有方式：Python venv + systemd + Nginx + MySQL 8.4 + Redis 7。仓库已经提供：
+
+- Reader 与 Admin 的 systemd 单元；
+- Nginx/TLS、安全请求白名单与限流模板；
+- MySQL 001–022 空库初始化、随机运行账号和迁移工具；
+- Redis、Worker 与周期任务模板；
+- 空书库初始化和最小权限配置示例。
+
+从新 Linux 主机安装时，请按[原生 Linux 部署指南](docs/HOST_DEPLOYMENT.md)执行。模板默认使用 `/opt/oohstory-reader`、`/opt/oohstory-admin`、`/srv/oohstory/library`、`127.0.0.1:8091` 与 `127.0.0.1:8092`，可在私有部署配置中调整。
+
+## 可选：Compose 本地沙盒
+
+`compose.yaml` 是为开源仓库新增的便携体验和 CI 验收工具，不是 OOH Story 原有生产架构，也不是正式部署的必需条件。
 
 需要 Docker Engine 24+、Docker Compose 2.23.1+、Python 3.12+ 和 `curl`：
 
@@ -86,29 +131,14 @@ docker compose --env-file .env.compose down
 docker compose --env-file .env.compose down --volumes
 ```
 
-Compose 适合本地体验和集成验证。Admin 中依赖宿主机 systemd/root helper 的任务控制在容器内会失败关闭；需要完整生产运维能力时，按 `deploy/` 与 `admin/deploy/` 的 systemd 模板安装到 Linux 主机。
-
-## 不使用 Docker 的本地 Reader
-
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
-./scripts/init_local_library.py
-cp .env.example .env
-set -a
-. ./.env
-set +a
-.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8091
-```
-
-这条路径使用本地 SQLite 空书库。后续可导入自己有权使用的正文、目录和封面；程序不会下载或附带任何作品。
+Compose 沙盒默认只把 Reader、Admin 和 MySQL 发布到 `127.0.0.1`，Redis 仅存在于内部网络。Admin 中依赖宿主机 systemd/root helper 的任务控制会安全失败关闭；完整运维能力以原生 Linux 部署为准。
 
 ## 数据库初始化保证
 
 - `admin/deploy/mysql/001_*.sql` 至 `022_*.sql` 是 MySQL schema 唯一真源。
 - `admin/deploy/mysql/init.sql` 由生成器构建，专用于空 schema，检测到现有表会拒绝覆盖。
 - `admin/deploy/mysql/runtime-users.sql` 用于宿主机安装，创建三个仅限 `127.0.0.1` 的随机密码账号。
-- Compose 使用相同 `init.sql`，只把账号 host 调整为隔离容器网络。
+- 可选 Compose 沙盒使用相同 `init.sql`，只把账号 host 调整为隔离容器网络。
 - `scripts/verify_mysql_schema.py` 同时核验 migration 文件 SHA-256、台账、表和触发器数量。
 - SQLite 账户库由 Reader 自动初始化；本地书库骨架由 `scripts/init_local_library.py` 幂等创建。
 

@@ -8,7 +8,8 @@ Before the first public push:
 - [ ] Run `admin/scripts/electronic-library/render_mysql_init_sql.py --check`.
 - [ ] Initialize a fresh MySQL 8.4 schema and verify 22 revisions, 27 tables and 7 triggers.
 - [ ] Confirm a second `init.sql` run fails closed and the migration runner skips all applied revisions.
-- [ ] Run Reader and Admin Python suites, JavaScript syntax check, Flutter analyze/test and Compose health checks.
+- [ ] Run Reader and Admin Python suites, JavaScript syntax check, Flutter analyze/test and native deployment checks.
+- [ ] Optionally run the Compose sandbox smoke test; do not treat it as the production architecture.
 - [ ] Stage intended files, then run `python scripts/check_repository_secrets.py .`.
 - [ ] Inspect Git history for novel text, user data, databases, logs, tokens, production domains, host paths and signing artifacts.
 - [ ] Replace `reader.example.com` and sample filesystem paths only in private deployment configuration, never in tracked examples.
