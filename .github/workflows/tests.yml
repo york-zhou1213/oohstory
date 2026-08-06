@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  reader-and-secrets:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,3 +23,110 @@ jobs:
         with:
           node-version: "22"
       - run: node --check static/app.js
+      - run: bash -n scripts/compose_up.sh deploy/compose/mysql-init.sh
+
+  admin-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install './admin[test]'
+      - working-directory: admin
+        run: PYTHONPATH=src python -m pytest -q tests
+      - working-directory: admin
+        run: PYTHONPATH=src python -m compileall -q src tests
+      - working-directory: admin
+        run: python scripts/electronic-library/render_mysql_init_sql.py --check
+      - working-directory: admin
+        run: |
+          bash -n ops/oohstory-admin-systemctl
+          bash -n ops/oohstory-admin-library-action
+          python -m py_compile ops/oohstory-admin-script-store
+          python -m py_compile ops/oohstory-admin-library-action-runner
+
+  mysql-bootstrap:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h127.0.0.1 -uroot -pci-root-password --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install './admin[test]'
+      - name: Install MySQL client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mysql-client
+      - name: Initialize a fresh schema
+        working-directory: admin
+        env:
+          MYSQL_PWD: ci-root-password
+        run: mysql --protocol=TCP -h127.0.0.1 -uroot < deploy/mysql/init.sql
+      - name: Verify schema manifest
+        env:
+          MYSQL_PWD: ci-root-password
+        run: |
+          umask 077
+          printf '%s\n' "$MYSQL_PWD" > "$RUNNER_TEMP/mysql-password"
+          python scripts/verify_mysql_schema.py \
+            --user root \
+            --password-file "$RUNNER_TEMP/mysql-password"
+          test "$(mysql -N -B -h127.0.0.1 -uroot -e \
+            "SELECT COUNT(*) FROM mysql.user WHERE User IN ('oohstory_library_writer_role','oohstory_library_reader_role','oohstory_public_reader_role')")" = "3"
+      - name: Refuse a second fresh initializer
+        working-directory: admin
+        env:
+          MYSQL_PWD: ci-root-password
+        run: |
+          if mysql --protocol=TCP -h127.0.0.1 -uroot < deploy/mysql/init.sql >reinit.log 2>&1; then
+            echo "second init.sql unexpectedly succeeded" >&2
+            exit 1
+          fi
+          grep -q "fresh empty database" reinit.log
+      - name: Safely skip all applied migrations
+        env:
+          OOHSTORY_BACKEND_ROOT: ${{ github.workspace }}/admin
+          OOHSTORY_LIBRARY_CATALOG_BACKEND: mysql
+          OOHSTORY_LIBRARY_MYSQL_HOST: 127.0.0.1
+          OOHSTORY_LIBRARY_MYSQL_PORT: "3306"
+          OOHSTORY_LIBRARY_MYSQL_DATABASE: oohstory_library
+          OOHSTORY_LIBRARY_MYSQL_USER: root
+          OOHSTORY_LIBRARY_MYSQL_PASSWORD_FILE: ${{ runner.temp }}/mysql-password
+          OOHSTORY_LIBRARY_OBJECT_ROOT: ${{ runner.temp }}/library
+        run: |
+          mkdir -p "$RUNNER_TEMP/library"
+          PYTHONPATH=admin/src python \
+            admin/scripts/electronic-library/apply_mysql_migrations.py \
+            | tee "$RUNNER_TEMP/migration-skip.log"
+          test "$(grep -c '^skip ' "$RUNNER_TEMP/migration-skip.log")" = "22"
+          test "$(grep -Ec '^(apply|adopt) ' "$RUNNER_TEMP/migration-skip.log" || true)" = "0"
+
+  mobile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - working-directory: mobile
+        run: flutter pub get
+      - working-directory: mobile
+        run: flutter analyze
+      - working-directory: mobile
+        run: flutter test
+      - working-directory: mobile
+        run: flutter build apk --debug

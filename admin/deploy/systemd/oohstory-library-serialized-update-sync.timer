@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily serialized-book update scan
+
+[Timer]
+OnCalendar=*-*-* 03:10:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=20m
+Unit=oohstory-library-serialized-update-sync.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}{{ book.title }} · 书籍详情{% endblock %}
+{% block content %}
+<a class="back-link" href="{{ base_path }}/books/catalog">← 返回小说目录</a>
+<div class="page-heading detail-heading catalog-detail-hero">
+  <div class="catalog-detail-cover">
+    <span><b>{{ (book.category or '小说')[:4] }}</b><strong>{{ book.title }}</strong><small>{{ book.author or '未知作者' }}</small></span>
+    {% if book.cover_url %}<img data-book-cover src="{{ book.cover_url }}" alt="《{{ book.title }}》封面" decoding="async">{% endif %}
+  </div>
+  <div class="catalog-detail-copy"><p class="eyebrow">{{ book.category or '未分类' }} · {{ '本地书库' if book.library_id == 'local' else '番茄书库' }}</p><h1>{{ book.title }}</h1><p>{{ book.author or '未知作者' }}</p><div class="catalog-status-row"><span class="status {{ 'ok' if book.body_available else 'warn' }}">{{ '正文可用' if book.body_available else '正文待恢复' }}</span><span class="status neutral">{{ book.book_status_label or ('已收录' if book.body_available else '待恢复') }}</span></div></div>
+</div>
+<div class="metric-grid">
+  <article class="metric"><span>章节数</span><strong>{{ book.chapter_count_label or (('{:,}'.format(book.chapter_count) ~ ' 章') if book.chapter_count else '未识别') }}</strong><small>{% if book.section_count %}{{ book.section_count }} 个索引分段{% else %}尚无章节索引分段{% endif %}</small></article>
+  <article class="metric"><span>字数</span><strong>{{ '{:,}'.format(book.word_count or 0) }}</strong><small>{{ book.source_bytes|filesize }} 源文件</small></article>
+  <article class="metric"><span>基调索引</span><strong>{{ '已完成' if book.indexed_at else '未建立' }}</strong><small>置信度 {{ book.tone_confidence or 0 }}</small></article>
+  <article class="metric"><span>剧情索引</span><strong>{{ book.segment_count or 0 }}</strong><small>证据片段</small></article>
+</div>
+<section class="panel"><h2>简介</h2><p class="long-text">{{ book.summary or '暂无简介' }}</p></section>
+<section class="panel">
+  <h2>索引标签</h2>
+  <p class="tag-line">{% for tag in book.primary_tone_tags + book.secondary_tone_tags %}<span>{{ tag }}</span>{% else %}<span>暂无基调标签</span>{% endfor %}</p>
+  <dl class="service-paths"><div><dt>目录 ID</dt><dd>{{ book.catalog_id }}</dd></div><div><dt>来源 ID</dt><dd>{{ book.source_id or '—' }}</dd></div><div><dt>书目状态</dt><dd>{{ book.download_status }}</dd></div><div><dt>最后更新</dt><dd>{{ book.updated_at or '—' }}</dd></div></dl>
+  {% if book.public_id and book.body_available %}<a class="button button-primary" href="{{ base_path }}/books/{{ book.public_id }}">查看真实章节与阅读指标</a>{% endif %}
+</section>
+<section class="panel">
+  <div class="section-title"><div><p class="section-kicker">CATALOG OPERATIONS</p><h2>归库与封面管理</h2></div><span class="status neutral">固定书目 ID · 全程审计</span></div>
+  <p class="muted">逻辑归库不修改来源真值；真实封面同步和 AI 重绘进入后台任务。上传支持 JPEG、PNG、GIF，1KB–12MB，并由 root helper 校验后原子入库。</p>
+  <div class="card-actions catalog-detail-actions">
+    {% for action,label,style in [('move_local','移入本地书库',''),('move_fanqie','移入番茄书库',''),('cover_sync','同步真实封面',''),('cover_redraw','提交 AI 封面重绘','button-primary')] %}
+      <form class="confirm-form" data-confirm="确认执行：{{ label }}？" method="post" action="{{ base_path }}/books/catalog-action"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="view" value="all"><input type="hidden" name="catalog_id" value="{{ book.catalog_id }}"><input type="hidden" name="action" value="{{ action }}"><button class="button {{ style }}" type="submit">{{ label }}</button></form>
+    {% endfor %}
+  </div>
+  <form class="cover-upload-form detail-cover-upload" data-cover-upload data-url="/api/admin/books/catalog/{{ book.catalog_id }}/cover-upload"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>上传本地封面<input type="file" accept="image/jpeg,image/png,image/gif" required></label><button class="button button-primary" type="submit">上传并替换封面</button><span role="status"></span></form>
+</section>
+{% endblock %}

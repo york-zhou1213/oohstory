@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Fanqie download-library synchronization
+
+[Timer]
+OnCalendar=*-*-* 03:40:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=10m
+Unit=oohstory-library-fanqie-sync.service
+
+[Install]
+WantedBy=timers.target

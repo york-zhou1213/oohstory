@@ -1,0 +1,169 @@
+#!/usr/bin/python3
+"""Root-only publisher for exact OOHStory-managed library scripts."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+MAX_SCRIPT_BYTES = 64 * 1024
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+TARGETS = {
+    "authorized_catalog": Path("/opt/oohstory-admin/scripts/electronic-library/authorized_site_catalog_sync.py"),
+    "authorized_download": Path("/opt/oohstory-admin/scripts/electronic-library/authorized_site_download_worker.py"),
+    "cover_sync": Path("/opt/oohstory-admin/scripts/electronic-library/txt80_cover_sync.py"),
+    "local_source_upgrade": Path("/opt/oohstory-admin/scripts/electronic-library/local_source_upgrade_worker.py"),
+    "index_refresh": Path("/opt/oohstory-admin/scripts/electronic-library/refresh_library_indexes.py"),
+    "ingestion_index": Path("/opt/oohstory-admin/scripts/electronic-library/ingestion_index_worker.py"),
+    "derived_index": Path("/opt/oohstory-admin/scripts/electronic-library/derived_index_worker.py"),
+}
+BACKUP_ROOT = Path("/var/lib/oohstory-admin/script-backups")
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def read_regular(path: Path) -> tuple[bytes, os.stat_result]:
+    try:
+        if path.resolve(strict=True) != path:
+            fail("托管脚本路径中禁止软链接")
+    except OSError:
+        fail("托管脚本不存在")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        fail("托管脚本不存在或不是安全的普通文件")
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            fail("托管脚本不是普通文件")
+        data = b""
+        while len(data) <= MAX_SCRIPT_BYTES:
+            chunk = os.read(descriptor, min(65_536, MAX_SCRIPT_BYTES + 1 - len(data)))
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(descriptor)
+    if len(data) > MAX_SCRIPT_BYTES:
+        fail("托管脚本超过大小上限")
+    return data, info
+
+
+def validate(data: bytes) -> str:
+    if not data:
+        fail("脚本内容不能为空")
+    if len(data) > MAX_SCRIPT_BYTES:
+        fail("脚本超过 64 KiB 上限")
+    if b"\x00" in data:
+        fail("脚本不能包含 NUL 字节")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("脚本必须是 UTF-8 文本")
+    if not text.startswith("#!/usr/bin/env python3"):
+        fail("Python 脚本必须保留标准 python3 shebang")
+    try:
+        compile(text, "<managed-script>", "exec", dont_inherit=True)
+    except SyntaxError as exc:
+        fail(f"Python 语法校验失败（第 {exc.lineno or 0} 行）")
+    return text
+
+
+def ensure_backup_root() -> None:
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chown(BACKUP_ROOT, 0, 0)
+    os.chmod(BACKUP_ROOT, 0o700)
+
+
+def publish(script_id: str, expected_sha: str, data: bytes) -> None:
+    target = TARGETS.get(script_id)
+    if target is None:
+        fail("脚本不在允许列表中")
+    if not SHA256_RE.fullmatch(expected_sha):
+        fail("原始 SHA-256 无效")
+    validate(data)
+    old_data, info = read_regular(target)
+    old_sha = sha256(old_data)
+    if old_sha != expected_sha:
+        fail("脚本已变更，请刷新后重试", 75)
+
+    ensure_backup_root()
+    script_backup_dir = BACKUP_ROOT / script_id
+    script_backup_dir.mkdir(mode=0o700, exist_ok=True)
+    os.chown(script_backup_dir, 0, 0)
+    os.chmod(script_backup_dir, 0o700)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    backup = script_backup_dir / f"{stamp}-{old_sha}.py"
+    with backup.open("xb") as handle:
+        handle.write(old_data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chown(backup, 0, 0)
+    os.chmod(backup, 0o600)
+
+    fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chown(temp_name, info.st_uid, info.st_gid)
+        os.chmod(temp_name, stat.S_IMODE(info.st_mode))
+        os.replace(temp_name, target)
+        directory_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+
+    new_data, new_info = read_regular(target)
+    if new_info.st_uid != info.st_uid or new_info.st_gid != info.st_gid:
+        fail("保存后所有者校验失败")
+    new_sha = sha256(new_data)
+    if new_sha != sha256(data):
+        fail("保存后哈希校验失败")
+    print(
+        json.dumps(
+            {
+                "script_id": script_id,
+                "old_sha256": old_sha,
+                "new_sha256": new_sha,
+                "backup": str(backup),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        fail("必须以 root 运行")
+    if len(sys.argv) != 4 or sys.argv[1] != "write":
+        fail("用法: oohstory-admin-script-store write <script-id> <expected-sha256>")
+    data = sys.stdin.buffer.read(MAX_SCRIPT_BYTES + 1)
+    publish(sys.argv[2], sys.argv[3], data)
+
+
+if __name__ == "__main__":
+    main()

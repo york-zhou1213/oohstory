@@ -1,18 +1,21 @@
 # Open-source release checklist
 
-This copy was prepared from `web-v20260806-v40` without carrying over the
-private Git history or untracked workspace files.
-
 Before the first public push:
 
-- [ ] Choose the final GitHub owner/repository name.
-- [ ] Review `LICENSE`, the brand assets, and contributor policy.
-- [ ] Replace `reader.example.com` and sample filesystem paths in `deploy/`.
-- [ ] Create production secrets outside Git and reference them by file path.
+- [ ] Choose the final GitHub owner/repository name and configure the remote.
+- [ ] Review `LICENSE`, brand assets, contributor policy and content-rights notice.
+- [ ] Confirm Reader, `admin/` Backend/Admin and `mobile/` are all present.
+- [ ] Run `admin/scripts/electronic-library/render_mysql_init_sql.py --check`.
+- [ ] Initialize a fresh MySQL 8.4 schema and verify 22 revisions, 27 tables and 7 triggers.
+- [ ] Confirm a second `init.sql` run fails closed and the migration runner skips all applied revisions.
+- [ ] Run Reader and Admin Python suites, JavaScript syntax check, Flutter analyze/test and Compose health checks.
+- [ ] Stage intended files, then run `python scripts/check_repository_secrets.py .`.
+- [ ] Inspect Git history for novel text, user data, databases, logs, tokens, production domains, host paths and signing artifacts.
+- [ ] Replace `reader.example.com` and sample filesystem paths only in private deployment configuration, never in tracked examples.
+- [ ] Create production credentials outside Git and use distinct least-privilege database accounts.
 - [ ] Publish signed mobile packages through GitHub Releases, not the source tree.
-- [ ] Run `python scripts/check_repository_secrets.py .`.
-- [ ] Run the complete Python test suite and JavaScript syntax check.
 - [ ] Enable branch protection and required CI checks before accepting changes.
 
-Never add novel text, user data, databases, OAuth credentials, SMTP passwords,
-TLS keys, APK signing material, production `.env` files, or server backups.
+Never add novel text, user data, database exports, OAuth/SMTP credentials, TLS
+keys, APK signing material, production `.env` files, site-verification files or
+server backups.

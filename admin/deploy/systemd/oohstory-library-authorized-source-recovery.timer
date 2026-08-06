@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry terminal ebook downloads through exact alternate sources
+
+[Timer]
+OnBootSec=5m
+OnUnitInactiveSec=10m
+AccuracySec=30s
+Unit=oohstory-library-authorized-source-recovery.service
+
+[Install]
+WantedBy=timers.target

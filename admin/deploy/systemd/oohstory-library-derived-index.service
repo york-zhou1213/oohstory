@@ -1,0 +1,35 @@
+[Unit]
+Description=Manual tone and plot index worker
+After=network-online.target mysql.service remote-fs.target
+Wants=network-online.target
+RequiresMountsFor=/srv/oohstory/library/txt80
+StartLimitIntervalSec=10min
+StartLimitBurst=6
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/oohstory-admin
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/oohstory-admin/library.env
+Environment=OOHSTORY_LIBRARY_MYSQL_READ_TIMEOUT=600
+Environment=OOHSTORY_LIBRARY_MYSQL_WRITE_TIMEOUT=120
+ExecStart=/opt/oohstory-admin/.venv/bin/python /opt/oohstory-admin/scripts/electronic-library/derived_index_worker.py
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=infinity
+TimeoutStopSec=30
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+CPUQuota=100%
+MemoryHigh=1G
+MemoryMax=1536M
+TasksMax=128
+IOWeight=10
+IOReadBandwidthMax=/dev/mapper/ubuntu--vg-ubuntu--lv 16M
+IOWriteBandwidthMax=/dev/mapper/ubuntu--vg-ubuntu--lv 8M
+OOMPolicy=stop
+
+[Install]
+WantedBy=multi-user.target

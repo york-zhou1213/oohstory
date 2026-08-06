@@ -1,0 +1,32 @@
+[Unit]
+Description=Synchronize authorized sites serially with per-site workers
+After=mysql.service redis-server.service network-online.target oohstory-shubaow-browser.service
+Requires=mysql.service redis-server.service
+Wants=oohstory-shubaow-browser.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/oohstory-admin/library.env
+Environment=OOHSTORY_LIBRARY_BROWSER_SERVICE=oohstory-shubaow-browser.service
+Environment=OOHSTORY_LIBRARY_SHUBAOW_CDP_URL=http://127.0.0.1:9223
+Environment=OOHSTORY_LIBRARY_SHUBAOW_WORKERS=3
+Environment=OOHSTORY_LIBRARY_LINOVELIB_WORKERS=3
+Environment=OOHSTORY_LIBRARY_LINOVELIB_CDP_URL=http://127.0.0.1:9223
+Environment=OOHSTORY_LIBRARY_CATALOG_BACKEND=mysql
+Environment=OOHSTORY_LIBRARY_MYSQL_READ_TIMEOUT=120
+Environment=OOHSTORY_LIBRARY_MYSQL_WRITE_TIMEOUT=120
+Environment=OOHSTORY_LIBRARY_IXDZS_MAX_DOWNLOAD_SECONDS=300
+WorkingDirectory=/opt/oohstory-admin
+ExecStartPre=/opt/oohstory-admin/.venv/bin/python /opt/oohstory-admin/scripts/electronic-library/sync_serialized_source_updates.py --sources xbiquge,ixdzs,shubaow,linovelib --pages 2 --apply-direct --limit-per-source 8 --min-interval 3600 --xbiquge-workers 8 --ixdzs-workers 8 --shubaow-workers 5 --linovelib-workers 5
+ExecStart=/opt/oohstory-admin/.venv/bin/python /opt/oohstory-admin/scripts/electronic-library/authorized_site_catalog_sync.py --sources xbiquge,ixdzs,shubaow,linovelib --download-limit 100 --xbiquge-workers 8 --ixdzs-workers 8 --shubaow-workers 5 --linovelib-workers 5 --page-limit 1
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+CPUQuota=250%
+MemoryHigh=2G
+MemoryMax=2560M
+TasksMax=256
+OOMPolicy=stop
+TimeoutStartSec=6h
+StandardOutput=append:/opt/oohstory-admin/electronic-library/txt80/logs/authorized-catalog-sync.log
+StandardError=append:/opt/oohstory-admin/electronic-library/txt80/logs/authorized-catalog-sync.log

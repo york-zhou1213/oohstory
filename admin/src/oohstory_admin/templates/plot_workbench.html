@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}剧情问答与改编 · OOHStory 运维台{% endblock %}
+{% block content %}
+<div class="library-workspace plot-workbench">
+  <header class="library-hero compact-hero plot">
+    <div>
+      <p class="eyebrow">PLOT EVIDENCE & ADAPTATION</p>
+      <h1>剧情问答与改编</h1>
+      <p>先用本地剧情索引召回证据，再将抽象母题、冲突功能与节奏重组为 OOHStory 托管项目的章节方案。</p>
+    </div>
+    <a class="button" href="{{ base_path }}/books/catalog?view=plot">返回剧情索引</a>
+  </header>
+
+  {% if notice %}<div class="alert alert-info" role="status">{{ notice }}</div>{% endif %}
+  {% if error %}<div class="alert alert-error" role="alert">{{ error }}</div>{% endif %}
+  <div class="alert alert-info">本工作台不包含“对标项目基调匹配”。所有问答先查本地索引；方案只抽象剧情功能，禁止复制来源作品的人名、设定、专名、句子与具体桥段。</div>
+
+  <section class="library-panel plot-query-panel">
+    <div>
+      <p class="section-kicker">LOCAL INDEX FIRST</p>
+      <h2>剧情证据问答</h2>
+      <p>输入母题、关系、冲突或情绪目标。未命中时 AI 仅扩展短检索词；命中后最多归纳少量本地证据。</p>
+    </div>
+    <form method="post" action="{{ base_path }}/books/plot-query">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>剧情问题<textarea name="question" minlength="2" maxlength="500" required placeholder="例如：有没有主角在资源断供后靠基础设施逆转战局的剧情？">{{ query_result.question if query_result else '' }}</textarea></label>
+      <label>候选数量<select name="limit"><option value="6">6 本</option><option value="8" selected>8 本</option><option value="12">12 本</option></select></label>
+      <button class="button button-primary" type="submit">查询本地剧情索引</button>
+    </form>
+  </section>
+
+  {% if query_result %}
+    <section class="library-panel plot-answer-panel">
+      <div class="library-panel-heading"><div><p class="section-kicker">EVIDENCE ANSWER</p><h2>证据回答</h2></div><span class="status {{ 'ok' if query_result.index_ready else 'warn' }}">{{ '索引已就绪' if query_result.index_ready else '索引未就绪' }}</span></div>
+      <blockquote>{{ query_result.answer or query_result.message or '没有返回可用回答。' }}</blockquote>
+      <div class="plot-answer-facts">
+        <span>候选 {{ (query_result.results or [])|length }} 本</span>
+        <span>AI 调用 {{ query_result.ai_calls or 0 }} 次</span>
+        <span>证据字符 {{ query_result.evidence_chars_sent or 0 }}</span>
+        <span>{{ query_result.token_strategy or '本地索引优先' }}</span>
+      </div>
+    </section>
+
+    {% if query_result.results %}
+      <form class="library-panel plot-plan-form confirm-form" data-confirm="确认把选中来源重组为剧情改编方案？此步骤不会修改正文。" method="post" action="{{ base_path }}/books/plot-plan">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="question" value="{{ query_result.question }}">
+        <div class="library-panel-heading"><div><p class="section-kicker">ADAPTATION PLAN</p><h2>选择证据并生成改编方案</h2><p>最多选择 12 本；实际传给 AI 的证据会继续压缩，并严格保留原创边界。</p></div><span class="status neutral">尚未写入正文</span></div>
+        <div class="plot-result-grid">
+          {% for item in query_result.results %}
+            <label class="plot-result-card">
+              <span class="catalog-select"><input type="checkbox" name="catalog_id" value="{{ item.catalog_id }}" {% if loop.index <= 3 %}checked{% endif %}>选作剧情来源</span>
+              <strong>《{{ item.title }}》</strong>
+              <small>{{ item.author or '未知作者' }} · {{ item.category or '未分类' }} · {{ item.confirmation_level or '索引候选' }}</small>
+              {% set evidence = (item.evidence or [])|first %}
+              {% if evidence %}<p>{{ evidence.content or evidence.excerpt or evidence.text or evidence.location or '已有本地剧情证据' }}</p>{% endif %}
+            </label>
+          {% endfor %}
+        </div>
+        <div class="plot-plan-fields">
+          <label>融入模式<select name="target_mode" data-plot-target-mode><option value="ai_recommended">AI 推荐章节</option><option value="specified_chapter">指定单章</option><option value="plot_arc">连续剧情段</option></select></label>
+          <label>指定章节<input type="number" name="target_chapter" min="1" max="1000000" placeholder="单章模式填写"></label>
+          <label>起始章节<input type="number" name="start_chapter" min="1" max="1000000" placeholder="剧情段可选"></label>
+          <label>结束章节<input type="number" name="end_chapter" min="1" max="1000000" placeholder="剧情段可选"></label>
+          <label class="wide">额外要求<textarea name="requirement" maxlength="2000" placeholder="例如：保持主角的工程师思维，不提前暴露终局底牌。"></textarea></label>
+        </div>
+        <button class="button button-primary" type="submit">生成剧情改编方案</button>
+      </form>
+    {% endif %}
+  {% endif %}
+
+  <div class="plot-workbench-split">
+    <section class="library-panel plot-plan-detail">
+      <div class="library-panel-heading"><div><p class="section-kicker">MANAGED PROJECT PLAN</p><h2>当前方案</h2></div>{% if plan %}<span class="status {{ 'ok' if plan.status in ['applied','applied_to_text'] else 'neutral' }}">{{ plan.status or 'planned' }}</span>{% endif %}</div>
+      {% if plan %}
+        <h3>{{ plan.adaptation_title or '未命名剧情方案' }}</h3>
+        <p>{{ plan.judgment or plan.reason or '已生成保守方案。' }}</p>
+        <dl class="plot-plan-summary">
+          <div><dt>方案 ID</dt><dd><code>{{ plan.id }}</code></dd></div>
+          <div><dt>建议位置</dt><dd>第 {{ (plan.recommended_target or {}).chapter_start or '?' }}–{{ (plan.recommended_target or {}).chapter_end or '?' }} 章</dd></div>
+          <div><dt>情绪目标</dt><dd>{{ plan.emotional_goal or '未填写' }}</dd></div>
+          <div><dt>原创边界</dt><dd>{{ plan.originality_boundary or '禁止复制来源专名与具体桥段' }}</dd></div>
+        </dl>
+        <div class="plot-material-summary"><strong>重组方案</strong><p>{{ plan.material_summary or '暂无摘要' }}</p></div>
+        {% if plan.chapter_beats %}
+          <div class="plot-beat-list">{% for beat in plan.chapter_beats %}<article><span>第 {{ beat.chapter }} 章 · {{ beat.role }}</span><p>{{ beat.beat }}</p><small>兑现：{{ beat.payoff or '—' }}｜钩子：{{ beat.hook or '—' }}</small></article>{% endfor %}</div>
+        {% endif %}
+        <div class="plot-plan-actions">
+          <form class="confirm-form" data-confirm="确认生成正文差异预览？预览不会写入正文，但可能调用 AI。" method="post" action="{{ base_path }}/books/plot-preview">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="plan_id" value="{{ plan.id }}">
+            <label>预览方式<select name="apply_mode"><option value="local_insert">局部插入</option><option value="replace_chapter">整章重写</option></select></label>
+            <button class="button" type="submit">生成差异预览</button>
+          </form>
+          <form class="confirm-form" data-confirm="确认仅绑定方案到后续章节生成链路？不会改写当前正文。" method="post" action="{{ base_path }}/books/plot-apply">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="plan_id" value="{{ plan.id }}"><input type="hidden" name="operation" value="bind">
+            <button class="button button-primary" type="submit">绑定后续写作</button>
+          </form>
+          <form class="confirm-form" data-confirm="确认按已审阅预览写入正文？系统会校验原文哈希并创建恢复备份。" method="post" action="{{ base_path }}/books/plot-apply">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="plan_id" value="{{ plan.id }}"><input type="hidden" name="operation" value="commit">
+            <button class="button button-danger" type="submit" {% if not preview and plan.status != 'previewed' %}disabled title="请先生成正文差异预览"{% endif %}>确认写入正文</button>
+          </form>
+        </div>
+      {% else %}<p class="empty">先执行剧情问答并选择证据，或从右侧历史方案打开已有记录。</p>{% endif %}
+    </section>
+
+    <aside class="library-panel plot-history">
+      <p class="section-kicker">PROJECT & HISTORY</p><h2>托管项目与方案历史</h2>
+      <div class="boundary-note">固定项目：<code>{{ history.project_root or '/var/lib/oohstory-admin/library-project' }}</code><br>不接受任意项目路径，避免越权读写其他目录。</div>
+      {% if history.project %}<p>{{ history.project.title or 'OOHStory 托管项目' }} · {{ history.project.genre or '题材待配置' }}</p>{% endif %}
+      <nav class="plot-history-list">{% for item in history['items'] %}<a class="{{ 'active' if item.id == selected_plan_id else '' }}" href="{{ base_path }}/books/plot-workbench?plan_id={{ item.id }}"><span>{{ item.adaptation_title or item.question or item.id }}</span><small>{{ item.status or 'planned' }} · {{ item.created_at or '' }}</small></a>{% else %}<p class="empty">暂无历史方案。</p>{% endfor %}</nav>
+    </aside>
+  </div>
+
+  {% if preview %}
+    <section class="library-panel plot-preview-panel">
+      <div class="library-panel-heading"><div><p class="section-kicker">REVIEW BEFORE WRITE</p><h2>正文差异预览</h2></div><span class="status {{ 'ok' if preview.ready_count else 'warn' }}">可写入 {{ preview.ready_count or 0 }} 章 · 待写 {{ preview.unwritten_count or 0 }} 章</span></div>
+      <div class="plot-preview-list">{% for chapter in preview.chapters or [] %}<article><div><strong>第 {{ chapter.chapter }} 章</strong><span class="status {{ 'ok' if chapter.status == 'ready' else 'warn' }}">{{ chapter.status }}</span></div><p>{{ chapter.revision_note or chapter.message or '已生成差异' }}</p>{% if chapter.diff %}<pre>{{ chapter.diff }}</pre>{% endif %}</article>{% endfor %}</div>
+    </section>
+  {% endif %}
+
+  {% if applied %}<section class="library-panel"><p class="section-kicker">APPLIED RESULT</p><h2>应用结果</h2><p>状态：{{ applied.status }}{% if applied.material_path %} · 素材：<code>{{ applied.material_path }}</code>{% endif %}</p>{% if applied.written_chapters %}<p>已写入 {{ applied.written_chapters|length }} 章；每章均已创建可恢复备份。</p>{% endif %}</section>{% endif %}
+</div>
+{% endblock %}

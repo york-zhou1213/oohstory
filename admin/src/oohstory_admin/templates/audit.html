@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}审计日志 · OOHStory 运维台{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">IMMUTABLE OPERATIONS TRAIL</p><h1>审计日志</h1><p class="muted">追踪管理员、动作、目标及执行结果，不记录源码正文或敏感凭据。</p></div><span class="status neutral">最近 100 条</span></div>
+<section class="panel audit-toolbar"><label>筛选当前记录<input type="search" placeholder="搜索操作者、动作、目标或结果" data-audit-search></label><span class="status neutral" data-audit-count>{{ entries|length }} 条记录</span></section>
+<div class="table-wrap audit-table">
+  <table>
+    <thead><tr><th>时间（UTC）</th><th>操作者</th><th>动作</th><th>目标</th><th>结果</th></tr></thead>
+    <tbody>
+    {% for entry in entries %}
+      <tr data-audit-row data-audit-text="{{ entry.created_at }} {{ entry.actor }} {{ entry.action }} {{ entry.target }} {{ entry.result }}"><td data-label="时间（UTC）">{{ entry.created_at }}</td><td data-label="操作者">{{ entry.actor }}</td><td data-label="动作"><code>{{ entry.action }}</code></td><td data-label="目标"><code>{{ entry.target }}</code></td><td data-label="结果">{{ entry.result }}</td></tr>
+    {% else %}<tr><td colspan="5">暂无审计事件。</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

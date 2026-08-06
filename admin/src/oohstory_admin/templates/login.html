@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <title>登录 · OOHStory 运维台</title>
+  <link rel="stylesheet" href="{{ static_path }}/admin.css">
+</head>
+<body class="login-page">
+  <div class="login-orbit login-orbit-one" aria-hidden="true"></div>
+  <div class="login-orbit login-orbit-two" aria-hidden="true"></div>
+  <main class="login-card">
+    <div class="brand brand-login">
+      <span class="brand-mark" aria-hidden="true">O!</span>
+      <span><strong>OOHStory</strong><small>Library Operations</small></span>
+    </div>
+    <p class="eyebrow">SECURE LOCAL CONSOLE</p>
+    <h1>欢迎回来</h1>
+    <p class="muted">登录本机管理后台，统一管理书库、索引、拆书任务与服务管道。</p>
+    {% if not configured %}
+      <div class="alert alert-error" role="alert">管理员凭据尚未配置，登录已关闭。</div>
+    {% endif %}
+    {% if error %}
+      <div class="alert alert-error" role="alert">{{ error }}</div>
+    {% endif %}
+    <form class="stack" method="post" action="{{ login_path }}">
+      <input type="hidden" name="csrf_token" value="{{ login_csrf }}">
+      <label>用户名
+        <input name="username" type="text" maxlength="128" autocomplete="username" required autofocus>
+      </label>
+      <label>密码
+        <input name="password" type="password" maxlength="4096" autocomplete="current-password" required>
+      </label>
+      <button class="button button-primary login-submit" type="submit" {% if not configured %}disabled{% endif %}>进入管理后台</button>
+    </form>
+    <p class="version"><span></span> Loopback only · v{{ version }}</p>
+  </main>
+</body>
+</html>

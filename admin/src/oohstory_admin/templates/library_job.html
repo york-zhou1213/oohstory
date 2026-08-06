@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}书库后台任务 · OOHStory 运维台{% endblock %}
+{% block content %}
+<div class="library-workspace">
+  <header class="page-heading"><div><p class="eyebrow">LIBRARY BACKGROUND JOB</p><h1>书库后台任务</h1></div><span class="status {{ 'ok' if job.status == 'completed' else 'warn' if job.status in ['queued','running'] else 'error' }}">{{ job.status }}</span></header>
+  <section class="library-panel job-detail-panel" {% if job.status in ['queued','running'] %}data-job-refresh{% endif %}><dl class="service-paths"><div><dt>任务 ID</dt><dd><code>{{ job.job_id }}</code></dd></div><div><dt>类型</dt><dd>{{ job.kind }}</dd></div><div><dt>创建时间</dt><dd>{{ job.created_at or '—' }}</dd></div><div><dt>更新时间</dt><dd>{{ job.updated_at or '—' }}</dd></div></dl><p>{{ job.message or '等待状态更新' }}</p>{% if job.error %}<div class="alert alert-error">{{ job.error }}</div>{% endif %}{% if job.result %}<pre class="job-result">{{ job.result | tojson(indent=2) }}</pre>{% endif %}<p class="card-actions"><a class="button" href="{{ base_path }}/books/catalog">返回小说目录</a>{% if job.status in ['queued','running'] %}<a class="button button-primary" href="{{ base_path }}/books/jobs/{{ job.job_id }}">刷新状态</a>{% endif %}</p></section>
+</div>
+{% endblock %}

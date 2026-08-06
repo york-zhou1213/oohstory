@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <title>{% block title %}OOHStory 运维台{% endblock %}</title>
+  <link rel="stylesheet" href="{{ static_path }}/admin.css?v={{ version }}">
+  <script src="{{ static_path }}/admin.js?v={{ version }}" defer></script>
+</head>
+<body class="admin-body" data-page="{{ page }}">
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
+  <header class="topbar">
+    <div class="topbar-start">
+      <button class="icon-button nav-toggle" type="button" data-nav-toggle aria-label="打开管理导航" aria-controls="admin-sidebar" aria-expanded="false">
+        <span aria-hidden="true"></span><span aria-hidden="true"></span><span aria-hidden="true"></span>
+      </button>
+      <a class="brand" href="{{ ui_root }}" aria-label="OOHStory 运维台首页">
+        <span class="brand-mark" aria-hidden="true">O!</span>
+        <span><strong>OOHStory</strong><small>Library Operations</small></span>
+      </a>
+    </div>
+    <div class="topbar-context" aria-hidden="true">
+      <span class="context-dot"></span>
+      <span>{{ {'dashboard':'系统概览','library':'电子书库总览','library_sync':'同步调度','books':'小说目录','operations':'运营管理','pipeline':'管道与服务','audit':'审计日志'}.get(page, '运维工作台') }}</span>
+    </div>
+    <div class="account">
+      <button class="icon-button theme-toggle" type="button" data-theme-toggle aria-label="切换明暗主题" title="切换明暗主题"><span aria-hidden="true">◐</span></button>
+      <span class="account-avatar" aria-hidden="true">{{ (username or 'O')[:1]|upper }}</span>
+      <span class="account-copy"><strong>{{ username }}</strong><small>本机管理员</small></span>
+      <form method="post" action="{{ base_path }}/logout">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="button button-quiet" type="submit">退出</button>
+      </form>
+    </div>
+  </header>
+  <div class="shell">
+    <aside id="admin-sidebar" class="sidebar" data-sidebar>
+      <nav aria-label="管理导航">
+        <p class="nav-section-label">工作台</p>
+        <a {% if page == 'dashboard' %}aria-current="page"{% endif %} href="{{ ui_root }}"><span class="nav-icon" aria-hidden="true">⌂</span><span><strong>系统概览</strong><small>资源与服务健康</small></span></a>
+        <p class="nav-section-label">电子书库</p>
+        <a {% if (nav_key or page) == 'library' %}aria-current="page"{% endif %} href="{{ base_path }}/library"><span class="nav-icon" aria-hidden="true">▦</span><span><strong>书库总览</strong><small>规模、队列与资产</small></span></a>
+        <a {% if (nav_key or '') == 'catalog' %}aria-current="page"{% endif %} href="{{ base_path }}/books/catalog"><span class="nav-icon" aria-hidden="true">▤</span><span><strong>小说目录</strong><small>书目、索引与拆书</small></span></a>
+        <a {% if (nav_key or '') == 'search' %}aria-current="page"{% endif %} href="{{ base_path }}/books/search"><span class="nav-icon" aria-hidden="true">⌕</span><span><strong>书源搜索</strong><small>检索与远程归档</small></span></a>
+        <a {% if (nav_key or page) == 'sync' or page == 'library_sync' %}aria-current="page"{% endif %} href="{{ base_path }}/library/sync"><span class="nav-icon" aria-hidden="true">↻</span><span><strong>同步调度</strong><small>定时、全力与服务控制</small></span></a>
+        <a class="nav-secondary" href="{{ base_path }}/library/sync#site-full-sync"><span class="nav-icon" aria-hidden="true">⇶</span><span><strong>站点全力同步</strong><small>TXT80 与四站独立控制</small></span></a>
+        <p class="nav-section-label">运营管理</p>
+        <a {% if page == 'operations' %}aria-current="page"{% endif %} href="{{ base_path }}/operations"><span class="nav-icon" aria-hidden="true">◎</span><span><strong>注册与内容运营</strong><small>用户、上下架、分类与上传</small></span></a>
+        <p class="nav-section-label">系统治理</p>
+        <a {% if page == 'pipeline' %}aria-current="page"{% endif %} href="{{ base_path }}/pipeline"><span class="nav-icon" aria-hidden="true">⌘</span><span><strong>管道与服务</strong><small>脚本与 systemd</small></span></a>
+        <a {% if page == 'audit' %}aria-current="page"{% endif %} href="{{ base_path }}/audit"><span class="nav-icon" aria-hidden="true">✓</span><span><strong>审计日志</strong><small>操作追踪与问责</small></span></a>
+      </nav>
+      <div class="sidebar-boundary">
+        <span class="pulse-dot" aria-hidden="true"></span>
+        <div><strong>本机安全模式</strong><small>仅 127.0.0.1 可访问</small></div>
+      </div>
+    </aside>
+    <button class="nav-scrim" type="button" data-nav-scrim aria-label="关闭管理导航" aria-hidden="true" tabindex="-1"></button>
+    <main id="main-content" class="content" tabindex="-1">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+  <footer class="footer">OOHStory Admin v{{ version }} · 只在受信任网络中使用</footer>
+</body>
+</html>

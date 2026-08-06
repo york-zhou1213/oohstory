@@ -1,0 +1,11 @@
+[Unit]
+Description=Continue authorized online catalog registration until complete
+
+[Timer]
+OnBootSec=2m
+OnUnitInactiveSec=30s
+AccuracySec=5s
+Unit=oohstory-library-authorized-catalog-sync.service
+
+[Install]
+WantedBy=timers.target

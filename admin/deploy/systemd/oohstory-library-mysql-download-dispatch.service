@@ -1,0 +1,15 @@
+[Unit]
+Description=Refill OOHStory Redis download stream from durable MySQL jobs
+After=mysql.service redis-server.service network-online.target
+Requires=mysql.service redis-server.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/oohstory-admin/library.env
+Environment=OOHSTORY_LIBRARY_CATALOG_BACKEND=mysql
+WorkingDirectory=/opt/oohstory-admin
+ExecStart=/opt/oohstory-admin/.venv/bin/python /opt/oohstory-admin/scripts/electronic-library/dispatch_mysql_download_jobs.py --limit 1000
+Nice=10
+CPUQuota=100%
+MemoryMax=512M
+TimeoutStartSec=5min

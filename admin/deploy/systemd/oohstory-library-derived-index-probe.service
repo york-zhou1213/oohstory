@@ -1,0 +1,13 @@
+[Unit]
+Description=Probe and recover the durable derived-index pipeline
+After=mysql.service remote-fs.target
+RequiresMountsFor=/srv/oohstory/library/txt80
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/oohstory-admin
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/oohstory-admin/library.env
+ExecStart=/opt/oohstory-admin/.venv/bin/python /opt/oohstory-admin/scripts/electronic-library/derived_index_worker.py --probe
+TimeoutStartSec=30

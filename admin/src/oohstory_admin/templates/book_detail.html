@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}书籍详情 · OOHStory 运维台{% endblock %}
+{% block content %}
+<a class="back-link" href="{{ base_path }}/books/catalog">← 返回小说目录</a>
+{% if bundle.book.available %}
+  {% set book = bundle.book.data %}
+  <div class="page-heading detail-heading"><div><p class="eyebrow">{{ book.category or '未分类' }}</p><h1>{{ book.title }}</h1><p>{{ book.author or '未知作者' }}</p></div><span class="status neutral">只读</span></div>
+  <div class="metric-grid">
+    <article class="metric"><span>章节数</span><strong>{% if bundle.chapters.available %}{{ bundle.chapters.data.chapter_count }}{% else %}—{% endif %}</strong><small>{{ bundle.chapters.error or 'Reader 实际目录' }}</small></article>
+    <article class="metric"><span>阅读次数</span><strong>{% if bundle.metrics.available %}{{ bundle.metrics.data.read_count }}{% else %}—{% endif %}</strong></article>
+    <article class="metric"><span>下载次数</span><strong>{% if bundle.metrics.available %}{{ bundle.metrics.data.download_count }}{% else %}—{% endif %}</strong></article>
+    <article class="metric"><span>源文件</span><strong>{{ book.source_bytes|filesize }}</strong><small>约 {{ book.approx_word_count or 0 }} 字</small></article>
+  </div>
+  <section class="panel"><h2>简介</h2><p class="long-text">{{ book.summary or '暂无简介' }}</p></section>
+  <section class="panel"><h2>能力边界</h2><p>{{ bundle.capabilities.reason }}。当前可用操作：搜索、详情、章节计数、指标查看。</p></section>
+{% else %}
+  <div class="alert alert-error">书籍详情不可用：{{ bundle.book.error }}</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly local txt80 catalog rescan
+
+[Timer]
+OnCalendar=Sun *-*-* 02:20:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=15m
+Unit=oohstory-library-catalog-scan.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,143 @@
+name: ${COMPOSE_PROJECT_NAME:-oohstory}
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/mysql_root_password
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --transaction-isolation=READ-COMMITTED
+    secrets:
+      - mysql_root_password
+      - mysql_writer_password
+      - mysql_admin_reader_password
+      - mysql_public_reader_password
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./admin:/workspace/admin:ro
+      - ./deploy/compose/mysql-init.sh:/docker-entrypoint-initdb.d/001-oohstory-init.sh:ro
+    ports:
+      - 127.0.0.1:${OOHSTORY_MYSQL_PUBLISH_PORT:-13306}:3306
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=$$(cat /run/secrets/mysql_root_password) mysqladmin ping -h127.0.0.1 -uroot --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    networks: [backend, edge]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [backend]
+
+  reader:
+    build:
+      context: .
+      dockerfile: Dockerfile.reader
+    restart: unless-stopped
+    depends_on:
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    environment:
+      OOHSTORY_CATALOG_BACKEND: mysql
+      OOHSTORY_LIBRARY_ROOT: /srv/oohstory/library
+      OOHSTORY_OBJECT_ROOT: /srv/oohstory/library
+      OOHSTORY_STATE_ROOT: /var/lib/oohstory-reader
+      OOHSTORY_ACCOUNT_DATABASE: /var/lib/oohstory-reader/accounts.sqlite3
+      OOHSTORY_USER_UPLOAD_ROOT: /var/lib/oohstory-reader/user-uploads
+      OOHSTORY_USER_AVATAR_ROOT: /var/lib/oohstory-reader/user-avatars
+      OOHSTORY_SUBMISSION_HANDOFF_ROOT: /var/lib/oohstory-reader/submission-handoff
+      OOHSTORY_MYSQL_HOST: mysql
+      OOHSTORY_MYSQL_PORT: 3306
+      OOHSTORY_MYSQL_DATABASE: oohstory_library
+      OOHSTORY_MYSQL_USER: oohstory_public_reader
+      OOHSTORY_MYSQL_PASSWORD_FILE: /run/secrets/mysql_public_reader_password
+      OOHSTORY_PUBLIC_ORIGIN: ${OOHSTORY_PUBLIC_ORIGIN:-http://localhost:8091}
+      OOHSTORY_ALLOWED_HOSTS: localhost,127.0.0.1,reader
+      OOHSTORY_CONTAINER_STATE_DIRS: /var/lib/oohstory-reader
+    secrets: [mysql_public_reader_password]
+    volumes:
+      - ./data/library:/srv/oohstory/library:ro
+      - reader-state:/var/lib/oohstory-reader
+    ports:
+      - 127.0.0.1:${OOHSTORY_READER_PUBLISH_PORT:-8091}:8091
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    networks: [backend, edge]
+
+  admin:
+    build:
+      context: .
+      dockerfile: admin/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      reader: {condition: service_healthy}
+    environment:
+      OOHSTORY_ADMIN_USERNAME: ${OOHSTORY_ADMIN_USERNAME:?run scripts/prepare_compose_env.py}
+      OOHSTORY_ADMIN_PASSWORD_HASH: ${OOHSTORY_ADMIN_PASSWORD_HASH:?run scripts/prepare_compose_env.py}
+      OOHSTORY_ADMIN_SESSION_SECRET: ${OOHSTORY_ADMIN_SESSION_SECRET:?run scripts/prepare_compose_env.py}
+      OOHSTORY_ADMIN_ALLOWED_HOSTS: localhost,127.0.0.1,admin
+      OOHSTORY_ADMIN_READER_URL: http://reader:8091
+      OOHSTORY_ADMIN_READER_ALLOWED_HOSTS: reader
+      OOHSTORY_ADMIN_DATABASE: /var/lib/oohstory-admin/audit.db
+      OOHSTORY_ADMIN_USE_SUDO_HELPER: "0"
+      OOHSTORY_LIBRARY_ROOT: /srv/oohstory/library
+      OOHSTORY_LIBRARY_RUNTIME_DIR: /srv/oohstory/library/全局索引
+      OOHSTORY_LIBRARY_OBJECT_ROOT: /srv/oohstory/library
+      OOHSTORY_LIBRARY_MYSQL_HOST: mysql
+      OOHSTORY_LIBRARY_MYSQL_PORT: 3306
+      OOHSTORY_LIBRARY_MYSQL_DATABASE: oohstory_library
+      OOHSTORY_LIBRARY_MYSQL_USER: oohstory_library_reader
+      OOHSTORY_LIBRARY_MYSQL_PASSWORD_FILE: /run/secrets/mysql_admin_reader_password
+      OOHSTORY_LIBRARY_REDIS_HOST: redis
+      OOHSTORY_LIBRARY_REDIS_PORT: 6379
+      OOHSTORY_LIBRARY_REDIS_DB: 6
+      OOHSTORY_LIBRARY_REDIS_PREFIX: "oohstory:"
+      OOHSTORY_CONTAINER_STATE_DIRS: /var/lib/oohstory-admin
+    secrets: [mysql_admin_reader_password]
+    volumes:
+      - ./data/library:/srv/oohstory/library:ro
+      - admin-state:/var/lib/oohstory-admin
+    ports:
+      - 127.0.0.1:${OOHSTORY_ADMIN_PUBLISH_PORT:-8092}:8092
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8092/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    networks: [backend, edge]
+
+secrets:
+  mysql_root_password:
+    environment: OOHSTORY_MYSQL_ROOT_PASSWORD
+  mysql_writer_password:
+    environment: OOHSTORY_MYSQL_WRITER_PASSWORD
+  mysql_admin_reader_password:
+    environment: OOHSTORY_MYSQL_ADMIN_READER_PASSWORD
+  mysql_public_reader_password:
+    environment: OOHSTORY_MYSQL_PUBLIC_READER_PASSWORD
+
+volumes:
+  mysql-data:
+  reader-state:
+  admin-state:
+
+networks:
+  backend:
+    internal: true
+  edge:

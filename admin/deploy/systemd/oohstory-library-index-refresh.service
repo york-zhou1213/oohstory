@@ -1,0 +1,22 @@
+[Unit]
+Description=Legacy manual tone-only OOHStory library index refresh
+After=mysql.service
+Requires=mysql.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/oohstory-admin/library.env
+Environment=OOHSTORY_LIBRARY_CATALOG_BACKEND=mysql
+WorkingDirectory=/opt/oohstory-admin
+ExecStart=/opt/oohstory-admin/.venv/bin/python /opt/oohstory-admin/scripts/electronic-library/refresh_library_indexes.py
+Nice=15
+CPUQuota=50%
+MemoryHigh=384M
+MemoryMax=512M
+TasksMax=64
+IOWeight=10
+IOReadBandwidthMax=/dev/mapper/ubuntu--vg-ubuntu--lv 8M
+IOWriteBandwidthMax=/dev/mapper/ubuntu--vg-ubuntu--lv 4M
+OOMPolicy=stop
+StandardOutput=append:/opt/oohstory-admin/electronic-library/txt80/logs/index-refresh.log
+StandardError=append:/opt/oohstory-admin/electronic-library/txt80/logs/index-refresh.log

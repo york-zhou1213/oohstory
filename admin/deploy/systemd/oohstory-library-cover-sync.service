@@ -1,0 +1,21 @@
+[Unit]
+Description=Synchronize real txt80 book covers with the local catalog
+After=mysql.service redis-server.service network-online.target oohstory-admin.service
+Requires=mysql.service redis-server.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/oohstory-admin/library.env
+Environment=OOHSTORY_LIBRARY_CATALOG_BACKEND=mysql
+Environment=OOHSTORY_LIBRARY_MYSQL_POOL_SIZE=3
+Environment=OOHSTORY_LIBRARY_MYSQL_READ_TIMEOUT=120
+Environment=OOHSTORY_LIBRARY_MYSQL_WRITE_TIMEOUT=120
+WorkingDirectory=/opt/oohstory-admin
+ExecStart=/opt/oohstory-admin/.venv/bin/python scripts/electronic-library/txt80_cover_sync.py --watch --library local --source txt80 --limit 50 --workers 2 --delay 0.20
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

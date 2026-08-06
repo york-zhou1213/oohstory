@@ -1,0 +1,7 @@
+# Install as /etc/sudoers.d/oohstory-admin with owner root:root and mode 0440.
+# The root-owned helper performs a second exact action/unit allowlist check.
+oohstory-admin ALL=(root) NOPASSWD: /usr/local/libexec/oohstory-admin-systemctl *
+# The script publisher only accepts fixed script IDs and never accepts a path.
+oohstory-admin ALL=(root) NOPASSWD: /usr/local/libexec/oohstory-admin-script-store *
+# Shared-library mutations accept JSON on stdin and no user-selected path.
+oohstory-admin ALL=(root) NOPASSWD: /usr/local/libexec/oohstory-admin-library-action

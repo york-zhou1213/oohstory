@@ -1,0 +1,25 @@
+[Unit]
+Description=AI-redraw existing covers and generate title-based fallback covers
+After=mysql.service redis-server.service network-online.target oohstory-library-cover-sync.service
+Requires=mysql.service redis-server.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/oohstory-admin/library.env
+Environment=OOHSTORY_LIBRARY_CATALOG_BACKEND=mysql
+Environment=OOHSTORY_LIBRARY_MYSQL_READ_TIMEOUT=120
+Environment=OOHSTORY_LIBRARY_MYSQL_WRITE_TIMEOUT=120
+WorkingDirectory=/opt/oohstory-admin
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/oohstory-admin/.venv/bin/python scripts/electronic-library/clean_cover_worker.py
+Restart=always
+RestartSec=15
+Nice=15
+MemoryHigh=1G
+MemoryMax=1536M
+TasksMax=128
+OOMPolicy=stop
+
+[Install]
+WantedBy=multi-user.target

@@ -21,7 +21,7 @@ Environment=OOHSTORY_OBJECT_ROOT=/srv/oohstory/library
 Environment=OOHSTORY_MYSQL_HOST=127.0.0.1
 Environment=OOHSTORY_MYSQL_PORT=3306
 Environment=OOHSTORY_MYSQL_DATABASE=oohstory_library
-Environment=OOHSTORY_MYSQL_USER=oohstory_reader
+Environment=OOHSTORY_MYSQL_USER=oohstory_public_reader
 Environment=OOHSTORY_MYSQL_PASSWORD_FILE=/etc/oohstory-reader/mysql-password
 Environment=OOHSTORY_MYSQL_POOL_SIZE=8
 Environment=OOHSTORY_STATE_ROOT=/var/lib/oohstory-reader

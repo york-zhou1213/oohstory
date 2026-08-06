@@ -1,0 +1,25 @@
+[Unit]
+Description=Consume authorized online book body download queue
+After=mysql.service redis-server.service network-online.target
+Requires=mysql.service redis-server.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/oohstory-admin/library.env
+Environment=OOHSTORY_LIBRARY_CATALOG_BACKEND=mysql
+WorkingDirectory=/opt/oohstory-admin
+ExecStart=/opt/oohstory-admin/.venv/bin/python /opt/oohstory-admin/scripts/electronic-library/authorized_site_download_worker.py --limit 24 --xbiquge-concurrency 2 --ixdzs-concurrency 2 --min-free-gb 50
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=5
+CPUQuota=250%
+MemoryHigh=2G
+MemoryMax=2560M
+TasksMax=256
+OOMPolicy=stop
+TimeoutStartSec=6h
+StandardOutput=append:/opt/oohstory-admin/electronic-library/txt80/logs/authorized-download.log
+StandardError=append:/opt/oohstory-admin/electronic-library/txt80/logs/authorized-download.log
+
+[Install]
+WantedBy=multi-user.target

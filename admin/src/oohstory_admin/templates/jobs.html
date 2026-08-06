@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}任务与作业 · OOHStory 运维台{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">Webnovel electronic-library</p><h1>任务与作业</h1></div><span class="status neutral">状态接口</span></div>
+<div class="job-grid">
+{% for name, item in statuses.items() %}
+  <article class="job-card">
+    <div class="section-title"><h2>{{ name|replace('_', ' ') }}</h2><span class="status {{ 'ok' if item.available else 'bad' }}">{{ '可用' if item.available else '不可用' }}</span></div>
+    <code>{{ item.endpoint }}</code>
+    {% if item.available %}
+      {% set data = item.data %}
+      <dl class="job-facts">
+        {% if data.status is defined %}<div><dt>状态</dt><dd>{{ data.status }}</dd></div>{% endif %}
+        {% if data.running is defined %}<div><dt>运行中</dt><dd>{{ data.running }}</dd></div>{% endif %}
+        {% if data.processed is defined %}<div><dt>已处理</dt><dd>{{ data.processed }} / {{ data.total or '—' }}</dd></div>{% endif %}
+        {% if data.indexed is defined %}<div><dt>已索引</dt><dd>{{ data.indexed }}</dd></div>{% endif %}
+        {% if data.ready_for_mysql_reads is defined %}<div><dt>MySQL 读取</dt><dd>{{ '就绪' if data.ready_for_mysql_reads else '未就绪' }}</dd></div>{% endif %}
+      </dl>
+      {% if data.message is defined %}<p>{{ data.message }}</p>{% endif %}
+    {% else %}<p class="error-text">{{ item.error }}</p>{% endif %}
+  </article>
+{% endfor %}
+</div>
+{% endblock %}

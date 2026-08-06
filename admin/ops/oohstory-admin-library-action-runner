@@ -1,0 +1,1077 @@
+#!/usr/bin/env python3
+"""Root-only exact action dispatcher for OOHStory's shared library.
+
+The web process can submit only structured IDs through stdin.  This program
+never accepts a filesystem path, command, environment value, or SQL fragment
+from the request.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import re
+import secrets
+import shlex
+import sqlite3
+import subprocess
+import sys
+import unicodedata
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+
+ENV_FILE = Path("/etc/oohstory-admin/library.env")
+PROJECT_ROOT = Path("/var/lib/oohstory-admin/library-project")
+JOB_ROOT = Path("/var/lib/oohstory-admin/library-action-jobs")
+UPLOAD_ROOT = Path("/var/lib/oohstory-admin/cover-uploads")
+ACCOUNTS_DATABASE = Path("/var/lib/oohstory-reader/accounts.sqlite3")
+RUNNER_PATH = Path("/opt/oohstory-admin/ops/oohstory-admin-library-action-runner")
+OOHSTORY_PYTHON = Path("/opt/oohstory-admin/.venv/bin/python")
+OOHSTORY_CATALOG_DELETE = Path(
+    "/opt/oohstory-admin/scripts/electronic-library/delete_catalog_books.py"
+)
+JOB_ID_RE = re.compile(r"^[a-f0-9]{20}$")
+TASK_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+PLAN_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+SEARCH_SOURCES = {
+    "local_txt80_catalog",
+    "authorized_xbiquge",
+    "authorized_ixdzs",
+    "authorized_shubaow",
+    "linovelib",
+    "authorized_txt80",
+    "fanqie_desktop_bridge",
+    "authorized_zlibrary",
+    "project_gutenberg",
+}
+IMPORT_PROVIDERS = SEARCH_SOURCES - {"local_txt80_catalog"}
+SITE_FULL_SYNC_GROUPS = {
+    "txt80": "local",
+    "xbiquge": "fanqie",
+    "ixdzs": "fanqie",
+    "shubaow": "fanqie",
+    "linovelib": "fanqie",
+}
+SAFE_ENV_RE = re.compile(
+    r"^(?:OOHSTORY_LIBRARY_|WEBNOVEL_LIBRARY_|WEBNOVEL_GLOBAL_DECONSTRUCTION_ROOT$|"
+    r"LIBRARY_TASK_USE_SYSTEMD$)[A-Z0-9_]*$"
+)
+
+
+def configure_root_runtime_environment() -> None:
+    """Use the root-owned AI CLI/config home, independent of sudo's caller."""
+
+    os.environ["HOME"] = "/root"
+    os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def emit(ok: bool, message: str, data: dict[str, Any] | None = None, code: int = 0) -> None:
+    print(
+        json.dumps(
+            {"ok": ok, "message": str(message)[:500], "data": data or {}},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+    raise SystemExit(code)
+
+
+def load_environment() -> None:
+    if not ENV_FILE.is_file() or ENV_FILE.is_symlink():
+        raise RuntimeError("电子书库写入环境尚未配置")
+    if ENV_FILE.stat().st_size > 64 * 1024:
+        raise RuntimeError("电子书库写入环境文件异常")
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped:
+            raise RuntimeError("电子书库写入环境格式无效")
+        name, raw = stripped.split("=", 1)
+        name = name.strip()
+        if not SAFE_ENV_RE.fullmatch(name):
+            continue
+        parts = shlex.split(raw.strip(), posix=True)
+        value = parts[0] if len(parts) == 1 else raw.strip()
+        os.environ[name] = value
+    os.environ["LIBRARY_TASK_USE_SYSTEMD"] = "1"
+    os.environ.pop("OOHSTORY_LIBRARY_LEGACY_UNIT_NAMES", None)
+
+
+def ensure_roots() -> None:
+    PROJECT_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (PROJECT_ROOT / ".webnovel").mkdir(exist_ok=True, mode=0o700)
+    JOB_ROOT.mkdir(parents=True, exist_ok=True, mode=0o750)
+    os.chmod(PROJECT_ROOT, 0o700)
+    os.chmod(PROJECT_ROOT / ".webnovel", 0o700)
+    os.chmod(JOB_ROOT, 0o750)
+
+
+def read_request() -> dict[str, Any]:
+    raw = sys.stdin.buffer.read(64 * 1024 + 1)
+    if len(raw) > 64 * 1024:
+        raise ValueError("请求超过安全上限")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("请求不是有效 JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("请求必须是 JSON 对象")
+    return payload
+
+
+def ids(payload: dict[str, Any], *, maximum: int) -> list[int]:
+    values = payload.get("catalog_ids")
+    if not isinstance(values, list):
+        raise ValueError("catalog_ids 必须是数组")
+    normalized = sorted({int(value) for value in values if int(value) > 0})
+    if not normalized:
+        raise ValueError("请至少选择一本作品")
+    if len(normalized) > maximum:
+        raise ValueError(f"单次最多处理 {maximum} 本作品")
+    return normalized
+
+
+def safe_text(payload: dict[str, Any], name: str, maximum: int) -> str:
+    value = str(payload.get(name) or "").strip()
+    if not value or len(value) > maximum or "\x00" in value:
+        raise ValueError(f"{name} 无效")
+    return value
+
+
+def optional_text(payload: dict[str, Any], name: str, maximum: int) -> str:
+    value = str(payload.get(name) or "").strip()
+    if len(value) > maximum or "\x00" in value:
+        raise ValueError(f"{name} 无效")
+    return value
+
+
+def strict_bool(payload: dict[str, Any], name: str) -> bool:
+    value = payload.get(name)
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} 必须是布尔值")
+    return value
+
+
+def optional_positive_int(payload: dict[str, Any], name: str) -> int | None:
+    value = payload.get(name)
+    if value is None or value == "":
+        return None
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} 必须是正整数") from exc
+    if normalized <= 0 or normalized > 1_000_000:
+        raise ValueError(f"{name} 必须是正整数")
+    return normalized
+
+
+def account_connection() -> sqlite3.Connection:
+    if not ACCOUNTS_DATABASE.is_file() or ACCOUNTS_DATABASE.is_symlink():
+        raise RuntimeError("注册用户数据库不可用")
+    connection = sqlite3.connect(ACCOUNTS_DATABASE, timeout=5.0)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("PRAGMA busy_timeout=5000")
+    required = {"users", "user_sessions", "registration_invites", "managed_categories"}
+    present = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    if not required.issubset(present):
+        connection.close()
+        raise RuntimeError("注册用户数据库结构不完整")
+    return connection
+
+
+def normalize_label(value: object, *, maximum: int, field: str) -> str:
+    text = " ".join(unicodedata.normalize("NFKC", str(value or "")).split())
+    if not text or len(text) > maximum or "\x00" in text:
+        raise ValueError(f"{field} 无效")
+    return text
+
+
+def operations_overview(payload: dict[str, Any]) -> dict[str, Any]:
+    query = optional_text(payload, "query", 100)
+    status = optional_text(payload, "status", 16)
+    if status not in {"", "active", "disabled"}:
+        raise ValueError("注册用户状态筛选无效")
+    conditions: list[str] = []
+    params: list[Any] = []
+    if query:
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conditions.append("(u.email LIKE ? ESCAPE '\\' OR u.display_name LIKE ? ESCAPE '\\')")
+        params.extend((f"%{escaped}%", f"%{escaped}%"))
+    if status:
+        conditions.append("u.status=?")
+        params.append(status)
+    where = " WHERE " + " AND ".join(conditions) if conditions else ""
+    current = now()
+    with account_connection() as connection:
+        users = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT u.id,u.email,u.display_name,u.status,u.email_verified_at,"
+                "u.created_at,u.updated_at,u.last_login_at,COUNT(DISTINCT s.id) active_sessions "
+                "FROM users u LEFT JOIN user_sessions s ON s.user_id=u.id "
+                "AND s.revoked_at IS NULL AND s.expires_at>?"
+                f"{where} GROUP BY u.id ORDER BY u.created_at DESC,u.id DESC LIMIT 100",
+                (current, *params),
+            )
+        ]
+        invites = [
+            dict(row) | {"disabled": bool(row["disabled_at"])}
+            for row in connection.execute(
+                "SELECT id,label,max_uses,used_count,created_at,expires_at,disabled_at,last_used_at "
+                "FROM registration_invites ORDER BY created_at DESC LIMIT 100"
+            )
+        ]
+        categories = [
+            dict(row) | {"enabled": bool(row["enabled"]), "is_custom": bool(row["is_custom"])}
+            for row in connection.execute(
+                "SELECT id,source_name,display_name,description,enabled,sort_order,is_custom,"
+                "created_at,updated_at FROM managed_categories ORDER BY sort_order,display_name,id"
+            )
+        ]
+        counts = dict(
+            connection.execute(
+                "SELECT COUNT(*) users,SUM(status='active') active_users FROM users"
+            ).fetchone()
+        )
+    uploads: list[dict[str, Any]] = []
+    if JOB_ROOT.is_dir():
+        for path in sorted(JOB_ROOT.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:100]:
+            try:
+                job = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if job.get("kind") == "admin_novel":
+                uploads.append(sanitized_job(job) | {"title": str((job.get("request") or {}).get("title") or "")[:120]})
+    return {
+        "summary": {"users": int(counts.get("users") or 0), "active_users": int(counts.get("active_users") or 0)},
+        "users": users,
+        "invites": invites,
+        "categories": categories,
+        "uploads": uploads,
+    }
+
+
+def book_publication_overview(payload: dict[str, Any]) -> dict[str, Any]:
+    unexpected = set(payload) - {"action", "query", "publication"}
+    if unexpected:
+        raise ValueError("书籍上下架筛选包含未允许字段")
+    query = optional_text(payload, "query", 100)
+    publication = optional_text(payload, "publication", 16)
+    if publication not in {"", "published", "unpublished"}:
+        raise ValueError("书籍上架状态筛选无效")
+    service = service_instance()
+    if service.mysql_catalog is None:
+        raise RuntimeError("MySQL 正式书库不可用")
+    return service.mysql_catalog.operations_publication_books(
+        query=query,
+        publication=publication,
+        limit=100,
+    )
+
+
+def update_book_publication(payload: dict[str, Any]) -> dict[str, Any]:
+    unexpected = set(payload) - {"action", "catalog_id", "published", "reason"}
+    if unexpected:
+        raise ValueError("书籍上下架请求包含未允许字段")
+    catalog_id = payload.get("catalog_id")
+    if type(catalog_id) is not int or catalog_id <= 0:
+        raise ValueError("书籍目录标识无效")
+    published = strict_bool(payload, "published")
+    reason = normalize_label(payload.get("reason"), maximum=240, field="操作原因")
+    service = service_instance()
+    if service.mysql_catalog is None:
+        raise RuntimeError("MySQL 正式书库不可用")
+    return service.mysql_catalog.set_book_publication(
+        catalog_id,
+        published=published,
+        reason=reason,
+    )
+
+
+def create_registration_invite(payload: dict[str, Any]) -> dict[str, Any]:
+    label = optional_text(payload, "label", 80)
+    max_uses = int(payload.get("max_uses") or 1)
+    expires_days = int(payload.get("expires_in_days") or 30)
+    if not 1 <= max_uses <= 100_000 or not 1 <= expires_days <= 365:
+        raise ValueError("邀请码使用次数或有效期无效")
+    invite_id = str(uuid.uuid4())
+    code = f"OOH-{secrets.token_urlsafe(24)}"
+    created = datetime.now(timezone.utc)
+    expires_at = (created + timedelta(days=expires_days)).isoformat(timespec="seconds")
+    with account_connection() as connection:
+        connection.execute(
+            "INSERT INTO registration_invites(id,code_hash,label,max_uses,created_at,expires_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (invite_id, hashlib.sha256(code.encode("utf-8")).digest(), label, max_uses, created.isoformat(timespec="seconds"), expires_at),
+        )
+    return {"code": code, "item": {"id": invite_id, "label": label, "max_uses": max_uses, "used_count": 0, "expires_at": expires_at}}
+
+
+def revoke_registration_invite(payload: dict[str, Any]) -> dict[str, Any]:
+    invite_id = safe_text(payload, "invite_id", 64)
+    with account_connection() as connection:
+        result = connection.execute(
+            "UPDATE registration_invites SET disabled_at=COALESCE(disabled_at,?) WHERE id=?",
+            (now(), invite_id),
+        )
+    if result.rowcount != 1:
+        raise KeyError("邀请码不存在")
+    return {"invite_id": invite_id, "disabled": True}
+
+
+def update_registered_user(payload: dict[str, Any]) -> dict[str, Any]:
+    unexpected = set(payload) - {"action", "user_id", "status"}
+    if unexpected:
+        raise ValueError("注册用户更新包含未允许字段；禁止角色授权")
+    user_id = safe_text(payload, "user_id", 64)
+    status = safe_text(payload, "status", 16)
+    if status not in {"active", "disabled"}:
+        raise ValueError("注册用户状态无效")
+    stamp = now()
+    with account_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        target = connection.execute(
+            "SELECT id,email,display_name,status FROM users WHERE id=?", (user_id,)
+        ).fetchone()
+        if not target:
+            connection.rollback()
+            raise KeyError("注册用户不存在")
+        connection.execute(
+            "UPDATE users SET status=?,updated_at=? WHERE id=?", (status, stamp, user_id)
+        )
+        revoked = 0
+        if status == "disabled":
+            result = connection.execute(
+                "UPDATE user_sessions SET revoked_at=COALESCE(revoked_at,?) "
+                "WHERE user_id=? AND revoked_at IS NULL",
+                (stamp, user_id),
+            )
+            revoked = max(int(result.rowcount), 0)
+        connection.commit()
+    return dict(target) | {"status": status, "revoked_sessions": revoked}
+
+
+def revoke_registered_user_sessions(payload: dict[str, Any]) -> dict[str, Any]:
+    unexpected = set(payload) - {"action", "user_id"}
+    if unexpected:
+        raise ValueError("会话撤销请求包含未允许字段")
+    user_id = safe_text(payload, "user_id", 64)
+    with account_connection() as connection:
+        if not connection.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone():
+            raise KeyError("注册用户不存在")
+        result = connection.execute(
+            "UPDATE user_sessions SET revoked_at=COALESCE(revoked_at,?) "
+            "WHERE user_id=? AND revoked_at IS NULL",
+            (now(), user_id),
+        )
+    return {"user_id": user_id, "revoked_sessions": max(int(result.rowcount), 0)}
+
+
+def mutate_managed_category(action: str, payload: dict[str, Any]) -> dict[str, Any]:
+    stamp = now()
+    if action == "category_create":
+        name = normalize_label(payload.get("name"), maximum=40, field="分类名称")
+        description = optional_text(payload, "description", 240)
+        sort_order = min(max(int(payload.get("sort_order") or 100), 0), 10_000)
+        category_id = str(uuid.uuid4())
+        try:
+            with account_connection() as connection:
+                connection.execute(
+                    "INSERT INTO managed_categories"
+                    "(id,source_name,display_name,description,sort_order,is_custom,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,1,?,?)",
+                    (category_id, name, name, description, sort_order, stamp, stamp),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("该分类已经存在") from exc
+        return {"id": category_id, "source_name": name, "display_name": name, "enabled": True}
+    category_id = safe_text(payload, "category_id", 64)
+    with account_connection() as connection:
+        row = connection.execute(
+            "SELECT id,source_name,display_name,is_custom FROM managed_categories WHERE id=?",
+            (category_id,),
+        ).fetchone()
+        if not row:
+            raise KeyError("分类不存在")
+        if action == "category_update":
+            display = normalize_label(payload.get("display_name"), maximum=40, field="分类显示名")
+            description = optional_text(payload, "description", 240)
+            enabled = strict_bool(payload, "enabled")
+            sort_order = min(max(int(payload.get("sort_order") or 100), 0), 10_000)
+            connection.execute(
+                "UPDATE managed_categories SET display_name=?,description=?,enabled=?,sort_order=?,updated_at=? WHERE id=?",
+                (display, description, int(enabled), sort_order, stamp, category_id),
+            )
+            return dict(row) | {"display_name": display, "enabled": enabled, "sort_order": sort_order}
+        if action == "category_delete":
+            if not bool(row["is_custom"]):
+                raise ValueError("内置分类只能停用，不能删除")
+            service = service_instance()
+            existing = service.browse_catalog(
+                library="all",
+                category=str(row["source_name"]),
+                page=1,
+                page_size=1,
+            )
+            if int(existing.get("total") or 0):
+                raise ValueError("分类下仍有正式书目，请先迁移书籍后再删除")
+            connection.execute("DELETE FROM managed_categories WHERE id=?", (category_id,))
+            return dict(row)
+    raise ValueError("分类操作不在允许列表中")
+
+
+def queue_admin_novel(payload: dict[str, Any]) -> dict[str, Any]:
+    token = safe_text(payload, "upload_token", 32)
+    if not re.fullmatch(r"[a-f0-9]{32}", token):
+        raise ValueError("上传标识无效")
+    request = {
+        "upload_token": token,
+        "title": normalize_label(payload.get("title"), maximum=120, field="书名"),
+        "author": normalize_label(payload.get("author"), maximum=80, field="作者"),
+        "category": normalize_label(payload.get("category"), maximum=40, field="分类"),
+        "serialization_status": safe_text(payload, "serialization_status", 16),
+        "summary": optional_text(payload, "summary", 2000),
+        "source": normalize_label(payload.get("source"), maximum=160, field="来源说明"),
+        "authorization": safe_text(payload, "authorization", 16),
+        "manuscript_filename": Path(optional_text(payload, "manuscript_filename", 180) or "book.txt").name,
+        "cover_content_type": optional_text(payload, "cover_content_type", 100),
+    }
+    if request["serialization_status"] not in {"ongoing", "finished"}:
+        raise ValueError("连载状态无效")
+    if request["authorization"] != "confirmed":
+        raise ValueError("必须确认拥有上传和发布授权")
+    if Path(request["manuscript_filename"]).suffix.casefold() != ".txt":
+        raise ValueError("后台正式入库当前仅支持 TXT 正文")
+    with account_connection() as connection:
+        category = connection.execute(
+            "SELECT source_name FROM managed_categories WHERE source_name=? AND enabled=1",
+            (request["category"],),
+        ).fetchone()
+    if not category:
+        raise ValueError("上传分类不存在或已停用")
+    return queue_job("admin_novel", request)
+
+
+def import_admin_novel(request: dict[str, Any]) -> dict[str, Any]:
+    token = safe_text(request, "upload_token", 32)
+    body_path = UPLOAD_ROOT / f"{token}.novel-body"
+    cover_path = UPLOAD_ROOT / f"{token}.novel-cover"
+    try:
+        for path, minimum, maximum in (
+            (body_path, 100, 40 * 1024 * 1024),
+            (cover_path, 1024, 12 * 1024 * 1024),
+        ):
+            info = path.lstat()
+            if path.is_symlink() or not path.is_file() or not minimum <= info.st_size <= maximum:
+                raise ValueError("隔离上传文件无效")
+        from oohstory_library.services.download_security import DownloadSecurityScanner
+
+        service = service_instance()
+        scanner = DownloadSecurityScanner(UPLOAD_ROOT)
+        body_scan = scanner.scan_file(
+            body_path, extension="txt", source="admin_novel_upload", max_bytes=40 * 1024 * 1024
+        )
+        cover_content_type = str(
+            request.get("cover_content_type") or ""
+        ).casefold()
+        cover_extension = {
+            "image/jpeg": "jpg",
+            "image/png": "png",
+            "image/webp": "webp",
+        }.get(cover_content_type)
+        if not cover_extension:
+            raise ValueError("封面仅支持 JPEG、PNG 或 WebP")
+        cover_scan = scanner.scan_file(
+            cover_path,
+            extension=cover_extension,
+            source="admin_novel_cover_upload",
+            max_bytes=12 * 1024 * 1024,
+        )
+        raw = body_path.read_bytes()
+        text = None
+        for encoding in ("utf-8-sig", "gb18030"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None or len(text.strip()) < 100:
+            raise ValueError("正文编码无法识别或内容过短")
+        title = normalize_label(request.get("title"), maximum=120, field="书名")
+        author = normalize_label(request.get("author"), maximum=80, field="作者")
+        if service._existing_catalog_identity(title, author):
+            raise ValueError("正式书库中已存在相同书名和作者")
+        category = normalize_label(request.get("category"), maximum=40, field="分类")
+        safe_title = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "-", title).strip(" .-")[:100]
+        safe_author = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "-", author).strip(" .-")[:60]
+        destination_dir = (service.books_root / category).resolve()
+        destination_dir.relative_to(service.books_root.resolve())
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination = destination_dir / f"{safe_title}-{safe_author}.txt"
+        if destination.exists():
+            raise ValueError("书库目标正文已存在，已拒绝覆盖")
+        temporary = destination.with_suffix(".txt.part")
+        temporary.write_text(text, encoding="utf-8", newline="\n")
+        temporary.chmod(0o640)
+        os.replace(temporary, destination)
+        digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+        source_id = f"admin-upload-{uuid.uuid4().hex}"
+        catalog_id: int | None = None
+        try:
+            catalog_id = service._insert_imported_catalog_row(
+                source_id=source_id,
+                title=title,
+                author=author,
+                category=category,
+                detail_url=f"admin://upload/{source_id}",
+                file_url="",
+                output_path=destination,
+                sha256=digest,
+                book_status=("连载中" if request.get("serialization_status") == "ongoing" else "已完结"),
+            )
+            cover = service.upload_catalog_cover(
+                catalog_id,
+                data=cover_path.read_bytes(),
+                filename="cover",
+                content_type=cover_content_type,
+            )
+            index = service.queue_ingestion_index_refresh(
+                [catalog_id], reason="admin_novel_upload", wait=False
+            )
+        except Exception:
+            if catalog_id:
+                try:
+                    service.delete_catalog_books(
+                        catalog_ids=[catalog_id],
+                        confirmation="确认删除1本书",
+                    )
+                except Exception:
+                    pass
+            else:
+                destination.unlink(missing_ok=True)
+            raise
+        return {
+            "catalog_id": int(catalog_id),
+            "title": title,
+            "category": category,
+            "bytes": destination.stat().st_size,
+            "sha256": digest,
+            "cover": cover,
+            "index": index,
+            "scan": {"body": body_scan, "cover": cover_scan},
+        }
+    finally:
+        body_path.unlink(missing_ok=True)
+        cover_path.unlink(missing_ok=True)
+
+
+def job_path(job_id: str) -> Path:
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise ValueError("任务标识无效")
+    return JOB_ROOT / f"{job_id}.json"
+
+
+def atomic_job(path: Path, value: dict[str, Any]) -> None:
+    value["updated_at"] = now()
+    temporary = path.with_suffix(".json.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+    try:
+        data = memoryview(json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8"))
+        while data:
+            written = os.write(descriptor, data)
+            if written <= 0:
+                raise OSError("short job state write")
+            data = data[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, path)
+    os.chmod(path, 0o640)
+
+
+def queue_job(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    job_id = uuid.uuid4().hex[:20]
+    path = job_path(job_id)
+    job = {
+        "job_id": job_id,
+        "kind": kind,
+        "status": "queued",
+        "request": payload,
+        "created_at": now(),
+        "message": "任务已进入后台队列",
+    }
+    atomic_job(path, job)
+    unit = f"oohstory-admin-library-action-{job_id}.service"
+    completed = subprocess.run(
+        [
+            "/usr/bin/systemd-run",
+            "--unit",
+            unit,
+            "--collect",
+            "--property=Type=exec",
+            "--property=User=root",
+            "--property=WorkingDirectory=/opt/oohstory-admin",
+            "--property=TimeoutStartSec=6h",
+            "/opt/oohstory-admin/.venv/bin/python",
+            str(RUNNER_PATH),
+            "--run-job",
+            job_id,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode:
+        job.update(status="failed", message="后台任务单元启动失败")
+        atomic_job(path, job)
+        raise RuntimeError("后台任务单元启动失败")
+    job.update(status="running", unit=unit, message="后台任务已启动")
+    atomic_job(path, job)
+    return {key: job[key] for key in ("job_id", "kind", "status", "message", "created_at", "updated_at")}
+
+
+def sanitized_job(job: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "job_id", "kind", "status", "message", "created_at", "updated_at",
+        "started_at", "finished_at", "result", "error", "unit",
+    }
+    return {key: value for key, value in job.items() if key in allowed}
+
+
+def service_instance():
+    load_environment()
+    from oohstory_library.services.electronic_library import ElectronicLibraryService
+
+    return ElectronicLibraryService()
+
+
+def delete_catalog_books(payload: dict[str, Any]) -> dict[str, Any]:
+    """Delegate one bounded deletion to OOHStory's own catalog CLI."""
+
+    unexpected = set(payload) - {"action", "catalog_ids", "confirmation"}
+    if unexpected:
+        raise ValueError("批量删除请求包含未允许字段")
+    values = payload.get("catalog_ids")
+    if not isinstance(values, list) or any(
+        type(value) is not int or value <= 0 for value in values
+    ):
+        raise ValueError("catalog_ids 必须是显式正整数数组")
+    selected = sorted(set(values))
+    if not selected:
+        raise ValueError("请至少选择一本作品")
+    if len(selected) > 100:
+        raise ValueError("单次最多处理 100 本作品")
+    confirmation = safe_text(payload, "confirmation", 64)
+    expected = f"确认删除{len(selected)}本书"
+    if confirmation != expected:
+        raise ValueError(f"请输入确认短语：{expected}")
+    if not OOHSTORY_PYTHON.is_file():
+        raise RuntimeError("统一删除运行环境不可用")
+    if not OOHSTORY_CATALOG_DELETE.is_file():
+        raise RuntimeError("统一删除入口尚未部署")
+    load_environment()
+    request = json.dumps(
+        {"catalog_ids": selected, "confirmation": confirmation},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    try:
+        completed = subprocess.run(
+            [str(OOHSTORY_PYTHON), str(OOHSTORY_CATALOG_DELETE)],
+            input=request,
+            capture_output=True,
+            timeout=540,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("统一删除任务不可用或执行超时") from exc
+    if len(completed.stdout) > 4 * 1024 * 1024:
+        raise RuntimeError("统一删除响应超过安全上限")
+    try:
+        result = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(detail[-500:] or "统一删除入口返回无效响应") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("统一删除入口返回无效响应")
+    if completed.returncode != 0 or result.get("ok") is not True:
+        raise RuntimeError(str(result.get("error") or "统一删除失败")[:500])
+    returned_ids = result.get("catalog_ids")
+    if returned_ids != selected or int(result.get("deleted") or 0) != len(selected):
+        raise RuntimeError("统一删除结果与明确选择不一致")
+    return result
+
+
+async def execute_job(job_id: str) -> None:
+    ensure_roots()
+    path = job_path(job_id)
+    job = json.loads(path.read_text(encoding="utf-8"))
+    job.update(status="running", started_at=now(), message="任务正在执行")
+    atomic_job(path, job)
+    try:
+        service = service_instance()
+        request = dict(job.get("request") or {})
+        if job["kind"] == "cover":
+            result = await service.batch_catalog_covers(
+                ids(request, maximum=200), action=safe_text(request, "cover_action", 16)
+            )
+        elif job["kind"] == "import":
+            provider = safe_text(request, "provider", 64)
+            if provider not in IMPORT_PROVIDERS:
+                raise ValueError("未知或未授权的远程书源")
+            from oohstory_library.services.ai_service import get_ai_service
+
+            result = await service.import_public_book(
+                provider=provider,
+                remote_id=safe_text(request, "remote_id", 160),
+                source_ref=str(request.get("source_ref") or "")[:1000],
+                book_status=str(request.get("book_status") or "")[:32],
+                defer_postprocess=True,
+                ai_service=get_ai_service(),
+            )
+            service.start_queued_ingestion_index_refresh(wait=False)
+        elif job["kind"] == "admin_novel":
+            result = import_admin_novel(request)
+        else:
+            raise ValueError("未知后台任务")
+        job.update(status="completed", result=result, message="任务执行完成")
+    except Exception as exc:
+        job.update(status="failed", error=str(exc)[:1000], message="任务执行失败")
+    job["finished_at"] = now()
+    atomic_job(path, job)
+
+
+async def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
+    action = str(payload.get("action") or "")
+    if action == "capabilities":
+        return {
+            "actions": [
+                "search", "move", "cover", "upload_cover", "import",
+                "delete_catalog_books",
+                "deconstruct", "resume", "deconstruction_batch",
+                "task_runners", "task_detail", "sync_status", "sync_control",
+                "site_full_sync", "cover_redraw_control",
+                "index_refresh", "plot_query", "plot_plan", "plot_preview",
+                "plot_apply", "plot_adaptations",
+                "operations_overview", "invite_create", "invite_revoke",
+                "registered_user_status", "registered_user_sessions_revoke",
+                "category_create", "category_update", "category_delete",
+                "admin_novel_upload", "book_publication_overview",
+                "book_publication_status",
+            ],
+            "move_limit": 500,
+            "cover_limit": 200,
+            "delete_limit": 100,
+            "project_tone_matching": False,
+        }
+    if action == "task_runners":
+        from oohstory_library.services.library_task_runners import task_runner_catalog
+
+        return task_runner_catalog(refresh=True)
+    allowed_actions = {
+        "job_status", "search", "move", "cover", "import",
+        "delete_catalog_books",
+        "deconstruct", "resume", "deconstruction_batch", "task_detail", "upload_cover",
+        "sync_status", "sync_control", "site_full_sync", "cover_redraw_control", "index_refresh", "plot_query", "plot_plan",
+        "plot_preview", "plot_apply", "plot_adaptations",
+        "operations_overview", "invite_create", "invite_revoke",
+        "registered_user_status", "registered_user_sessions_revoke",
+        "category_create", "category_update", "category_delete",
+        "admin_novel_upload", "book_publication_overview",
+        "book_publication_status",
+    }
+    if action not in allowed_actions:
+        raise ValueError("操作不在允许列表中")
+    ensure_roots()
+    if action == "operations_overview":
+        return operations_overview(payload)
+    if action == "book_publication_overview":
+        return book_publication_overview(payload)
+    if action == "book_publication_status":
+        return update_book_publication(payload)
+    if action == "invite_create":
+        return create_registration_invite(payload)
+    if action == "invite_revoke":
+        return revoke_registration_invite(payload)
+    if action == "registered_user_status":
+        return update_registered_user(payload)
+    if action == "registered_user_sessions_revoke":
+        return revoke_registered_user_sessions(payload)
+    if action in {"category_create", "category_update", "category_delete"}:
+        return mutate_managed_category(action, payload)
+    if action == "admin_novel_upload":
+        return queue_admin_novel(payload)
+    if action == "job_status":
+        path = job_path(safe_text(payload, "job_id", 20))
+        if not path.is_file() or path.is_symlink() or path.stat().st_size > 4 * 1024 * 1024:
+            raise KeyError("后台任务不存在")
+        return sanitized_job(json.loads(path.read_text(encoding="utf-8")))
+    if action == "delete_catalog_books":
+        return delete_catalog_books(payload)
+    service = service_instance()
+    if action == "sync_status":
+        return service.sync_controls_status()
+    if action == "sync_control":
+        library_id = safe_text(payload, "library_id", 16)
+        if library_id not in {"local", "fanqie"}:
+            raise ValueError("未知书库同步开关")
+        pipeline = optional_text(payload, "pipeline", 16) or "content"
+        if pipeline != "content":
+            raise ValueError("当前后台只允许正文同步开关")
+        enabled = strict_bool(payload, "enabled")
+        return service.set_sync_control(
+            library_id,
+            enabled,
+            pipeline,
+        )
+    if action == "site_full_sync":
+        site_id = safe_text(payload, "site_id", 16)
+        library_id = SITE_FULL_SYNC_GROUPS.get(site_id)
+        if not library_id:
+            raise ValueError("未知正文同步站点")
+        enabled = strict_bool(payload, "enabled")
+        books_per_cycle = optional_positive_int(payload, "books_per_cycle")
+        return service.set_site_full_sync(
+            site_id,
+            enabled,
+            books_per_cycle=books_per_cycle,
+        )
+    if action == "cover_redraw_control":
+        target_per_hour = optional_positive_int(payload, "target_per_hour")
+        if target_per_hour is None:
+            raise ValueError("target_per_hour 必须是正整数")
+        raw_enabled = payload.get("enabled")
+        enabled = (
+            None if raw_enabled is None else strict_bool(payload, "enabled")
+        )
+        return service.set_cover_redraw_control(target_per_hour, enabled)
+    if action == "index_refresh":
+        index_kind = safe_text(payload, "index_kind", 16)
+        force = strict_bool(payload, "force")
+        if index_kind == "tone":
+            return await service.start_index(force=force)
+        if index_kind == "plot":
+            return await service.start_plot_index(force=force)
+        raise ValueError("未知索引类型")
+    if action == "plot_query":
+        question = safe_text(payload, "question", 500)
+        if len(question) < 2:
+            raise ValueError("提问至少需要 2 个字符")
+        limit = max(1, min(int(payload.get("limit") or 8), 12))
+        from oohstory_library.services.ai_service import get_ai_service
+
+        return await service.answer_plot_question(
+            PROJECT_ROOT, question, get_ai_service(), limit=limit
+        )
+    if action == "plot_plan":
+        question = safe_text(payload, "question", 500)
+        if len(question) < 2:
+            raise ValueError("提问至少需要 2 个字符")
+        selected = ids(payload, maximum=12)
+        target_mode = optional_text(payload, "target_mode", 32) or "ai_recommended"
+        if target_mode not in {"ai_recommended", "specified_chapter", "plot_arc"}:
+            raise ValueError("未知的剧情融入模式")
+        from oohstory_library.services.ai_service import get_ai_service
+
+        return await service.plan_plot_adaptation(
+            PROJECT_ROOT,
+            question=question,
+            catalog_ids=selected,
+            requirement=optional_text(payload, "requirement", 2000),
+            target_mode=target_mode,
+            target_chapter=optional_positive_int(payload, "target_chapter"),
+            start_chapter=optional_positive_int(payload, "start_chapter"),
+            end_chapter=optional_positive_int(payload, "end_chapter"),
+            ai_service=get_ai_service(),
+        )
+    if action == "plot_preview":
+        plan_id = safe_text(payload, "plan_id", 12)
+        if not PLAN_ID_RE.fullmatch(plan_id):
+            raise ValueError("剧情融入方案标识无效")
+        apply_mode = optional_text(payload, "apply_mode", 32) or "local_insert"
+        if apply_mode not in {"local_insert", "replace_chapter"}:
+            raise ValueError("未知的正文融入方式")
+        from oohstory_library.services.ai_service import get_ai_service
+
+        return await service.preview_plot_adaptation(
+            PROJECT_ROOT, plan_id, apply_mode, get_ai_service()
+        )
+    if action == "plot_apply":
+        plan_id = safe_text(payload, "plan_id", 12)
+        if not PLAN_ID_RE.fullmatch(plan_id):
+            raise ValueError("剧情融入方案标识无效")
+        operation = safe_text(payload, "operation", 16)
+        if operation == "bind":
+            return service.apply_plot_adaptation(PROJECT_ROOT, plan_id)
+        if operation == "commit":
+            return service.commit_plot_adaptation(PROJECT_ROOT, plan_id)
+        raise ValueError("未知的剧情融入操作")
+    if action == "plot_adaptations":
+        items = service.list_plot_adaptations(PROJECT_ROOT)[:100]
+        return {
+            "items": items,
+            "project": service.project_profile(PROJECT_ROOT),
+            "project_root": str(PROJECT_ROOT),
+        }
+    if action == "upload_cover":
+        catalog_id = ids({"catalog_ids": [payload.get("catalog_id")]}, maximum=1)[0]
+        token = safe_text(payload, "upload_token", 32)
+        if not re.fullmatch(r"[a-f0-9]{32}", token):
+            raise ValueError("上传标识无效")
+        path = UPLOAD_ROOT / f"{token}.bin"
+        try:
+            info = path.lstat()
+            if path.is_symlink() or not path.is_file() or info.st_size < 1024 or info.st_size > 12 * 1024 * 1024:
+                raise ValueError("上传封面不是安全的普通文件")
+            data = path.read_bytes()
+        finally:
+            path.unlink(missing_ok=True)
+        return service.upload_catalog_cover(
+            catalog_id,
+            data=data,
+            filename="cover",
+            content_type=optional_text(payload, "content_type", 100),
+        )
+    if action == "task_detail":
+        task_id = safe_text(payload, "task_id", 12)
+        if not TASK_ID_RE.fullmatch(task_id):
+            raise ValueError("拆书任务标识无效")
+        task = service.get_task(PROJECT_ROOT, task_id)
+        task["log"] = service.read_task_log(PROJECT_ROOT, task_id, max_chars=50000)
+        return task
+    if action == "search":
+        source = safe_text(payload, "source", 64)
+        if source not in SEARCH_SOURCES:
+            raise ValueError("未知书源")
+        query = safe_text(payload, "query", 100)
+        if len(query) < 2:
+            raise ValueError("作品名或作者名至少需要 2 个字符")
+        limit = max(1, min(int(payload.get("limit") or 24), 100))
+        return await service.global_book_search(query, source=source, limit=limit)
+    if action == "move":
+        target = safe_text(payload, "target_library", 16)
+        return service.move_catalog_books(catalog_ids=ids(payload, maximum=500), target_library=target)
+    if action == "cover":
+        cover_action = safe_text(payload, "cover_action", 16)
+        if cover_action not in {"sync", "redraw"}:
+            raise ValueError("未知封面操作")
+        selected = ids(payload, maximum=200)
+        return queue_job("cover", {"catalog_ids": selected, "cover_action": cover_action})
+    if action == "import":
+        provider = safe_text(payload, "provider", 64)
+        if provider not in IMPORT_PROVIDERS:
+            raise ValueError("未知或未授权的远程书源")
+        request = {
+            "provider": provider,
+            "remote_id": safe_text(payload, "remote_id", 160),
+            "source_ref": str(payload.get("source_ref") or "")[:1000],
+            "book_status": str(payload.get("book_status") or "")[:32],
+        }
+        return queue_job("import", request)
+    if action == "deconstruct":
+        catalog_id = ids({"catalog_ids": [payload.get("catalog_id")]}, maximum=1)[0]
+        mode = safe_text(payload, "mode", 16)
+        if mode not in {"scan", "full"}:
+            raise ValueError("未知拆书模式")
+        runner_id = optional_text(payload, "runner_id", 64)
+        profile_id = optional_text(payload, "profile_id", 128)
+        reasoning_effort = optional_text(payload, "reasoning_effort", 32)
+        return service.create_task(
+            PROJECT_ROOT,
+            catalog_id,
+            mode,
+            runner_id=runner_id or None,
+            profile_id=profile_id or None,
+            reasoning_effort=reasoning_effort or None,
+        )
+    if action == "resume":
+        task_id = safe_text(payload, "task_id", 12)
+        if not TASK_ID_RE.fullmatch(task_id):
+            raise ValueError("拆书任务标识无效")
+        return service.continue_task(PROJECT_ROOT, task_id)
+    if action == "deconstruction_batch":
+        mode = safe_text(payload, "mode", 16)
+        if mode not in {"scan", "full"}:
+            raise ValueError("未知拆书模式")
+        scope = optional_text(payload, "scope", 16) or "selected"
+        if scope not in {"selected", "filtered"}:
+            raise ValueError("批量范围无效")
+        selected = ids(payload, maximum=500) if scope == "selected" else None
+        state = optional_text(payload, "state", 16) or "unstarted"
+        if state not in {"all", "unstarted", "running", "scan", "full", "error"}:
+            raise ValueError("拆书状态筛选无效")
+        query = optional_text(payload, "query", 100)
+        category = optional_text(payload, "category", 100)
+        runner_id = optional_text(payload, "runner_id", 64)
+        profile_id = optional_text(payload, "profile_id", 128)
+        reasoning_effort = optional_text(payload, "reasoning_effort", 32)
+        if not runner_id or not profile_id:
+            from oohstory_library.services.library_task_runners import task_runner_catalog
+
+            runner_catalog = task_runner_catalog(refresh=True)
+            runner_id = str(runner_catalog.get("default_runner") or "")
+            runner = next(
+                (item for item in runner_catalog.get("runners", []) if item.get("id") == runner_id),
+                None,
+            )
+            if not runner or not runner.get("available"):
+                raise ValueError("当前没有可用的拆书执行工具")
+            profile_id = str(runner.get("default_profile") or "")
+            if not profile_id:
+                raise ValueError("默认拆书模型未配置")
+        return service.create_deconstruction_batch(
+            PROJECT_ROOT,
+            mode=mode,
+            runner_id=runner_id,
+            profile_id=profile_id,
+            reasoning_effort=reasoning_effort or None,
+            state=state,
+            query=query,
+            category=category,
+            catalog_ids=selected,
+        )
+    raise ValueError("操作不在允许列表中")
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        emit(False, "书库操作助手必须由 root 执行", code=77)
+    configure_root_runtime_environment()
+    if len(sys.argv) == 3 and sys.argv[1] == "--run-job":
+        try:
+            asyncio.run(execute_job(sys.argv[2]))
+        except Exception:
+            raise SystemExit(1)
+        raise SystemExit(0)
+    if len(sys.argv) == 2 and sys.argv[1] == "--dispatch-stdin":
+        pass
+    elif len(sys.argv) != 1:
+        emit(False, "不接受命令行参数", code=64)
+    try:
+        data = asyncio.run(dispatch(read_request()))
+        emit(True, str(data.get("message") or "操作完成") if isinstance(data, dict) else "操作完成", data if isinstance(data, dict) else {})
+    except (ValueError, KeyError) as exc:
+        emit(False, str(exc).strip("'"), code=64)
+    except Exception as exc:
+        emit(False, str(exc)[:500] or "书库操作失败", code=1)
+
+
+if __name__ == "__main__":
+    main()

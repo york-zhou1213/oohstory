@@ -1,0 +1,12 @@
+[Unit]
+Description=Batch authorized-download metadata and index post-processing
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=oohstory-library-authorized-postprocess.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

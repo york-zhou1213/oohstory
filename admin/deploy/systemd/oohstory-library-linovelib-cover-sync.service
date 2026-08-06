@@ -1,0 +1,27 @@
+[Unit]
+Description=Synchronize Linovelib light-novel covers
+After=mysql.service redis-server.service network-online.target oohstory-admin.service oohstory-shubaow-browser.service
+Requires=mysql.service redis-server.service
+Wants=oohstory-shubaow-browser.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/oohstory-admin/library.env
+Environment=OOHSTORY_LIBRARY_BROWSER_SERVICE=oohstory-shubaow-browser.service
+Environment=OOHSTORY_LIBRARY_CATALOG_BACKEND=mysql
+Environment=OOHSTORY_LIBRARY_MYSQL_POOL_SIZE=2
+Environment=OOHSTORY_LIBRARY_LINOVELIB_CDP_URL=http://127.0.0.1:9223
+Environment=OOHSTORY_LIBRARY_MYSQL_READ_TIMEOUT=120
+Environment=OOHSTORY_LIBRARY_MYSQL_WRITE_TIMEOUT=120
+WorkingDirectory=/opt/oohstory-admin
+ExecStart=/opt/oohstory-admin/.venv/bin/python scripts/electronic-library/txt80_cover_sync.py --watch --library fanqie --source linovelib --limit 20 --workers 1 --delay 0.80
+Restart=always
+RestartSec=15
+Nice=10
+MemoryHigh=512M
+MemoryMax=768M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

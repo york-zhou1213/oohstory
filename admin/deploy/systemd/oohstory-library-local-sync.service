@@ -1,0 +1,24 @@
+[Unit]
+Description=Synchronize local txt80 books with targeted plot-free ingestion indexing
+After=mysql.service redis-server.service network-online.target
+Requires=mysql.service redis-server.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/oohstory-admin/library.env
+Environment=OOHSTORY_LIBRARY_CATALOG_BACKEND=mysql
+WorkingDirectory=/opt/oohstory-admin
+ExecStart=/opt/oohstory-admin/.venv/bin/python /opt/oohstory-admin/scripts/electronic-library/scheduled_library_sync.py --library local
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+CPUQuota=200%
+MemoryHigh=1536M
+MemoryMax=2G
+TasksMax=256
+IOWeight=20
+IOReadBandwidthMax=/dev/mapper/ubuntu--vg-ubuntu--lv 32M
+IOWriteBandwidthMax=/dev/mapper/ubuntu--vg-ubuntu--lv 16M
+OOMPolicy=stop
+StandardOutput=append:/opt/oohstory-admin/electronic-library/txt80/logs/local-scheduled-sync.log
+StandardError=append:/opt/oohstory-admin/electronic-library/txt80/logs/local-scheduled-sync.log

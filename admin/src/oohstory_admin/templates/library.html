@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+{% block title %}电子书库 · OOHStory 运维台{% endblock %}
+{% block content %}
+{% set books = dashboard.books %}
+{% set local = dashboard.libraries.local %}
+{% set fanqie = dashboard.libraries.fanqie %}
+{% set tone = dashboard.tone %}
+{% set plot = dashboard.plot %}
+{% set infra = dashboard.infrastructure %}
+
+<div class="library-workspace">
+  <header class="library-hero">
+    <div>
+      <p class="eyebrow">LOCAL STORY INTELLIGENCE</p>
+      <h1>电子书库</h1>
+      <p>统一管理本地书目、授权来源、正文同步、基调与剧情索引、封面流水线及全局拆书资产。</p>
+    </div>
+    <div class="boundary-badge">
+      <span aria-hidden="true">✓</span>
+      <div><strong>来源隔离 · 全局复用</strong><small>书目数据只读；写入仅由白名单流水线执行</small></div>
+    </div>
+  </header>
+
+  {% if notice %}<div class="alert {{ 'alert-info' if notice == '操作成功' else 'alert-error' }}" role="status">{{ notice }}</div>{% endif %}
+  {% for error in dashboard.errors %}<div class="alert alert-error">{{ error }}</div>{% endfor %}
+
+  <section class="library-metrics" aria-label="电子书库总览">
+    {% for label, value, hint, kind in dashboard.metrics %}
+      {% set metric_view = 'all' if kind in ['catalog','running'] else kind %}
+      <a class="library-metric {{ 'accent' if kind in ['readable', 'tone'] else '' }}" href="{{ base_path }}/books/catalog?view={{ metric_view }}">
+        <span>{{ label }}</span><strong>{{ '{:,}'.format(value) }}</strong><small>{{ hint }}</small><em>查看详情 →</em>
+      </a>
+    {% endfor %}
+  </section>
+
+  <section class="library-panel library-sync-summary" id="sync">
+    <div class="library-panel-heading">
+      <div><p class="section-kicker">SCHEDULED LIBRARY SYNC</p><h2>来源同步与正文管道</h2><p>四个授权站点严格串行，站内任务并发；失败保留现有正文，下一轮继续。</p></div>
+      <a class="button button-primary" href="{{ base_path }}/library/sync">打开同步调度</a>
+    </div>
+    <div class="sync-source-grid">
+      {% for source_id, source in [('local', local), ('fanqie', fanqie)] %}
+        {% set control = dashboard.sync_controls.get(source_id, {}) %}
+        <article class="sync-source-card {{ 'enabled' if control.get('content_enabled') else '' }}">
+          <div class="sync-source-top">
+            <span class="toggle-visual" aria-hidden="true"><i></i></span>
+            <div><h3>{{ '本地书库正文' if source_id == 'local' else '授权书源正文' }}</h3><p>{{ control.get('pipeline_description', '等待同步状态') }}</p></div>
+            <span class="status {{ 'ok' if control.get('content_enabled') else 'warn' }}">{{ '已启用' if control.get('content_enabled') else '未启用' }}</span>
+          </div>
+          <dl class="sync-facts">
+            <div><dt>书目</dt><dd>{{ '{:,}'.format(source.get('total', 0)) }}</dd></div>
+            <div><dt>正文可用</dt><dd>{{ '{:,}'.format(source.get('downloaded', 0)) }}</dd></div>
+            <div><dt>待恢复</dt><dd>{{ '{:,}'.format(source.get('recovery', 0)) }}</dd></div>
+            <div><dt>运行状态</dt><dd>{{ '执行中' if control.get('content_pipeline_active') else '等待下一轮' }}</dd></div>
+          </dl>
+          <p class="schedule-line">上次：{{ control.get('last_run') or '—' }}<br>下次：{{ control.get('next_run') or '—' }}</p>
+        </article>
+      {% endfor %}
+    </div>
+    <p class="compact-panel-footer">新笔趣阁、爱下电子书、书宝网和哔哩轻小说的启停、全力同步与底层服务控制已集中到“同步调度”。</p>
+  </section>
+
+  <section class="library-control-grid" id="indexes">
+    {% for kind, item, title, subtitle in [
+      ('tone', tone, '作品基调索引', '题材、基调、摘要与模型复核'),
+      ('plot', plot, '剧情证据索引', '正文位置、母题标签与证据片段')
+    ] %}
+      {% set processed = item.get('processed', 0) %}
+      {% set total = item.get('total', books.get('downloaded', 0)) %}
+      <article class="library-panel index-card {{ kind }}">
+        <div class="library-panel-heading compact">
+          <div><p class="section-kicker">{{ 'TONE ASSETS' if kind == 'tone' else 'PLOT EVIDENCE' }}</p><h2>{{ title }}</h2><p>{{ subtitle }}</p></div>
+          <span class="status {{ 'ok' if not item.get('running') else 'warn' }}">{{ '运行中' if item.get('running') else item.get('status', '就绪') }}</span>
+        </div>
+        <div class="index-number"><strong>{{ '{:,}'.format(item.get('count', item.get('books', item.get('indexed', 0)))) }}</strong><span>{{ '本作品' if kind == 'tone' else '本作品' }}</span></div>
+        <div class="progress-track"><span style="width: {{ ((processed / total * 100) if total else 0)|round|int }}%"></span></div>
+        <p class="progress-copy">本轮 {{ '{:,}'.format(processed) }} / {{ '{:,}'.format(total) }} · 失败 {{ item.get('failed', 0) }}{% if kind == 'plot' %} · {{ '{:,}'.format(item.get('segments', 0)) }} 个片段{% endif %}</p>
+        <div class="card-link-row"><a href="{{ base_path }}/books/catalog?view={{ kind }}">浏览已索引作品</a><a href="{{ base_path }}/books/catalog?view={{ kind }}">增量索引控制 →</a></div>
+      </article>
+    {% endfor %}
+  </section>
+
+  <section class="library-panel search-panel" id="catalog">
+    <div class="library-panel-heading">
+      <div><p class="section-kicker">GLOBAL TITLE / AUTHOR SEARCH</p><h2>作品、作者与馆藏检索</h2><p>后台检索直接读取 OOHStory Reader 的当前公开目录；远程导入仍由受控同步流水线负责。</p></div>
+      <span class="legal-source-badge">公版 / 授权来源</span>
+    </div>
+    <form class="library-search" method="get" action="{{ base_path }}/books/catalog">
+      <select aria-label="搜索范围"><option>当前 OOHStory 馆藏</option></select>
+      <input type="search" name="q" maxlength="100" placeholder="输入作品名称或作者名称" aria-label="作品或作者">
+      <button class="button button-primary" type="submit">搜索电子书库</button>
+    </form>
+    <div class="capability-grid">
+      <a href="{{ base_path }}/books/catalog?view=all"><b>小说目录</b><span>分类、书名、作者、章节与阅读指标</span><em>进入 →</em></a>
+      <a href="{{ base_path }}/books/search"><b>书源搜索</b><span>本地、授权站点与公版资源归档</span><em>搜索 →</em></a>
+      <a href="{{ base_path }}/library/sync"><b>同步调度</b><span>定时、全力同步与服务控制</span><em>管理 →</em></a>
+      <a href="{{ base_path }}/books/catalog?view=deconstruction"><b>拆书与索引</b><span>全局拆书库及受控任务入口</span><em>管理 →</em></a>
+    </div>
+  </section>
+
+  <section class="library-split-grid">
+    <article class="library-panel" id="queue">
+      <div class="library-panel-heading compact"><div><p class="section-kicker">INGESTION QUEUE</p><h2>下载与处理队列</h2></div><span class="status {{ 'warn' if dashboard.active_queue else 'ok' }}">{{ dashboard.active_queue }} 活跃</span></div>
+      {% if dashboard.queue %}
+        <div class="queue-list">
+          {% for item in dashboard.queue %}<div><span>{{ item.label }}</span><strong>{{ '{:,}'.format(item.count) }}</strong><i class="queue-dot {{ item.status }}"></i></div>{% endfor %}
+        </div>
+      {% else %}<p class="empty">当前没有下载队列记录。</p>{% endif %}
+    </article>
+    <article class="library-panel">
+      <div class="library-panel-heading compact"><div><p class="section-kicker">CATEGORY DISTRIBUTION</p><h2>正文分类分布</h2></div><a href="{{ base_path }}/books/catalog">全部书籍</a></div>
+      {% if dashboard.categories %}
+        <div class="category-bars">
+          {% for item in dashboard.categories %}<div><span>{{ item.name }}</span><i><b style="width: {{ item.percent }}%"></b></i><strong>{{ '{:,}'.format(item.count) }}</strong></div>{% endfor %}
+        </div>
+      {% else %}<p class="empty">暂无分类统计。</p>{% endif %}
+    </article>
+  </section>
+
+  <section class="library-panel" id="covers">
+    <div class="library-panel-heading"><div><p class="section-kicker">COVER ASSET PIPELINE</p><h2>封面同步与重绘</h2><p>优先使用真实来源；只有确认无安全封面或 404 时才进入 AI 兜底。</p></div></div>
+    <div class="cover-grid">
+      {% for item in dashboard.covers %}
+        <article>
+          <div><span class="cover-icon" aria-hidden="true">{{ loop.index }}</span><span><b>{{ item.label }}</b><small>{{ item.description }}</small></span></div>
+          <strong>{{ item.done }} / {{ item.total }}</strong>
+          <div class="progress-track"><span style="width: {{ item.percent }}%"></span></div>
+          <p>完成 {{ item.percent }}% · 待处理 {{ item.pending }} · 失败 {{ item.failed }}</p>
+        </article>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="library-split-grid" id="infrastructure">
+    <article class="library-panel">
+      <div class="library-panel-heading compact"><div><p class="section-kicker">INFRASTRUCTURE</p><h2>书库基础设施</h2></div><span class="status {{ 'ok' if infra.get('ready_for_mysql_reads') else 'bad' }}">{{ '读取就绪' if infra.get('ready_for_mysql_reads') else '异常' }}</span></div>
+      <dl class="infrastructure-list">
+        <div><dt>MySQL 目录</dt><dd>{{ '正常' if infra.get('mysql', {}).get('ok') else '不可用' }}</dd></div>
+        <div><dt>Redis 队列</dt><dd>{{ '正常' if infra.get('redis', {}).get('ok') else '不可用' }}</dd></div>
+        <div><dt>共享数据根</dt><dd>{{ '正常' if infra.get('object_store', {}).get('ok') else '不可用' }}</dd></div>
+        <div><dt>目录后端</dt><dd>{{ infra.get('catalog_backend', 'mysql') }}</dd></div>
+      </dl>
+      <p class="boundary-note">管理 Web 进程使用只读数据库账号，不直接修改书目；需要写入的动作全部由受控服务完成并写入审计日志。</p>
+    </article>
+    <article class="library-panel deconstruction-card">
+      <div class="library-panel-heading compact"><div><p class="section-kicker">GLOBAL DECONSTRUCTION</p><h2>全局拆书库</h2></div><span class="status neutral">共享资产</span></div>
+      <strong class="deconstruction-total">{{ '{:,}'.format(dashboard.deconstruction.get('total', 0)) }}</strong>
+      <p>已完成 {{ dashboard.deconstruction.get('completed', 0) }} · 运行中 {{ dashboard.deconstruction.get('running', 0) }}</p>
+      <p class="muted">拆书成果保存在唯一共享数据根；管理后台只显示进度并通过白名单服务调度。</p>
+    </article>
+  </section>
+
+</div>
+{% endblock %}

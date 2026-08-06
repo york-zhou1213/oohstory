@@ -1,0 +1,236 @@
+{% extends "base.html" %}
+{% macro catalog_cover(item) %}
+  {% if item.catalog_id %}{% set detail_url = base_path ~ '/books/catalog/' ~ item.catalog_id %}
+  {% elif item.public_id %}{% set detail_url = base_path ~ '/books/' ~ item.public_id %}
+  {% else %}{% set detail_url = '' %}{% endif %}
+  {% if detail_url %}<a class="catalog-novel-cover" href="{{ detail_url }}" aria-label="查看《{{ item.title }}》详情">{% else %}<div class="catalog-novel-cover">{% endif %}
+    <span class="catalog-cover-fallback" aria-hidden="true"><b>{{ (item.category or '小说')[:4] }}</b><strong>{{ item.title }}</strong><small>{{ item.author or '未知作者' }}</small></span>
+    {% if item.cover_url %}<img data-book-cover src="{{ item.cover_url }}" alt="《{{ item.title }}》封面" loading="lazy" decoding="async">{% endif %}
+    <span class="catalog-cover-badge {{ 'ready' if item.readable else 'recovery' }}">{{ '正文可用' if item.readable else '待恢复' }}</span>
+  {% if detail_url %}</a>{% else %}</div>{% endif %}
+{% endmacro %}
+{% block title %}书籍与索引 · OOHStory 运维台{% endblock %}
+{% block content %}
+<div class="library-workspace catalog-workspace">
+  <header class="library-hero compact-hero">
+    <div>
+      <p class="eyebrow">NOVEL CATALOG</p>
+      <h1>{{ {'all':'书目总量','local':'本地书库','fanqie':'番茄书库','readable':'正文可用','tone':'基调索引','plot':'剧情索引','deconstruction':'全局拆书库'}.get(view, '小说目录') }}</h1>
+      <p>独立目录页只保留当前书目、筛选和必要操作；书源导入与同步调度已拆分到各自页面。</p>
+    </div>
+    <nav class="catalog-page-actions" aria-label="目录相关功能">
+      <a class="button" href="{{ base_path }}/library">书库总览</a>
+      <a class="button" href="{{ base_path }}/books/search">书源搜索</a>
+      <a class="button" href="{{ base_path }}/library/sync">同步调度</a>
+    </nav>
+  </header>
+
+  {% if notice %}<div class="alert {{ 'alert-info' if notice == '操作成功' else 'alert-error' }}" role="status">{{ notice }}</div>{% endif %}
+
+  <nav class="catalog-view-tabs" aria-label="书库视图">
+    {% set view_links = [
+      ('all','书目总量'),('local','本地书库'),('fanqie','番茄书库'),
+      ('readable','正文可用'),('tone','基调索引'),('plot','剧情索引'),
+      ('deconstruction','全局拆书库')
+    ] %}
+    {% for key, label in view_links %}
+      <a class="{{ 'active' if view == key else '' }}" href="{{ base_path }}/books/catalog?view={{ key }}"><span>{{ label }}</span>
+        {% if key == view and result.available %}
+          <strong>{{ '{:,}'.format(result.data.total) }}</strong>
+        {% else %}
+          {% for metric_label, metric_value, metric_hint, metric_kind in workspace.metrics %}
+            {% if (key == 'all' and metric_kind == 'catalog') or metric_kind == key %}<strong>{{ '{:,}'.format(metric_value) }}</strong>{% endif %}
+          {% endfor %}
+        {% endif %}
+      </a>
+    {% endfor %}
+  </nav>
+
+  {% if view in ['tone','plot'] %}
+    {% set index = workspace.tone if view == 'tone' else workspace.plot %}
+    <section class="library-panel catalog-index-control {{ view }}">
+      <div>
+        <p class="section-kicker">INCREMENTAL INDEX UPDATE</p>
+        <h2>{{ '基调索引' if view == 'tone' else '剧情证据索引' }}增量更新</h2>
+        <p>只处理新增、内容指纹变化或缺失索引的作品；已有有效结果直接跳过。</p>
+      </div>
+      <dl>
+        <div><dt>状态</dt><dd>{{ '运行中' if index.get('running') else index.get('status', '就绪') }}</dd></div>
+        <div><dt>本轮进度</dt><dd>{{ index.get('processed', 0) }} / {{ index.get('total', 0) }}</dd></div>
+        <div><dt>失败</dt><dd>{{ index.get('failed', 0) }}</dd></div>
+      </dl>
+      <div class="index-action-group">
+        <form class="confirm-form" data-confirm="确认启动{{ '基调' if view == 'tone' else '剧情' }}索引增量更新？" method="post" action="{{ base_path }}/books/index">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="index_kind" value="{{ view }}">
+          <input type="hidden" name="force" value="0">
+          <button class="button button-primary" type="submit">增量更新</button>
+        </form>
+        <form class="confirm-form" data-confirm="确认完整重建{{ '基调' if view == 'tone' else '剧情' }}索引？这会重新处理已有有效结果。" method="post" action="{{ base_path }}/books/index">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="index_kind" value="{{ view }}">
+          <input type="hidden" name="force" value="1">
+          <button class="button button-danger" type="submit">完整重建</button>
+        </form>
+        {% if view == 'plot' %}<a class="button" href="{{ base_path }}/books/plot-workbench">剧情问答与改编</a>{% endif %}
+      </div>
+    </section>
+  {% endif %}
+
+  <form class="filter-bar catalog-filter" method="get" action="{{ base_path }}/books/catalog">
+    <input type="hidden" name="view" value="{{ view }}">
+    <label>作品或作者<input type="search" name="q" value="{{ query }}" maxlength="100" placeholder="输入作品名称或作者"></label>
+    {% if view in ['all','local','fanqie'] %}
+      <label>正文状态<select name="availability"><option value="all" {% if availability == 'all' %}selected{% endif %}>全部状态</option><option value="readable" {% if availability == 'readable' %}selected{% endif %}>正文可用</option><option value="recovery" {% if availability == 'recovery' %}selected{% endif %}>正文待恢复</option></select></label>
+    {% elif view in ['readable','tone','plot'] %}
+      <label>书库来源<select name="source"><option value="all" {% if source == 'all' %}selected{% endif %}>全部来源</option><option value="local" {% if source == 'local' %}selected{% endif %}>本地书库</option><option value="fanqie" {% if source == 'fanqie' %}selected{% endif %}>番茄书库</option></select></label>
+    {% endif %}
+    <label>正文分类<select name="category"><option value="">全部分类</option>{% for row in (result.data.categories if result.available else []) %}{% set category_name = row.category or row.name %}<option value="{{ category_name }}" {% if category == category_name %}selected{% endif %}>{{ category_name }}（{{ row.count }}）</option>{% endfor %}</select></label>
+    {% if view == 'tone' %}
+      <label>索引标签<select name="tag"><option value="">全部标签</option>{% for row in (result.data.tags if result.available else []) %}<option value="{{ row.name }}" {% if tag == row.name %}selected{% endif %}>{{ row.name }}（{{ row.count }}）</option>{% endfor %}</select></label>
+    {% endif %}
+    <label>每页<select name="page_size"><option value="14" {% if page_size == 14 %}selected{% endif %}>14</option><option value="28" {% if page_size == 28 %}selected{% endif %}>28</option><option value="56" {% if page_size == 56 %}selected{% endif %}>56</option></select></label>
+    <button class="button button-primary" type="submit">筛选</button>
+  </form>
+
+  <p class="catalog-boundary-note">目录由 MySQL 只读账号提供；写入动作只通过固定白名单服务执行并记录审计。</p>
+  {% if not result.available %}
+    <div class="alert alert-error">{{ result.error }}</div>
+  {% else %}
+    {% set data = result.data %}
+    {% if view == 'deconstruction' %}
+      <nav class="deconstruction-state-tabs" aria-label="拆书状态">
+        {% for key, label in [('all','全部'),('unstarted','未开始'),('running','运行中'),('scan','黄金三章'),('full','完整拆书'),('error','可续跑/异常')] %}
+          <a class="{{ 'active' if state == key else '' }}" href="{{ base_path }}/books/catalog?{{ {'view': view, 'state': key, 'q': query, 'category': category, 'page_size': page_size}|urlencode }}"><span>{{ label }}</span><strong>{{ '{:,}'.format(data.state_counts.get(key, 0)) }}</strong></a>
+        {% endfor %}
+      </nav>
+    {% endif %}
+    <div class="catalog-result-heading"><div><p class="section-kicker">{{ data.view_label or '书目总量' }}</p><h2>{% if view == 'plot' %}{{ '{:,}'.format(data.evidence_total) }} 条剧情证据 · {% endif %}共 {{ '{:,}'.format(data.total) }} 项</h2><p>当前显示 {{ data.range_start if data.range_start is defined else (((data.page - 1) * data.page_size + 1) if data.total else 0) }}–{{ data.range_end if data.range_end is defined else [data.page * data.page_size, data.total]|min }} 项</p></div><span class="status neutral">第 {{ data.page }} / {{ data.page_count }} 页</span></div>
+
+    {% if view == 'deconstruction' %}
+      <section class="library-panel task-runner-panel" data-task-config>
+        <div><p class="section-kicker">OH-STORY AI SESSION</p><h2>拆书执行配置</h2><p>每本书独立进程、独立 AI 会话和独立日志；选择会同时用于单本与批量任务。</p></div>
+        {% if task_runners.runners %}
+          <label>执行工具<select id="task-runner" name="runner_id" form="catalog-bulk-form">{% for runner in task_runners.runners %}<option value="{{ runner.id }}" {% if runner.id == task_runners.default_runner %}selected{% endif %} {% if not runner.available %}disabled{% endif %}>{{ runner.name }}{{ '' if runner.available else '（不可用）' }}</option>{% endfor %}</select></label>
+          <label>AI 配置<select id="task-profile" name="profile_id" form="catalog-bulk-form">{% for runner in task_runners.runners %}{% if runner.available %}{% for profile in runner.profiles %}<option value="{{ profile.id }}" data-runner="{{ runner.id }}" {% if runner.id == task_runners.default_runner and profile.id == runner.default_profile %}selected{% endif %}>{{ runner.name }} · {{ profile.name }}</option>{% endfor %}{% endif %}{% endfor %}</select></label>
+          <label>AI 智商<select id="task-reasoning" name="reasoning_effort" form="catalog-bulk-form">{% for runner in task_runners.runners %}{% for profile in runner.profiles or [] %}{% for reasoning in profile.reasoning_options or [] %}<option value="{{ reasoning.id }}" data-runner="{{ runner.id }}" data-profile="{{ profile.id }}" {% if runner.id == task_runners.default_runner and profile.id == runner.default_profile and reasoning.id == profile.default_reasoning_effort %}selected{% endif %}>{{ reasoning.name }}</option>{% endfor %}{% endfor %}{% endfor %}</select></label>
+          <span class="status neutral">并行上限 {{ task_runners.max_parallel or 0 }}</span>
+        {% else %}<div class="alert alert-error">当前未检测到可用的拆书执行工具；查询和已有成果仍可使用。</div>{% endif %}
+      </section>
+      <form id="catalog-bulk-form" class="catalog-bulk-actions confirm-form" data-confirm="确认对已选择的作品启动批量拆书？" method="post" action="{{ base_path }}/books/catalog-action">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="view" value="{{ view }}">
+        <input type="hidden" name="state" value="{{ state }}">
+        <input type="hidden" name="query" value="{{ query }}">
+        <input type="hidden" name="category" value="{{ category }}">
+        <span>选择本页作品后批量执行；每本使用独立进程、会话和日志，并受全局并行上限约束。<b data-selection-count>已选择 0 本</b></span>
+        <button class="button" type="button" data-select-page="catalog-bulk-form">选择本页全部</button>
+        <button class="button" name="action" value="batch_scan" type="submit">批量黄金三章</button>
+        <button class="button button-primary" name="action" value="batch_full" type="submit">批量完整拆书</button>
+        <button class="button" name="action" value="batch_filtered_scan" type="submit">全部筛选结果·黄金三章</button>
+        <button class="button button-danger" name="action" value="batch_filtered_full" type="submit">全部筛选结果·完整拆书</button>
+      </form>
+    {% elif result.data.source != 'reader-fallback' %}
+      <form id="catalog-bulk-form" class="catalog-bulk-actions confirm-form" data-confirm="确认执行所选书目的批量操作？" {% if view == 'all' %}data-delete-catalog-form{% endif %} method="post" action="{{ base_path }}/books/catalog-action">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="view" value="{{ view }}">
+        <span>选择本页作品；逻辑归库不改来源真值，封面操作进入后台任务。<b data-selection-count>已选择 0 本</b></span>
+        <button class="button" type="button" data-select-page="catalog-bulk-form">选择本页全部</button>
+        <button class="button" name="action" value="move_local" type="submit">移入本地书库</button>
+        <button class="button" name="action" value="move_fanqie" type="submit">移入番茄书库</button>
+        <button class="button" name="action" value="cover_sync" type="submit">同步真实封面</button>
+        <button class="button button-primary" name="action" value="cover_redraw" type="submit">提交封面重绘</button>
+        {% if view == 'all' %}
+          <details class="catalog-delete-danger">
+            <summary>危险区 · 删除所选小说</summary>
+            <div class="catalog-delete-danger-body">
+              <p>仅删除本页明确勾选的书目，单次最多 100 本。书目、阅读映射、章节目录、索引、封面和拆书成果会联动处理，文件先进入可恢复归档。</p>
+              <label>二次确认短语
+                <input name="confirmation" maxlength="64" autocomplete="off" spellcheck="false" placeholder="先选择小说" aria-describedby="catalog-delete-confirmation-hint">
+              </label>
+              <small id="catalog-delete-confirmation-hint">选择后请输入：<code data-delete-confirmation-hint>确认删除0本书</code></small>
+              <button class="button button-danger" name="action" value="delete_catalog_books" type="submit">永久删除所选书目</button>
+            </div>
+          </details>
+        {% endif %}
+      </form>
+    {% endif %}
+
+    {% if view == 'deconstruction' %}
+      {% if data.batches %}<section class="batch-strip"><strong>最近批次</strong>{% for batch in data.batches[:5] %}<span class="status {{ 'ok' if batch.status == 'completed' else 'warn' }}">{{ batch.mode or '拆书' }} · {{ batch.finished or 0 }}/{{ batch.total or 0 }} · {{ batch.status or 'unknown' }}</span>{% endfor %}</section>{% endif %}
+      <div class="book-grid catalog-book-grid catalog-novel-grid deconstruction-grid">
+        {% for item in data['items'] %}
+          <article class="book-card catalog-novel-card deconstruction-item">
+            {{ catalog_cover(item) }}
+            <div class="catalog-novel-main">
+            {% set task = item.deconstruction %}
+            <div class="book-meta"><label class="catalog-select"><input form="catalog-bulk-form" type="checkbox" name="catalog_id" value="{{ item.catalog_id }}" {% if not item.readable %}disabled{% endif %}>选择</label><span>{{ item.category or '未分类' }}</span><span>{{ '本地' if item.library_id == 'local' else '番茄/授权' }}</span></div>
+            <h2><a href="{{ base_path }}/books/catalog/{{ item.catalog_id }}">{{ item.title }}</a></h2>
+            <p>{{ item.author or '未知作者' }}</p>
+            <div class="catalog-status-row"><span class="status {{ 'ok' if item.readable else 'warn' }}">{{ '正文可用' if item.readable else '正文待恢复' }}</span><span class="status {{ 'ok' if item.deconstruction_state == 'full' else 'warn' if item.deconstruction_state in ['running','error'] else 'neutral' }}">{{ {'unstarted':'未开始','running':'运行中','scan':'黄金三章','full':'完整拆书','error':'可续跑/异常'}.get(item.deconstruction_state, item.deconstruction_state) }}</span></div>
+            {% if task %}<p class="summary">{{ task.current_stage or task.message or task.output_dir or '已有全局拆书记录' }}</p><div class="progress"><span style="width: {{ task.progress or 0 }}%"></span></div>{% else %}<p class="summary">尚未建立全局拆书成果。</p>{% endif %}
+            <dl class="catalog-facts"><div><dt>状态</dt><dd>{{ item.book_status_label or ('已收录' if item.readable else '待恢复') }}</dd></div><div><dt>文件</dt><dd>{{ (item.source_bytes or 0)|filesize }}</dd></div><div><dt>更新</dt><dd>{{ item.updated_label or (item.updated_at or '未知')[:10] }}</dd></div><div><dt>分类</dt><dd>{{ item.category or '未分类' }}</dd></div><div><dt>字数</dt><dd>{{ '{:,}'.format(item.word_count) if item.word_count else '未识别' }}</dd></div><div><dt>章节</dt><dd>{{ item.chapter_count_label or (('{:,}'.format(item.chapter_count) ~ ' 章') if item.chapter_count else '未识别') }}</dd></div></dl>
+            {% if item.readable %}
+              <div class="card-actions">
+                {% if task and task.can_resume and task.managed_task_id %}
+                  <form class="confirm-form deconstruction-action-form" data-confirm="确认从已有断点续跑这本作品？" method="post" action="{{ base_path }}/books/deconstruction-action"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="operation" value="resume"><input type="hidden" name="task_id" value="{{ task.managed_task_id }}"><button class="button button-primary" type="submit">续跑任务</button></form>
+                {% elif item.deconstruction_state not in ['running','full'] %}
+                  <form class="confirm-form deconstruction-action-form" data-confirm="确认启动黄金三章扫描？" method="post" action="{{ base_path }}/books/deconstruction-action"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="operation" value="scan"><input type="hidden" name="catalog_id" value="{{ item.catalog_id }}"><button class="button" type="submit">黄金三章</button></form>
+                  <form class="confirm-form deconstruction-action-form" data-confirm="确认启动完整拆书？" method="post" action="{{ base_path }}/books/deconstruction-action"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="operation" value="full"><input type="hidden" name="catalog_id" value="{{ item.catalog_id }}"><button class="button button-primary" type="submit">完整拆书</button></form>
+                {% endif %}
+                {% if task and task.managed_task_id %}<a class="button" href="{{ base_path }}/books/tasks/{{ task.managed_task_id }}">任务详情/日志</a>{% endif %}
+              </div>
+            {% endif %}
+            </div>
+          </article>
+        {% else %}<p class="empty">当前筛选没有匹配的书目。</p>{% endfor %}
+      </div>
+    {% else %}
+      <div class="book-grid catalog-book-grid catalog-novel-grid">
+        {% for book in data['items'] %}
+          <article class="book-card catalog-book-card catalog-novel-card">
+            {{ catalog_cover(book) }}
+            <div class="catalog-novel-main">
+            <div class="book-meta">{% if book.catalog_id %}<label class="catalog-select"><input form="catalog-bulk-form" type="checkbox" name="catalog_id" value="{{ book.catalog_id }}">选择</label>{% endif %}<span>{{ book.category or '未分类' }}</span><span>{{ '本地' if book.library_id == 'local' else '番茄/授权' }}</span></div>
+            <h2>
+              {% if book.catalog_id %}<a href="{{ base_path }}/books/catalog/{{ book.catalog_id }}">{{ book.title }}</a>
+              {% elif book.public_id %}<a href="{{ base_path }}/books/{{ book.public_id }}">{{ book.title }}</a>
+              {% else %}{{ book.title }}{% endif %}
+            </h2>
+            <p>{{ book.author or '未知作者' }}</p>
+            <div class="catalog-status-row">
+              <span class="status {{ 'ok' if book.readable else 'warn' }}">{{ '正文可用' if book.readable else '待恢复' }}</span>
+              {% if book.tone_indexed %}<span class="status ok">基调已索引</span>{% endif %}
+              {% if book.plot_indexed %}<span class="status neutral">剧情 {{ book.segment_count or 0 }} 段</span>{% endif %}
+            </div>
+            <dl class="catalog-facts"><div><dt>状态</dt><dd>{{ book.book_status_label or ('已收录' if book.readable else '待恢复') }}</dd></div><div><dt>规模</dt><dd>{{ (book.source_bytes or 0)|filesize }} · {{ '{:,}'.format(book.word_count or book.approx_word_count) if (book.word_count or book.approx_word_count) else '字数待识别' }}</dd></div><div><dt>章节</dt><dd>{{ book.chapter_count_label or (('{:,}'.format(book.chapter_count or book.approx_chapter_count) ~ ' 章') if (book.chapter_count or book.approx_chapter_count) else '未识别') }} · {{ book.updated_label or (book.updated_at or '未知')[:10] }}</dd></div></dl>
+            {% if view == 'tone' %}
+              <div class="tone-groups"><p><strong>题材</strong>{% for item in book.genre_tags[:2] %}<span>{{ item }}</span>{% else %}<em>未提取</em>{% endfor %}</p><p><strong>主基调</strong>{% for item in book.primary_tone_tags[:2] %}<span>{{ item }}</span>{% else %}<em>未提取</em>{% endfor %}</p>{% if book.secondary_tone_tags %}<p><strong>辅助</strong>{% for item in book.secondary_tone_tags[:3] %}<span>{{ item }}</span>{% endfor %}</p>{% endif %}<p><strong>置信度</strong><span>{{ ((book.tone_confidence or 0) * 100)|round|int }}%</span><em>{{ '模型复核' if book.tone_source == 'model_review' else '题材先验' if book.tone_source == 'category_prior' else '规则证据' }}</em></p></div>
+            {% endif %}
+            <p class="summary">{{ book.summary or book.last_error or '暂无简介' }}</p>
+            <p class="card-actions">{% if book.catalog_id and view != 'plot' %}<a class="button" href="{{ base_path }}/books/catalog/{{ book.catalog_id }}">书籍详情</a>{% endif %}{% if view == 'plot' %}<a class="button" href="{{ base_path }}/books/catalog/{{ book.catalog_id }}/plot">剧情证据</a>{% endif %}{% if book.public_id and book.readable %}<a class="button button-primary" href="{{ base_path }}/books/{{ book.public_id }}">章节目录</a>{% endif %}</p>
+            </div>
+          </article>
+        {% else %}<p class="empty">没有匹配书籍。</p>{% endfor %}
+      </div>
+    {% endif %}
+
+    <nav class="pagination catalog-pagination" aria-label="分页">
+      {% set previous = data.page - 1 %}{% set following = data.page + 1 %}
+      {% if data.page > 1 %}<a class="button" href="{{ base_path }}/books/catalog?{{ {'view': view, 'q': query, 'category': category, 'availability': availability, 'source': source, 'tag': tag, 'state': state, 'page': previous, 'page_size': page_size}|urlencode }}">上一页</a>{% endif %}
+      <span class="page-number-strip" aria-label="页码">
+        {% set page_start = ((data.page - 1) // 10) * 10 + 1 %}{% set page_end = [data.page_count, page_start + 9]|min %}
+        {% if page_start > 1 %}<a class="button" href="{{ base_path }}/books/catalog?{{ {'view': view, 'q': query, 'category': category, 'availability': availability, 'source': source, 'tag': tag, 'state': state, 'page': 1, 'page_size': page_size}|urlencode }}">1</a>{% if page_start > 2 %}<i aria-hidden="true">…</i>{% endif %}{% endif %}
+        {% for page_number in range(page_start, page_end + 1) %}<a class="button {{ 'button-primary' if page_number == data.page else '' }}" {% if page_number == data.page %}aria-current="page"{% endif %} href="{{ base_path }}/books/catalog?{{ {'view': view, 'q': query, 'category': category, 'availability': availability, 'source': source, 'tag': tag, 'state': state, 'page': page_number, 'page_size': page_size}|urlencode }}">{{ page_number }}</a>{% endfor %}
+        {% if page_end < data.page_count %}{% if page_end < data.page_count - 1 %}<i aria-hidden="true">…</i>{% endif %}<a class="button" href="{{ base_path }}/books/catalog?{{ {'view': view, 'q': query, 'category': category, 'availability': availability, 'source': source, 'tag': tag, 'state': state, 'page': data.page_count, 'page_size': page_size}|urlencode }}">{{ data.page_count }}</a>{% endif %}
+      </span>
+      {% if data.page < data.page_count %}<a class="button" href="{{ base_path }}/books/catalog?{{ {'view': view, 'q': query, 'category': category, 'availability': availability, 'source': source, 'tag': tag, 'state': state, 'page': following, 'page_size': page_size}|urlencode }}">下一页</a>{% endif %}
+      <form class="page-jump" method="get" action="{{ base_path }}/books/catalog">
+        <input type="hidden" name="view" value="{{ view }}"><input type="hidden" name="q" value="{{ query }}"><input type="hidden" name="category" value="{{ category }}"><input type="hidden" name="availability" value="{{ availability }}"><input type="hidden" name="source" value="{{ source }}"><input type="hidden" name="tag" value="{{ tag }}"><input type="hidden" name="state" value="{{ state }}"><input type="hidden" name="page_size" value="{{ page_size }}">
+        <label><span>跳至</span><input name="page" type="number" min="1" max="{{ data.page_count }}" inputmode="numeric" aria-label="跳转页码"></label>
+        <button class="button" type="submit">跳转</button>
+      </form>
+    </nav>
+  {% endif %}
+</div>
+{% endblock %}

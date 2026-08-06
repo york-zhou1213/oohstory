@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}概览 · OOHStory 运维台{% endblock %}
+{% block content %}
+<div class="page-heading dashboard-hero">
+  <div><p class="eyebrow">REAL-TIME OPERATIONS</p><h1>系统概览</h1><p class="muted">一眼掌握 Reader、主机资源、电子书库和受控服务状态。</p></div>
+  <div class="hero-health"><span class="pulse-dot"></span><div><strong>本机运维边界</strong><small>数据来自受限读取与精确白名单</small></div></div>
+</div>
+
+<nav class="quick-action-grid" aria-label="常用工作台">
+  <a href="{{ base_path }}/library"><span aria-hidden="true">▦</span><strong>电子书库</strong><small>同步、封面、索引和任务总览</small><em>打开工作台 →</em></a>
+  <a href="{{ base_path }}/books/catalog"><span aria-hidden="true">▤</span><strong>小说目录</strong><small>7 类馆藏视图与全局拆书库</small><em>浏览全部书目 →</em></a>
+  <a href="{{ base_path }}/pipeline"><span aria-hidden="true">⌘</span><strong>管道与服务</strong><small>服务控制和白名单脚本管理</small><em>进入服务治理 →</em></a>
+  <a href="{{ base_path }}/audit"><span aria-hidden="true">✓</span><strong>审计日志</strong><small>查看最近的受控写操作记录</small><em>查看操作轨迹 →</em></a>
+</nav>
+
+{% set home = dashboard.reader_home %}
+<section aria-labelledby="reader-stats">
+  <div class="section-title"><h2 id="reader-stats">Reader 数据</h2>
+    <span class="status {{ 'ok' if dashboard.reader_health.available else 'bad' }}">{{ '可用' if dashboard.reader_health.available else '不可用' }}</span>
+  </div>
+  {% if home.available and home.data.stats %}
+  <div class="metric-grid">
+    <article class="metric"><span>目录总量</span><strong>{{ home.data.stats.catalog_total }}</strong></article>
+    <article class="metric"><span>可阅读</span><strong>{{ home.data.stats.readable_total }}</strong></article>
+    <article class="metric"><span>分类</span><strong>{{ home.data.stats.category_total }}</strong></article>
+    <article class="metric"><span>拆书档案</span><strong>{{ home.data.stats.deconstruction_total }}</strong></article>
+  </div>
+  {% else %}
+  <div class="alert alert-error">Reader 首页统计不可用：{{ home.error or '未知错误' }}</div>
+  {% endif %}
+</section>
+
+<section aria-labelledby="resources">
+  <div class="section-title"><h2 id="resources">主机资源</h2><span class="status neutral">边界读取</span></div>
+  {% if dashboard.system.memory %}
+  <div class="metric-grid">
+    <article class="metric"><span>内存已用</span><strong>{{ dashboard.system.memory.used_bytes|filesize }}</strong><small>可用 {{ dashboard.system.memory.available_bytes|filesize }}</small></article>
+    <article class="metric"><span>Swap 已用</span><strong>{{ dashboard.system.memory.swap_used_bytes|filesize }}</strong><small>总量 {{ dashboard.system.memory.swap_total_bytes|filesize }}</small></article>
+    <article class="metric"><span>进程数</span><strong>{{ dashboard.system.processes.process_count or '—' }}</strong><small>运行 {{ dashboard.system.processes.uptime_seconds or '—' }} 秒</small></article>
+    <article class="metric"><span>负载</span><strong>{% if dashboard.system.processes.load %}{{ '%.2f'|format(dashboard.system.processes.load[0]) }}{% else %}—{% endif %}</strong><small>1 分钟</small></article>
+  </div>
+  <div class="table-wrap">
+    <table><thead><tr><th>挂载点</th><th>已用</th><th>可用</th><th>总量</th></tr></thead><tbody>
+    {% for disk in dashboard.system.disks %}
+      <tr><td><code>{{ disk.path }}</code></td><td>{{ disk.used_bytes|filesize if disk.available else '不可用' }}</td><td>{{ disk.free_bytes|filesize if disk.available else '—' }}</td><td>{{ disk.total_bytes|filesize if disk.available else '—' }}</td></tr>
+    {% endfor %}
+    </tbody></table>
+  </div>
+  {% else %}<div class="alert alert-error">主机资源状态不可用。</div>{% endif %}
+</section>
+
+<section aria-labelledby="service-status">
+  <div class="section-title"><h2 id="service-status">服务摘要</h2><a href="{{ base_path }}/pipeline">进入管道控制</a></div>
+  <div class="service-grid">
+  {% for service in dashboard.services %}
+    <article class="service-card">
+      <div><strong>{{ service.label }}</strong><code>{{ service.unit }}</code></div>
+      {% if service.available %}<span class="status {{ 'ok' if service.active == 'active' else 'warn' }}">{{ service.active }}/{{ service.sub }}</span>
+      {% else %}<span class="status bad">不可用</span>{% endif %}
+    </article>
+  {% endfor %}
+  </div>
+</section>
+{% endblock %}

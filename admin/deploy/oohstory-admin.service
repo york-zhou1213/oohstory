@@ -1,0 +1,56 @@
+[Unit]
+Description=OOHStory operations administration backend
+After=network-online.target oohstory-library-cache.service
+Wants=network-online.target
+RequiresMountsFor=/srv/oohstory/library
+
+[Service]
+Type=simple
+User=oohstory-admin
+Group=oohstory-admin
+WorkingDirectory=/opt/oohstory-admin
+EnvironmentFile=/etc/oohstory-admin/admin.env
+Environment=PYTHONUNBUFFERED=1
+Environment=OOHSTORY_ADMIN_DATABASE=/var/lib/oohstory-admin/audit.db
+Environment=OOHSTORY_ADMIN_USE_SUDO_HELPER=1
+Environment=OOHSTORY_ADMIN_SYSTEMCTL_HELPER_PATH=/usr/local/libexec/oohstory-admin-systemctl
+Environment=OOHSTORY_ADMIN_SCRIPT_STORE_HELPER_PATH=/usr/local/libexec/oohstory-admin-script-store
+Environment=OOHSTORY_ADMIN_LIBRARY_ACTION_HELPER_PATH=/usr/local/libexec/oohstory-admin-library-action
+Environment=OOHSTORY_ADMIN_LIBRARY_UPLOAD_DIR=/var/lib/oohstory-admin/cover-uploads
+Environment=OOHSTORY_ADMIN_MANAGED_SCRIPT_ROOT=/opt/oohstory-admin
+ExecStart=/opt/oohstory-admin/.venv/bin/uvicorn oohstory_admin.app:create_app --factory --host 127.0.0.1 --port 8092 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=35
+StateDirectory=oohstory-admin
+StateDirectoryMode=0700
+UMask=0077
+
+NoNewPrivileges=false
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=all
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+ReadOnlyPaths=/opt/oohstory-admin
+BindReadOnlyPaths=/srv/oohstory/library
+ReadWritePaths=/var/lib/oohstory-admin /opt/oohstory-admin/scripts/electronic-library
+
+[Install]
+WantedBy=multi-user.target

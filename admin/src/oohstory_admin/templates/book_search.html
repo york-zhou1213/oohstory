@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}全局书源搜索 · OOHStory 运维台{% endblock %}
+{% block content %}
+<div class="library-workspace catalog-workspace">
+  <header class="library-hero compact-hero"><div><p class="eyebrow">GLOBAL BOOK SEARCH</p><h1>全局书源搜索</h1><p>搜索本地馆藏或受支持的远程来源；远程归档会作为独立后台任务运行并自动进入增量索引队列。</p></div><a class="button" href="{{ base_path }}/books/catalog">返回小说目录</a></header>
+  <form class="library-panel library-search" method="get" action="{{ base_path }}/books/search">
+    <select name="source" aria-label="选择搜索书源">{% for value,label in search_sources %}<option value="{{ value }}" {% if selected_source == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
+    <input type="search" name="q" minlength="2" maxlength="100" value="{{ query }}" placeholder="输入作品名或作者">
+    <button class="button button-primary" type="submit">搜索</button>
+  </form>
+  {% if search_error %}<div class="alert alert-error">{{ search_error }}</div>{% endif %}
+  {% if search_result %}
+    <section class="library-panel"><div class="catalog-result-heading"><div><p class="section-kicker">{{ search_result.search_source_label }}</p><h2>本地 {{ search_result.local_count or 0 }} 项 · 远程 {{ search_result.remote_count or 0 }} 项</h2></div></div>
+      {% if search_result.local %}<h3>本地馆藏</h3><div class="book-grid catalog-book-grid">{% for item in search_result.local %}<article class="book-card"><div class="book-meta"><span>{{ item.category or '未分类' }}</span><span>本地</span></div><h2>{{ item.title }}</h2><p>{{ item.author or '未知作者' }}</p>{% if item.catalog_id %}<a class="button" href="{{ base_path }}/books/catalog/{{ item.catalog_id }}">查看书目</a>{% endif %}</article>{% endfor %}</div>{% endif %}
+      {% if search_result.remote %}<h3>远程来源</h3><div class="book-grid catalog-book-grid">{% for item in search_result.remote %}<article class="book-card"><div class="book-meta"><span>{{ item.category or '未分类' }}</span><span>{{ item.provider or selected_source }}</span></div><h2>{{ item.title or '未命名作品' }}</h2><p>{{ item.author or '未知作者' }}</p><p class="summary">{{ item.description or item.latest_chapter or item.download_mode or '可归档至 OOHStory 电子书库' }}</p>{% if item.downloadable is not false %}<form class="confirm-form" data-confirm="确认下载并归档这本作品？" method="post" action="{{ base_path }}/books/import"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="provider" value="{{ item.provider or selected_source }}"><input type="hidden" name="remote_id" value="{{ item.remote_id or item.id }}"><input type="hidden" name="source_ref" value="{{ item.source_ref or item.detail_url or '' }}"><input type="hidden" name="book_status" value="{{ item.book_status or '' }}"><button class="button button-primary" type="submit">下载并归档</button></form>{% endif %}</article>{% endfor %}</div>{% endif %}
+      {% if not search_result.local and not search_result.remote %}<p class="empty">没有匹配的作品。</p>{% endif %}
+    </section>
+  {% endif %}
+</div>
+{% endblock %}

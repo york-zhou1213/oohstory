@@ -1,0 +1,5 @@
+# Copy this file to ../key.properties and keep the real file out of Git.
+storeFile=/absolute/path/to/upload-keystore.jks
+storePassword=replace-with-a-local-secret
+keyAlias=upload
+keyPassword=replace-with-a-local-secret

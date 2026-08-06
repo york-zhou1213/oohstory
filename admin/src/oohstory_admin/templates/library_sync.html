@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+{% block title %}同步调度 · OOHStory 运维台{% endblock %}
+{% block content %}
+<div class="library-workspace sync-workspace">
+  <header class="library-hero compact-hero">
+    <div>
+      <p class="eyebrow">LIBRARY SYNC CONTROL</p>
+      <h1>同步调度</h1>
+      <p>定时同步、按站点全力同步和底层服务控制集中在这里；小说目录不再混入运维面板。</p>
+    </div>
+    <nav class="catalog-page-actions" aria-label="同步相关页面">
+      <a class="button button-primary" href="#site-full-sync">按站点全力同步</a>
+      <a class="button" href="{{ base_path }}/library">书库总览</a>
+      <a class="button" href="{{ base_path }}/books/catalog">小说目录</a>
+      <a class="button" href="{{ base_path }}/pipeline">全部服务</a>
+    </nav>
+  </header>
+
+  {% if notice %}<div class="alert {{ 'alert-info' if notice == '操作成功' else 'alert-error' }}" role="status">{{ notice }}</div>{% endif %}
+  {% if sync_error %}<div class="alert alert-error">同步状态暂不可用：{{ sync_error }}</div>{% endif %}
+
+  <section class="library-panel sync-toggle-panel">
+    <div class="library-panel-heading">
+      <div>
+        <p class="section-kicker">SCHEDULED LIBRARY SYNC</p>
+        <h2>书库定时同步</h2>
+        <p>分别控制本地书库和番茄书库的书目、正文及源站增量同步。</p>
+      </div>
+      <span class="status neutral">固定白名单 · 全程审计</span>
+    </div>
+    <div class="sync-toggle-grid">
+      {% for library_id, label in [('local','本地书库'),('fanqie','番茄书库')] %}
+        {% set control = sync_controls.get(library_id, {}) %}
+        {% set enabled = control.get('content_enabled', control.get('enabled', false)) %}
+        <article class="sync-toggle-card">
+          <div>
+            <span class="status {{ 'ok' if enabled else 'neutral' }}">{{ '已启用' if enabled else '已停用' }}</span>
+            <h3>{{ label }}</h3>
+            <p>{{ control.get('pipeline_description') or '书目、正文与来源版本增量同步' }}</p>
+            <div class="sync-cover-lines">
+              {% for cover in dashboard.covers %}
+                {% if (library_id == 'local' and cover.key in ['local_sync','local_source_upgrade','ai_redraw']) or (library_id == 'fanqie' and cover.key == 'fanqie_sync') %}
+                  <small>{{ cover.label }}：{{ '{:,}'.format(cover.done) }} / {{ '{:,}'.format(cover.total) }}{% if cover.failed %} · 失败 {{ cover.failed }}{% endif %}</small>
+                {% endif %}
+              {% endfor %}
+            </div>
+          </div>
+          <dl>
+            <div><dt>运行状态</dt><dd>{{ '运行中' if control.get('content_pipeline_active') or control.get('active') else '空闲' }}</dd></div>
+            <div><dt>下次执行</dt><dd>{{ control.get('next_run') or '未排期' }}</dd></div>
+            <div><dt>上次执行</dt><dd>{{ control.get('last_run') or '暂无' }}</dd></div>
+          </dl>
+          <form class="confirm-form" data-confirm="确认{{ '停用' if enabled else '启用' }}{{ label }}定时同步？" method="post" action="{{ base_path }}/books/sync-control">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="library_id" value="{{ library_id }}">
+            <input type="hidden" name="enabled" value="{{ '0' if enabled else '1' }}">
+            <button class="button {{ 'button-danger' if enabled else 'button-primary' }}" type="submit">{{ '停用同步' if enabled else '启用同步' }}</button>
+          </form>
+        </article>
+      {% endfor %}
+    </div>
+  </section>
+
+  {% set full_sync = sync_controls.get('site_full_sync', {}) %}
+  <section class="library-panel site-full-sync-panel" id="site-full-sync">
+    <div class="library-panel-heading">
+      <div>
+        <p class="section-kicker">PER-SITE FULL-RATE BODY SYNC</p>
+        <h2>按站点全力同步正文</h2>
+        <p>与 Webnovel Writer 电子书库保持同等五站能力：本地 TXT80 与四个授权站点均可独立保存每轮目录数量，运行脚本会在每轮开始前读取最新配置。</p>
+        <p class="sync-boundary-copy">这里只控制 OOHStory 自有 <code>oohstory-*</code> 单元；两套系统共享 MySQL、NAS 与安全执行槽，但不会跨项目启动 <code>webnovel-*</code> 服务。</p>
+      </div>
+      <span class="status info">原子配置 · 每轮读取</span>
+    </div>
+    <div class="site-full-sync-grid">
+      {% for site in full_sync.get('sites', []) %}
+        <article class="site-full-sync-card {{ 'active' if site.active else ('enabled' if site.enabled else '') }}">
+          <div>
+            <span class="status {{ 'ok' if site.active else ('info' if site.enabled else 'neutral') }}">{{ '运行中' if site.active else ('等待/重试' if site.enabled else '已关闭') }}</span>
+            <h4>{{ site.label }}</h4>
+            <p>{{ site.message or '尚未启动' }}</p>
+            {% if site.updated_at %}<small>更新：{{ site.updated_at }}</small>{% endif %}
+          </div>
+          <form class="sync-control-form" method="post" action="{{ base_path }}/books/site-full-sync">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="site_id" value="{{ site.id }}">
+            {% if site.configurable %}
+              <label class="sync-number-field">
+                <span>每轮目录本数</span>
+                <input name="books_per_cycle" type="number" min="1" max="500" step="1" required value="{{ site.books_per_cycle }}" inputmode="numeric">
+                <small>安全范围 1–500 本</small>
+              </label>
+              <div class="sync-card-actions">
+                <button class="button" name="enabled" value="{{ '1' if site.enabled else '0' }}" type="submit">保存数量</button>
+                <button class="button {{ 'button-danger' if site.enabled else 'button-primary' }}" name="enabled" value="{{ '0' if site.enabled else '1' }}" type="submit">{{ '停止全力同步' if site.enabled else '开启全力同步' }}</button>
+              </div>
+            {% else %}
+              <input type="hidden" name="enabled" value="{{ '0' if site.enabled else '1' }}">
+              <button class="button {{ 'button-danger' if site.enabled else 'button-primary' }}" type="submit">{{ '停止全力同步' if site.enabled else '开启全力同步' }}</button>
+            {% endif %}
+          </form>
+        </article>
+      {% else %}
+        <div class="alert alert-error">站点全力同步状态暂不可用；不会启动任何正文写任务。</div>
+      {% endfor %}
+    </div>
+  </section>
+
+  {% set redraw = sync_controls.get('cover_redraw', {}) %}
+  {% set redraw_actual = redraw.get('actual', {}) %}
+  <section class="library-panel cover-redraw-control {{ 'is-running' if redraw.get('active') else '' }}">
+    <div class="cover-redraw-copy">
+      <div class="cover-redraw-orbit" aria-hidden="true"><span>AI</span></div>
+      <div>
+        <p class="section-kicker">OOHSTORY AI COVER STUDIO</p>
+        <h2>封面重绘加速器</h2>
+        <p>只控制 OOHStory 自有重绘实例。目标会换算为并行 worker 数，并保存到脚本每轮读取的运行配置。</p>
+        <div class="cover-redraw-metrics" aria-label="封面重绘实时状态">
+          <span><b>{{ redraw_actual.get('completed_last_hour', 0) }}</b>近 1 小时完成</span>
+          <span><b>{{ redraw.get('active_workers', 0) }}/{{ redraw.get('configured_workers', 3) }}</b>worker 运行</span>
+          <span><b>{{ redraw_actual.get('processing', 0) }}</b>正在处理</span>
+          <span><b>{{ redraw_actual.get('pending', 0) }}</b>队列剩余</span>
+        </div>
+      </div>
+    </div>
+    <form class="cover-redraw-form" method="post" action="{{ base_path }}/books/cover-redraw-control">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label class="sync-number-field featured">
+        <span>每小时重绘目标</span>
+        <div><input name="target_per_hour" type="number" min="50" max="160" step="1" required value="{{ redraw.get('target_per_hour', 60) }}" inputmode="numeric"><em>本 / 小时</em></div>
+        <small>最低 50；系统按每路约 20 本/小时配置并发</small>
+      </label>
+      <div class="cover-redraw-actions">
+        <button class="button" name="operation" value="save" type="submit">保存目标</button>
+        {% if redraw.get('enabled') %}
+          <button class="button button-danger" name="operation" value="stop" type="submit">停止重绘</button>
+        {% else %}
+          <button class="button button-primary" name="operation" value="start" type="submit">启动重绘</button>
+        {% endif %}
+      </div>
+      <small class="cover-redraw-health">{{ '运行正常' if redraw.get('active') else ('已启用，worker 正在启动' if redraw.get('enabled') else '当前已停止') }}{% if redraw_actual.get('failed') %} · 失败 {{ redraw_actual.get('failed') }}{% endif %}</small>
+    </form>
+  </section>
+
+  <section class="library-panel" id="operations">
+    <div class="library-panel-heading">
+      <div><p class="section-kicker">CONTROLLED OPERATIONS</p><h2>电子书库服务控制</h2><p>只允许对白名单单元执行启动、重启和停止，所有操作写入审计日志。</p></div>
+      <a class="button" href="{{ base_path }}/audit">查看审计日志</a>
+    </div>
+    <div class="library-operation-grid">
+      {% for service in dashboard.operations %}
+        <article>
+          <div><h3>{{ service.label }}</h3><code>{{ service.unit }}</code></div>
+          <span class="status {{ 'ok' if service.active == 'active' else 'warn' }}">{{ service.active }}/{{ service.sub }}</span>
+          <div class="action-row">
+            {% for action in ['start', 'restart', 'stop'] %}
+              <form class="confirm-form" data-confirm="确认执行 {{ action }}？该操作会写入审计日志。" method="post" action="{{ library_action_path }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="target" value="{{ service.unit }}"><input type="hidden" name="action" value="{{ action }}">
+                <button class="button {{ 'button-danger' if action == 'stop' else '' }}" type="submit">{{ action }}</button>
+              </form>
+            {% endfor %}
+          </div>
+        </article>
+      {% else %}<p class="empty">未读取到白名单服务状态，请前往“管道与服务”检查。</p>{% endfor %}
+    </div>
+  </section>
+</div>
+{% endblock %}

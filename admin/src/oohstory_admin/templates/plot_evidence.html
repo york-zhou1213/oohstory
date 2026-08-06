@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}剧情证据 · {{ evidence.book.title }} · OOHStory 运维台{% endblock %}
+{% block content %}
+<div class="library-workspace evidence-workspace">
+  <header class="library-hero compact-hero plot">
+    <div>
+      <p class="eyebrow">PLOT EVIDENCE INDEX</p>
+      <h1>{{ evidence.book.title }}</h1>
+      <p>{{ evidence.book.author or '未知作者' }} · {{ evidence.book.category or '未分类' }} · 共 {{ '{:,}'.format(evidence.total) }} 条剧情证据</p>
+    </div>
+    <a class="button" href="{{ base_path }}/books/catalog?view=plot">返回剧情索引</a>
+  </header>
+
+  <div class="alert alert-info">证据来自只读剧情派生索引，按正文顺序展示位置、母题与原文片段；不会修改书目或正文。</div>
+  <section class="evidence-list">
+    {% for item in evidence['items'] %}
+      <article class="evidence-card">
+        <div class="book-meta"><span>#{{ item.id }}</span><span>{{ item.location or '正文位置未知' }}</span></div>
+        {% if item.motif_tags %}<p class="tag-line">{% for tag in item.motif_tags %}<span>{{ tag }}</span>{% endfor %}</p>{% endif %}
+        <blockquote>{{ item.content }}</blockquote>
+      </article>
+    {% else %}<p class="empty">该页没有剧情证据。</p>{% endfor %}
+  </section>
+
+  <nav class="pagination" aria-label="剧情证据分页">
+    {% if evidence.page > 1 %}<a class="button" href="{{ base_path }}/books/catalog/{{ evidence.book.catalog_id }}/plot?page={{ evidence.page - 1 }}">上一页</a>{% endif %}
+    <span>第 {{ evidence.page }} / {{ evidence.page_count }} 页</span>
+    {% if evidence.page < evidence.page_count %}<a class="button" href="{{ base_path }}/books/catalog/{{ evidence.book.catalog_id }}/plot?page={{ evidence.page + 1 }}">下一页</a>{% endif %}
+  </nav>
+</div>
+{% endblock %}

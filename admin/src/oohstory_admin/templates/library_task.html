@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}拆书任务详情 · OOHStory 运维台{% endblock %}
+{% block content %}
+<a class="back-link" href="{{ base_path }}/books/catalog?view=deconstruction">← 返回全局拆书库</a>
+<div class="page-heading"><div><p class="eyebrow">TASK {{ task.id }}</p><h1>{{ task.title or '拆书任务' }}</h1><p>{{ task.current_stage or task.message }}</p></div><span class="status {{ 'ok' if task.status == 'completed' else 'warn' if task.status in ['queued','running','paused'] else 'bad' }}">{{ task.status }}</span></div>
+<section class="panel"><dl class="service-paths"><div><dt>模式</dt><dd>{{ task.requested_mode or '—' }}</dd></div><div><dt>进度</dt><dd>{{ task.progress or 0 }}%</dd></div><div><dt>执行工具</dt><dd>{{ task.runner_name or task.runner_requested or '自动' }}</dd></div><div><dt>AI 配置</dt><dd>{{ task.model_name or task.model_requested or '默认' }}</dd></div><div><dt>AI 智商</dt><dd>{{ task.reasoning_name or task.reasoning_requested or '跟随默认' }}</dd></div><div><dt>AI 会话</dt><dd><code>{{ task.ai_session_id or '—' }}</code></dd></div><div><dt>输出目录</dt><dd><code>{{ task.output_dir or '—' }}</code></dd></div><div><dt>更新时间</dt><dd>{{ task.updated_at or '—' }}</dd></div></dl></section>
+{% if task.steps %}<section class="panel"><h2>执行步骤</h2><div class="task-step-list">{% for step in task.steps %}<div><span class="status {{ 'ok' if step.status == 'completed' else 'warn' }}">{{ step.status }}</span><strong>{{ step.name }}</strong></div>{% endfor %}</div></section>{% endif %}
+<section class="panel"><h2>任务日志</h2><pre class="job-result">{{ task.log or '暂无日志' }}</pre></section>
+{% endblock %}

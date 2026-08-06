@@ -23,7 +23,7 @@ class Settings:
     mysql_host: str = "127.0.0.1"
     mysql_port: int = 3306
     mysql_database: str = "oohstory_library"
-    mysql_user: str = "oohstory_reader"
+    mysql_user: str = "oohstory_public_reader"
     mysql_password_file: Path | None = None
     mysql_pool_size: int = 8
     public_deconstruction_root: Path | None = None
@@ -183,7 +183,7 @@ def load_settings() -> Settings:
             "OOHSTORY_MYSQL_DATABASE", "oohstory_library"
         ).strip(),
         mysql_user=os.getenv(
-            "OOHSTORY_MYSQL_USER", "oohstory_reader"
+            "OOHSTORY_MYSQL_USER", "oohstory_public_reader"
         ).strip(),
         mysql_password_file=(
             Path(raw_password_file).expanduser().resolve()

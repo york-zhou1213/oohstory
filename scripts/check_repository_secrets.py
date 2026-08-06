@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -14,7 +15,7 @@ FORBIDDEN_SUFFIXES = {
     ".aab", ".apk", ".db", ".jks", ".key", ".p12", ".pem", ".pfx",
     ".sqlite", ".sqlite3", ".tar", ".tgz", ".zip",
 }
-FORBIDDEN_NAMES = {".env", "id_rsa", "id_ed25519"}
+FORBIDDEN_NAMES = {".env", ".env.compose", "id_rsa", "id_ed25519"}
 TEXT_RULES = {
     "private-key marker": re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     "AWS access key": re.compile(rb"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
@@ -32,9 +33,24 @@ def is_ignored(path: Path) -> bool:
     return any(part in IGNORED_PARTS for part in path.relative_to(ROOT).parts)
 
 
+def repository_files() -> list[Path]:
+    result = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "-z"],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        return [
+            ROOT / value.decode("utf-8", errors="strict")
+            for value in result.stdout.split(b"\0")
+            if value
+        ]
+    return [path for path in ROOT.rglob("*") if path.is_file()]
+
+
 def main() -> int:
     findings: list[tuple[str, int, str]] = []
-    for path in sorted(ROOT.rglob("*")):
+    for path in sorted(repository_files()):
         if not path.is_file() or is_ignored(path):
             continue
         relative = path.relative_to(ROOT)

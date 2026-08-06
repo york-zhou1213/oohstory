@@ -1,0 +1,31 @@
+[Unit]
+Description=Targeted plot-free index for newly ingested OOHStory books
+After=network-online.target mysql.service remote-fs.target
+Wants=network-online.target
+RequiresMountsFor=/srv/oohstory/library/txt80
+StartLimitIntervalSec=10min
+StartLimitBurst=4
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/oohstory-admin
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/oohstory-admin/library.env
+Environment=OOHSTORY_LIBRARY_MYSQL_READ_TIMEOUT=120
+Environment=OOHSTORY_LIBRARY_MYSQL_WRITE_TIMEOUT=120
+ExecStart=/opt/oohstory-admin/.venv/bin/python /opt/oohstory-admin/scripts/electronic-library/ingestion_index_worker.py
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=infinity
+TimeoutStopSec=30
+Nice=15
+IOSchedulingClass=idle
+CPUQuota=50%
+MemoryHigh=384M
+MemoryMax=512M
+TasksMax=64
+IOWeight=10
+IOReadBandwidthMax=/dev/mapper/ubuntu--vg-ubuntu--lv 8M
+IOWriteBandwidthMax=/dev/mapper/ubuntu--vg-ubuntu--lv 4M
+OOMPolicy=stop

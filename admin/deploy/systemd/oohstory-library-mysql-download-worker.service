@@ -1,0 +1,31 @@
+[Unit]
+Description=Consume OOHStory authorized downloads from Redis Streams
+After=mysql.service redis-server.service network-online.target remote-fs.target
+Requires=mysql.service redis-server.service
+Wants=network-online.target
+RequiresMountsFor=/srv/oohstory/library
+ConditionPathIsMountPoint=/srv/oohstory/library
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/oohstory-admin/library.env
+Environment=OOHSTORY_LIBRARY_CATALOG_BACKEND=mysql
+Environment=OOHSTORY_LIBRARY_MYSQL_READ_TIMEOUT=120
+Environment=OOHSTORY_LIBRARY_MYSQL_WRITE_TIMEOUT=120
+WorkingDirectory=/opt/oohstory-admin
+ExecStart=/opt/oohstory-admin/.venv/bin/python /opt/oohstory-admin/scripts/electronic-library/authorized_site_stream_worker.py --concurrency 1 --min-local-free-gb 40 --min-nas-free-gb 100 --idle-exit-seconds 0
+Restart=on-failure
+RestartSec=10s
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=5
+CPUQuota=200%
+MemoryHigh=2G
+MemoryMax=2560M
+TasksMax=256
+OOMPolicy=stop
+TimeoutStopSec=2min
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,170 @@
+{% extends "base.html" %}
+{% block title %}运营管理 · OOHStory{% endblock %}
+{% block content %}
+<div class="page-heading operations-heading">
+  <div>
+    <p class="eyebrow">BUSINESS OPERATIONS</p>
+    <h1>运营管理</h1>
+    <p class="muted">管理邀请码、真实注册用户、书籍上下架、前台分类和正式书库上传。此页面不提供任何管理员角色授权。</p>
+  </div>
+</div>
+
+<nav class="operations-nav" aria-label="运营管理分区">
+  <a href="#invites">邀请码</a>
+  <a href="#users">注册用户</a>
+  <a href="#book-publication">书籍上下架</a>
+  <a href="#categories">书籍分类</a>
+  <a href="#novels">小说上传</a>
+</nav>
+
+{% if notice %}<div class="alert alert-info" role="status">{{ notice }}</div>{% endif %}
+{% if error %}<div class="alert alert-error" role="alert">{{ error }}</div>{% endif %}
+{% if invite_code %}
+<div class="alert alert-info" role="status">
+  <strong>新邀请码（仅本次显示）</strong>
+  <code class="one-time-code">{{ invite_code }}</code>
+</div>
+{% endif %}
+
+{% set data = operations or {} %}
+{% set summary = data.get('summary', {}) %}
+{% set book_summary = data.get('book_summary', {}) %}
+<div class="metric-grid operations-metrics">
+  <article class="metric"><span>注册用户</span><strong>{{ summary.get('users', 0) }}</strong><small>来自 accounts.sqlite3</small></article>
+  <article class="metric"><span>启用用户</span><strong>{{ summary.get('active_users', 0) }}</strong><small>仅注册账号，不含后台管理员</small></article>
+  <article class="metric"><span>邀请码</span><strong>{{ data.get('invites', [])|length }}</strong><small>最近 100 条</small></article>
+  <article class="metric"><span>分类</span><strong>{{ data.get('categories', [])|length }}</strong><small>实时影响前台分类</small></article>
+  <article class="metric"><span>已上架书籍</span><strong>{{ book_summary.get('published_books', 0) }}</strong><small>Reader 当前公开可见</small></article>
+  <article class="metric"><span>已下架书籍</span><strong>{{ book_summary.get('unpublished_books', 0) }}</strong><small>资源与数据仍安全保留</small></article>
+</div>
+
+<div class="operations-workspace">
+<section class="panel operations-section operations-invites" id="invites">
+  <div class="section-title"><div><h2>邀请码</h2><p class="muted">完整代码只在创建响应中显示，数据库仅保存哈希。</p></div></div>
+  <form class="operations-form-grid" method="post" action="{{ base_path }}/operations/invites/create">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>备注<input name="label" maxlength="80" placeholder="例如：8 月内测"></label>
+    <label>可用次数<input name="max_uses" type="number" min="1" max="100000" value="1" required></label>
+    <label>有效天数<input name="expires_in_days" type="number" min="1" max="365" value="30" required></label>
+    <button class="button button-primary" type="submit">生成邀请码</button>
+  </form>
+  <div class="table-wrap operations-table">
+    <table><thead><tr><th>备注</th><th>使用</th><th>到期</th><th>状态</th><th>操作</th></tr></thead><tbody>
+    {% for item in data.get('invites', []) %}
+      <tr>
+        <td data-label="备注">{{ item.label or '—' }}</td><td data-label="使用">{{ item.used_count }} / {{ item.max_uses }}</td><td data-label="到期">{{ item.expires_at or '永久' }}</td>
+        <td data-label="状态"><span class="status {{ 'bad' if item.disabled else 'ok' }}">{{ '已撤销' if item.disabled else '有效' }}</span></td>
+        <td data-label="操作">{% if not item.disabled %}<form method="post" action="{{ base_path }}/operations/invites/{{ item.id }}/revoke"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button button-danger" type="submit">撤销</button></form>{% else %}—{% endif %}</td>
+      </tr>
+    {% else %}<tr><td colspan="5" class="empty">暂无邀请码</td></tr>{% endfor %}
+    </tbody></table>
+  </div>
+</section>
+
+<section class="panel operations-section operations-users" id="users">
+  <div class="section-title"><div><h2>注册用户</h2><p class="muted">只允许启用、停用和撤销会话；这里没有角色字段，也不能创建或提升管理员。</p></div></div>
+  <form class="filter-bar" method="get" action="{{ base_path }}/operations">
+    <label>邮箱或昵称<input name="q" maxlength="100" value="{{ query }}" placeholder="搜索注册用户"></label>
+    <label>状态<select name="status"><option value="">全部</option><option value="active" {% if status_filter == 'active' %}selected{% endif %}>启用</option><option value="disabled" {% if status_filter == 'disabled' %}selected{% endif %}>停用</option></select></label>
+    <button class="button" type="submit">筛选</button>
+  </form>
+  <div class="table-wrap operations-table">
+    <table><thead><tr><th>注册用户</th><th>状态</th><th>有效会话</th><th>注册 / 最近登录</th><th>操作</th></tr></thead><tbody>
+    {% for user in data.get('users', []) %}
+      <tr>
+        <td data-label="注册用户"><strong>{{ user.display_name }}</strong><br><small>{{ user.email }}</small></td>
+        <td data-label="状态"><span class="status {{ 'ok' if user.status == 'active' else 'bad' }}">{{ '启用' if user.status == 'active' else '停用' }}</span></td>
+        <td data-label="有效会话">{{ user.active_sessions }}</td><td data-label="注册 / 最近登录"><small>{{ user.created_at }}<br>{{ user.last_login_at or '尚未登录' }}</small></td>
+        <td data-label="操作"><div class="action-row">
+          <form method="post" action="{{ base_path }}/operations/users/{{ user.id }}/status"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="status" value="{{ 'disabled' if user.status == 'active' else 'active' }}"><button class="button {{ 'button-danger' if user.status == 'active' else '' }}" type="submit">{{ '停用' if user.status == 'active' else '启用' }}</button></form>
+          <form method="post" action="{{ base_path }}/operations/users/{{ user.id }}/sessions/revoke"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button" type="submit">撤销会话</button></form>
+        </div></td>
+      </tr>
+    {% else %}<tr><td colspan="5" class="empty">没有匹配的注册用户</td></tr>{% endfor %}
+    </tbody></table>
+  </div>
+</section>
+
+<section class="panel operations-section operations-publication" id="book-publication">
+  <div class="section-title"><div><h2>书籍上下架</h2><p class="muted">下架会立即从书库、搜索、排行、详情直链、封面与下载入口隐藏，但不会删除正文、封面、章节、指标或拆书数据；通过此处可重新上架。</p></div></div>
+  <form class="filter-bar" method="get" action="{{ base_path }}/operations#book-publication">
+    <label>书名、作者或目录 ID<input name="book_q" maxlength="100" value="{{ book_query }}" placeholder="搜索正式书籍"></label>
+    <label>上架状态<select name="publication"><option value="">全部</option><option value="published" {% if publication_filter == 'published' %}selected{% endif %}>已上架</option><option value="unpublished" {% if publication_filter == 'unpublished' %}selected{% endif %}>已下架</option></select></label>
+    <button class="button" type="submit">筛选书籍</button>
+  </form>
+  <div class="table-wrap operations-table">
+    <table><thead><tr><th>书籍</th><th>分类 / 状态</th><th>公开状态</th><th>最近原因</th><th>操作</th></tr></thead><tbody>
+    {% for book in data.get('books', []) %}
+      <tr>
+        <td data-label="书籍"><strong>{{ book.title }}</strong><br><small>{{ book.author or '未知作者' }} · ID {{ book.catalog_id }}</small></td>
+        <td data-label="分类 / 状态">{{ book.category or '未分类' }}<br><small>{{ book.book_status or book.status }}</small></td>
+        <td data-label="公开状态"><span class="status {{ 'ok' if book.is_published else 'bad' }}">{{ '已上架' if book.is_published else '已下架' }}</span></td>
+        <td data-label="最近原因"><small>{{ book.publication_reason or '—' }}</small></td>
+        <td data-label="操作">
+          <form class="publication-action" method="post" action="{{ base_path }}/operations/books/{{ book.catalog_id }}/publication">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="published" value="{{ '0' if book.is_published else '1' }}">
+            <label>操作原因<input name="reason" maxlength="240" required placeholder="{{ '填写下架原因' if book.is_published else '填写重新上架原因' }}"></label>
+            <button class="button {{ 'button-danger' if book.is_published else 'button-primary' }}" type="submit" {% if book.is_published %}onclick="return confirm('确认下架这本书？公开入口会立即隐藏。')"{% endif %}>{{ '下架' if book.is_published else '重新上架' }}</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}<tr><td colspan="5" class="empty">没有匹配的正式书籍</td></tr>{% endfor %}
+    </tbody></table>
+  </div>
+</section>
+
+<section class="panel operations-section operations-categories" id="categories">
+  <div class="section-title"><div><h2>书籍分类</h2><p class="muted">显示名、排序和启停会实时影响前台；已有书目的分类不能删除。</p></div></div>
+  <form class="operations-form-grid" method="post" action="{{ base_path }}/operations/categories/create">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>分类名<input name="name" maxlength="40" required></label>
+    <label>简介<input name="description" maxlength="240"></label>
+    <label>排序<input name="sort_order" type="number" min="0" max="10000" value="100" required></label>
+    <button class="button button-primary" type="submit">新增分类</button>
+  </form>
+  <div class="operations-card-grid">
+    {% for category in data.get('categories', []) %}
+      <article class="service-card operations-category-card">
+        <form class="stack" method="post" action="{{ base_path }}/operations/categories/{{ category.id }}/update">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label>显示名<input name="display_name" maxlength="40" value="{{ category.display_name }}" required></label>
+          <label>简介<input name="description" maxlength="240" value="{{ category.description }}"></label>
+          <label>排序<input name="sort_order" type="number" min="0" max="10000" value="{{ category.sort_order }}" required></label>
+          <label class="check-label"><input type="checkbox" name="enabled" value="1" {% if category.enabled %}checked{% endif %}> 前台启用</label>
+          <button class="button" type="submit">保存</button>
+        </form>
+        {% if category.is_custom %}<form method="post" action="{{ base_path }}/operations/categories/{{ category.id }}/delete"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button button-danger" type="submit">删除空分类</button></form>{% endif %}
+      </article>
+    {% else %}<p class="empty">暂无分类</p>{% endfor %}
+  </div>
+</section>
+
+<section class="panel operations-section operations-novels" id="novels">
+  <div class="section-title"><div><h2>后台小说上传</h2><p class="muted">TXT 与封面先进入隔离区，病毒与结构扫描通过后写入正式 MySQL 书库、NAS 正文、封面对象和轻量索引队列。</p></div></div>
+  <form class="stack novel-upload-form" method="post" enctype="multipart/form-data" action="{{ base_path }}/operations/novels/upload">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="operations-form-grid">
+      <label>书名<input name="title" maxlength="120" required></label>
+      <label>作者<input name="author" maxlength="80" required></label>
+      <label>分类<select name="category" required>{% for category in data.get('categories', []) if category.enabled %}<option value="{{ category.source_name }}">{{ category.display_name }}</option>{% endfor %}</select></label>
+      <label>状态<select name="serialization_status"><option value="finished">已完结</option><option value="ongoing">连载中</option></select></label>
+    </div>
+    <label>简介<textarea name="summary" maxlength="2000" rows="4"></textarea></label>
+    <label>来源与版权说明<input name="source" maxlength="160" required placeholder="例如：作者本人原创并授权发布"></label>
+    <div class="operations-form-grid">
+      <label>TXT 正文（最大 40MB）<input name="manuscript" type="file" accept=".txt,text/plain" required></label>
+      <label>封面（JPG/PNG/GIF/WebP，最大 12MB）<input name="cover" type="file" accept="image/jpeg,image/png,image/gif,image/webp" required></label>
+    </div>
+    <label class="check-label"><input type="checkbox" name="authorization" value="confirmed" required> 我确认拥有上传、处理和发布该作品的授权</label>
+    <button class="button button-primary" type="submit">安全扫描并提交正式入库</button>
+  </form>
+  <div class="table-wrap operations-table">
+    <table><thead><tr><th>书名</th><th>任务</th><th>状态</th><th>时间</th><th>结果</th></tr></thead><tbody>
+    {% for job in data.get('uploads', []) %}<tr><td data-label="书名">{{ job.title or '—' }}</td><td data-label="任务"><code>{{ job.job_id }}</code></td><td data-label="状态"><span class="status {{ 'ok' if job.status == 'completed' else 'bad' if job.status == 'failed' else 'warn' }}">{{ job.status }}</span></td><td data-label="时间">{{ job.updated_at }}</td><td data-label="结果">{{ job.message or job.error or '—' }}</td></tr>
+    {% else %}<tr><td colspan="5" class="empty">暂无后台上传任务</td></tr>{% endfor %}
+    </tbody></table>
+  </div>
+</section>
+</div>
+{% endblock %}

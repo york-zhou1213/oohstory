@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily local txt80正文 synchronization
+
+[Timer]
+OnCalendar=*-*-* 03:10:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=10m
+Unit=oohstory-library-local-sync.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,39 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 2 ]; then
+    echo "expected: action unit" >&2
+    exit 64
+fi
+
+action=$1
+unit=$2
+
+case "$action" in
+    start|restart|stop|enable|disable) ;;
+    *) echo "action is not allowlisted" >&2; exit 64 ;;
+esac
+
+case "$unit" in
+    oohstory-reader.service|\
+    oohstory-deconstruction-sync.service|\
+    oohstory-deconstruction-sync.timer|\
+    oohstory-library-authorized-catalog-sync.service|\
+    oohstory-library-authorized-catalog-sync.timer|\
+    oohstory-library-authorized-download.service|\
+    oohstory-library-authorized-download.timer|\
+    oohstory-library-cover-sync.service|\
+    oohstory-library-xbiquge-cover-sync.service|\
+    oohstory-library-ixdzs-cover-sync.service|\
+    oohstory-library-shubaow-cover-sync.service|\
+    oohstory-library-linovelib-cover-sync.service|\
+    oohstory-library-local-source-upgrade.service|\
+    oohstory-library-index-refresh.service|\
+    oohstory-library-ingestion-index.service|\
+    oohstory-library-derived-index.service|\
+    oohstory-library-derived-index-probe.service|\
+    oohstory-shubaow-browser.service) ;;
+    *) echo "unit is not allowlisted" >&2; exit 64 ;;
+esac
+
+exec /usr/bin/systemctl --no-pager "$action" "$unit"

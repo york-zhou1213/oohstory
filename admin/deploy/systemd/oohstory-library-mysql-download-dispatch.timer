@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep the bounded OOHStory Redis download stream supplied
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=20s
+AccuracySec=3s
+Unit=oohstory-library-mysql-download-dispatch.service
+
+[Install]
+WantedBy=timers.target

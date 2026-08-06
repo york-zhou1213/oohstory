@@ -3,9 +3,11 @@ __pycache__/
 .pytest_cache/
 *.pyc
 var/
+.runtime/
 .env
 .env.*
 !.env.example
+!.env.compose.example
 data/
 *.sqlite
 *.sqlite3
@@ -24,5 +26,8 @@ data/
 .coverage
 htmlcov/
 node_modules/
+.dart_tool/
+build/
+*.egg-info/
 .DS_Store
 --full-page

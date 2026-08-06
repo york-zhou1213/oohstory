@@ -1,0 +1,28 @@
+[Unit]
+Description=OOHStory Chrome transport for authorized Shubaow and Linovelib sources
+After=network-online.target graphical.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=oohstory
+Group=oohstory
+StateDirectory=oohstory-browser
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/var/lib/oohstory-browser/.Xauthority
+Environment=LANG=zh_CN.UTF-8
+Environment=TZ=Asia/Shanghai
+ExecStartPre=-/usr/bin/rm -f /var/lib/oohstory-browser/profile/SingletonLock
+ExecStartPre=-/usr/bin/rm -f /var/lib/oohstory-browser/profile/SingletonCookie
+ExecStartPre=-/usr/bin/rm -f /var/lib/oohstory-browser/profile/SingletonSocket
+ExecStart=/usr/bin/google-chrome-stable --remote-debugging-port=9223 --user-data-dir=/var/lib/oohstory-browser/profile --remote-allow-origins=* --no-first-run --no-default-browser-check --disable-features=ChromeWhatsNewUI --lang=zh-CN --window-size=1280,900
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+MemoryHigh=768M
+MemoryMax=1G
+TasksMax=256
+OOMPolicy=stop
+
+[Install]
+WantedBy=multi-user.target

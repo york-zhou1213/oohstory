@@ -1,0 +1,13 @@
+[Unit]
+Description=Ensure OOHStory library timers are enabled
+After=mysql.service redis-server.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/oohstory-library-scheduler-cutover
+TimeoutStartSec=2min
+ProtectSystem=strict
+ReadWritePaths=/etc/systemd/system /run/systemd/system
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true

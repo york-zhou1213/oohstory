@@ -1,0 +1,26 @@
+[Unit]
+Description=Resolve terminal ebook downloads against exact alternate authorized sources
+After=mysql.service redis-server.service network-online.target oohstory-shubaow-browser.service
+Requires=mysql.service redis-server.service
+Wants=oohstory-shubaow-browser.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/oohstory-admin/library.env
+Environment=OOHSTORY_LIBRARY_BROWSER_SERVICE=oohstory-shubaow-browser.service
+Environment=OOHSTORY_LIBRARY_SHUBAOW_CDP_URL=http://127.0.0.1:9223
+Environment=OOHSTORY_LIBRARY_LINOVELIB_CDP_URL=http://127.0.0.1:9223
+Environment=OOHSTORY_LIBRARY_CATALOG_BACKEND=mysql
+Environment=OOHSTORY_LIBRARY_MYSQL_READ_TIMEOUT=120
+Environment=OOHSTORY_LIBRARY_MYSQL_WRITE_TIMEOUT=120
+WorkingDirectory=/opt/oohstory-admin
+ExecStart=/opt/oohstory-admin/.venv/bin/python scripts/electronic-library/authorized_source_recovery_sync.py --limit 10
+Nice=15
+IOSchedulingClass=idle
+CPUQuota=40%
+MemoryMax=768M
+StandardOutput=append:/opt/oohstory-admin/electronic-library/txt80/logs/authorized-source-recovery.log
+StandardError=append:/opt/oohstory-admin/electronic-library/txt80/logs/authorized-source-recovery.log
+
+[Install]
+WantedBy=multi-user.target

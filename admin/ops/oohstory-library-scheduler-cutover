@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+
+# Idempotently activate only OOHStory-owned library timers. Webnovel-Write is
+# a separate application and is never inspected, stopped, or enabled here.
+timers="
+oohstory-library-local-sync.timer
+oohstory-library-catalog-scan.timer
+oohstory-library-fanqie-sync.timer
+oohstory-library-authorized-catalog-sync.timer
+"
+
+for unit in $timers; do
+  /usr/bin/systemctl cat "$unit" >/dev/null 2>&1 || {
+    echo "missing OOHStory timer: $unit" >&2
+    exit 1
+  }
+done
+
+/usr/bin/systemctl enable --now $timers >/dev/null
+
+for unit in $timers; do
+  /usr/bin/systemctl is-enabled --quiet "$unit" || {
+    /usr/bin/systemctl disable --now $timers >/dev/null 2>&1 || true
+    exit 1
+  }
+done
+
+/usr/bin/logger -t oohstory-library-cutover \
+  "OOHStory library timers enabled"

@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}编辑脚本 · OOHStory 运维台{% endblock %}
+{% block content %}
+<a class="back-link" href="{{ pipeline_path }}">← 返回管道与服务</a>
+<div class="page-heading">
+  <div><p class="eyebrow">受控脚本存储</p><h1>{{ script.label }}</h1></div>
+  <span class="status warn">保存不自动重启</span>
+</div>
+{% if notice %}<div class="alert alert-info" role="status">{{ notice }}</div>{% endif %}
+{% if error %}<div class="alert alert-error" role="alert">{{ error }}</div>{% endif %}
+<div class="alert alert-info">只能保存到下面这个固定 OOHStory 路径。系统会拒绝任意路径、软链接、超限内容、并发覆盖与 Python 语法错误；旧版本由 root helper 留存于本机受保护备份目录。</div>
+
+<section class="panel script-meta-panel">
+  <dl class="service-paths">
+    <div><dt>托管绝对路径</dt><dd><code>{{ script.absolute_path }}</code></dd></div>
+    <div><dt>仓库相对路径</dt><dd><code>{{ script.relative_path }}</code></dd></div>
+    <div><dt>当前 SHA-256</dt><dd><code>{{ script.sha256 }}</code></dd></div>
+    <div><dt>内容规模</dt><dd>{{ script.lines }} 行 · {{ script.bytes|filesize }}</dd></div>
+  </dl>
+  <h2>受影响单元</h2>
+  <div class="affected-units">
+    {% for service in affected_services %}
+      <span><code>{{ service.unit }}</code><small>{{ service.runtime_path or '由对应 service 触发' }}</small></span>
+    {% endfor %}
+  </div>
+</section>
+
+<form class="script-editor-form confirm-form" data-confirm="确认校验并保存这份白名单脚本？保存后不会自动重启服务。" method="post" action="{{ save_path }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="expected_sha256" value="{{ script.sha256 }}">
+  <input type="hidden" name="action" value="script_save">
+  <input type="hidden" name="target" value="{{ script.id }}">
+  <label for="script-content">Python 脚本内容
+    <textarea id="script-content" name="content" spellcheck="false" wrap="off" required>{{ script.content }}</textarea>
+  </label>
+  <div class="editor-actions">
+    <a class="button" href="{{ pipeline_path }}">取消</a>
+    <button class="button button-primary" type="submit">校验并原子保存</button>
+  </div>
+</form>
+{% endblock %}

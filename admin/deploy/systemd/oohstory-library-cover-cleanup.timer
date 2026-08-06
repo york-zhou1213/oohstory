@@ -1,0 +1,11 @@
+[Unit]
+Description=Check whether superseded library covers can be removed
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+Persistent=true
+Unit=oohstory-library-cover-cleanup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 0 ]; then
+    echo '{"ok":false,"message":"helper does not accept command-line arguments","data":{}}'
+    exit 64
+fi
+
+unit_id=$(tr -d '-' </proc/sys/kernel/random/uuid | cut -c1-20)
+exec /usr/bin/systemd-run \
+    --quiet \
+    --pipe \
+    --wait \
+    --collect \
+    --unit="oohstory-admin-library-dispatch-${unit_id}.service" \
+    --property=Type=exec \
+    --property=User=root \
+    --property=WorkingDirectory=/opt/oohstory-admin \
+    --property=ProtectSystem=strict \
+    --property=ProtectHome=false \
+    --property=PrivateTmp=true \
+    --property=PrivateDevices=true \
+    --property=ProtectKernelTunables=true \
+    --property=ProtectKernelModules=true \
+    --property=ProtectKernelLogs=true \
+    --property=ProtectControlGroups=true \
+    --property=TimeoutStartSec=10min \
+    --property='ReadWritePaths=/srv/oohstory/library /var/lib/oohstory-admin /var/lib/oohstory-reader' \
+    /opt/oohstory-admin/.venv/bin/python \
+    /opt/oohstory-admin/ops/oohstory-admin-library-action-runner \
+    --dispatch-stdin

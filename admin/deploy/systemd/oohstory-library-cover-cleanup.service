@@ -1,0 +1,14 @@
+[Unit]
+Description=Retire superseded covers after each verified AI replacement
+After=mysql.service redis-server.service oohstory-library-cover-sync.service
+Requires=mysql.service redis-server.service
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/etc/oohstory-admin/library.env
+Environment=OOHSTORY_LIBRARY_CATALOG_BACKEND=mysql
+Environment=OOHSTORY_LIBRARY_MYSQL_POOL_SIZE=2
+WorkingDirectory=/opt/oohstory-admin
+ExecStart=/opt/oohstory-admin/.venv/bin/python scripts/electronic-library/finalize_clean_covers.py --apply
+Nice=15

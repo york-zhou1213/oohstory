@@ -9,7 +9,9 @@
 
 ```bash
 python -m pytest -q
+PYTHONPATH=admin/src python -m pytest -q admin/tests
 node --check static/app.js
+cd mobile && flutter analyze && flutter test
 ```
 
 5. Pull Request 说明需包含变更目的、安全边界、测试结果和部署影响。

@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}管道与服务 · OOHStory 运维台{% endblock %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">CONTROLLED OPERATIONS</p><h1>管道与服务</h1><p class="muted">统一查看运行状态、资源占用、systemd 路径及 OOHStory 托管脚本。</p></div><span class="status warn">所有操作写入审计日志</span></div>
+{% if notice %}<div class="alert {{ 'alert-info' if notice == '操作成功' else 'alert-error' }}" role="status">{{ notice }}</div>{% endif %}
+<div class="alert alert-info">仅允许下表中精确单元名与 start / restart / stop / enable / disable。脚本编辑仅开放 OOHStory 固定白名单路径，保存会校验 SHA-256 与 Python 语法，并且不会自动重启服务。</div>
+<section class="panel service-toolbar" aria-label="服务筛选">
+  <label>搜索服务<input type="search" placeholder="输入服务名称、单元或脚本路径" data-service-search></label>
+  <label>运行状态<select data-service-status><option value="all">全部状态</option><option value="active">仅运行中</option><option value="inactive">仅非运行中</option><option value="unavailable">仅不可用</option></select></label>
+  <span class="status neutral" data-service-count>{{ services|length }} 个白名单单元</span>
+</section>
+<div class="service-list">
+{% for service in services %}
+  <article class="service-row" data-service-card data-service-state="{{ 'unavailable' if not service.available else 'active' if service.active == 'active' else 'inactive' }}" data-service-text="{{ service.label }} {{ service.unit }} {{ service.runtime_path or '' }} {{ service.script.absolute_path if service.script else '' }}">
+    <div class="service-main">
+      <div><h2>{{ service.label }}</h2><code>{{ service.unit }}</code></div>
+      {% if service.available %}
+        <span class="status {{ 'ok' if service.active == 'active' else 'warn' }}">{{ service.active }}/{{ service.sub }}</span>
+      {% else %}<span class="status bad">{{ service.error or '不可用' }}</span>{% endif %}
+    </div>
+    {% if service.available %}<p class="service-detail">启用状态 {{ service.enabled }} · PID {{ service.pid }} · 内存 {{ service.memory_bytes|filesize }} · 重启 {{ service.restarts }}</p>{% endif %}
+    <dl class="service-paths">
+      <div><dt>systemd 单元</dt><dd><code>{{ service.unit_path or '未返回 FragmentPath' }}</code></dd></div>
+      <div><dt>工作目录</dt><dd><code>{{ service.working_directory or '—' }}</code></dd></div>
+      <div><dt>当前运行路径</dt><dd><code>{{ service.runtime_path or ('由对应 service 触发' if service.unit.endswith('.timer') else '未识别到独立脚本') }}</code></dd></div>
+      {% if service.script %}
+      <div><dt>OOHStory 托管路径</dt><dd><code>{{ service.script.absolute_path }}</code></dd></div>
+      {% endif %}
+    </dl>
+    {% if service.script %}
+      <div class="script-state-row">
+        {% if service.unit.endswith('.timer') %}
+          <span class="status neutral">共享对应 service 脚本</span>
+        {% elif service.script.runtime_matches %}
+          <span class="status ok">运行入口已指向 OOHStory</span>
+        {% else %}
+          <span class="status warn">当前运行入口与托管路径不同</span>
+        {% endif %}
+        {% if service.script.sha256 %}<code>SHA-256 {{ service.script.sha256[:12] }}… · {{ service.script.bytes|filesize }}</code>{% endif %}
+        {% if service.script.editable %}<a class="button button-primary" href="{{ base_path }}/pipeline/scripts/{{ service.script.id }}">查看 / 编辑脚本</a>{% else %}<span class="error-text">{{ service.script.error }}</span>{% endif %}
+      </div>
+    {% endif %}
+    <div class="action-row">
+    {% for action in actions %}
+      <form class="confirm-form" data-confirm="确认对该白名单单元执行此操作？" method="post" action="{{ action_path }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="target" value="{{ service.unit }}">
+        <input type="hidden" name="action" value="{{ action }}">
+        <button class="button {{ 'button-danger' if action in ['stop', 'disable'] else '' }}" type="submit">{{ action }}</button>
+      </form>
+    {% endfor %}
+    </div>
+  </article>
+{% endfor %}
+</div>
+{% endblock %}
