@@ -1,16 +1,34 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart' as io_client;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/book.dart';
 
 const _appUserAgent = 'OOHStoryApp/1.18 (Flutter; official)';
 
 class _OOHClient extends http.BaseClient {
-  final http.Client _inner = http.Client();
+  late final http.Client _inner;
+
+  _OOHClient() {
+    final httpClient = HttpClient()
+      ..badCertificateCallback = _rejectBadCert
+      ..connectionTimeout = const Duration(seconds: 15)
+      ..idleTimeout = const Duration(seconds: 30);
+    _inner = io_client.IOClient(httpClient);
+  }
+
+  static bool _rejectBadCert(X509Certificate cert, String host, int port) {
+    return false;
+  }
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) {
+    if (request.url.host.endsWith('oohstory.com') &&
+        request.url.scheme != 'https') {
+      throw ApiException('不安全的连接已被阻止', 0);
+    }
     request.headers.putIfAbsent('User-Agent', () => _appUserAgent);
     return _inner.send(request);
   }
