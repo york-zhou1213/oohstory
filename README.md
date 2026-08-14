@@ -5,7 +5,7 @@
 <h1 align="center">OOH Story</h1>
 
 <p align="center">
-  可自托管的中文电子书阅读、管理与移动端平台
+  开源、可自托管的中文电子书阅读、管理与移动端平台
 </p>
 
 <p align="center">
@@ -15,9 +15,22 @@
   <img alt="MySQL 8.4" src="https://img.shields.io/badge/MySQL-8.4-4479A1">
 </p>
 
+<p align="center">
+  <a href="https://www.oohstory.com">在线演示</a> ·
+  <a href="docs/HOST_DEPLOYMENT.md">部署指南</a> ·
+  <a href="CHANGELOG.md">更新记录</a> ·
+  <a href="CONTRIBUTING.md">参与贡献</a>
+</p>
+
 OOH Story 是一套数据自持有、可从空环境部署的中文电子书平台。仓库包含 Web Reader、独立运维后台、书库 Backend/Worker、MySQL 数据库迁移，以及 Flutter Android/iOS 客户端源码。
 
 > 仓库只提供程序代码与品牌静态资源，不包含小说正文、用户数据、数据库备份、签名安装包、私钥或生产凭据。部署者必须确保内容具备合法的使用和发布权。
+
+## 在线演示
+
+演示站：[https://www.oohstory.com](https://www.oohstory.com)
+
+演示站运行完整的 Web Reader，可直接体验响应式书库、作品详情、章节阅读、账户与智能听书界面。站点启用了 Cloudflare 安全防护，首次访问时可能需要完成浏览器验证；公开演示仅用于产品体验，部署、开发和测试请使用本仓库提供的本地环境。
 
 ## 界面预览
 
