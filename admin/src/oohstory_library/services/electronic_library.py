@@ -10,12 +10,16 @@
 
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+from .deconstruction_catalog import DeconstructionCatalogMixin
+from .library_feature_analysis import LibraryFeatureAnalysisMixin
+from .reader_heading_index import ReaderHeadingIndexMixin
+
 import asyncio
 import copy
 import difflib
 import fcntl
 import hashlib
-import io
 import json
 import math
 import os
@@ -28,20 +32,20 @@ import time
 import uuid
 import shutil
 import unicodedata
-import zipfile
 from collections import Counter
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from typing import Callable
-from xml.etree import ElementTree
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
-from bs4 import BeautifulSoup
 from oohstory_library.services.cover_failure_policy import should_generate_ai_fallback
 from oohstory_library.services.download_security import DownloadSecurityScanner
-from oohstory_library.services.authorized_source_recovery import downloaded_text_matches_identity
+from oohstory_library.services.epub_text import epub_to_text
+from oohstory_library.services.authorized_source_recovery import (
+    downloaded_text_matches_identity,
+)
 from oohstory_library.services.fanqie_downloader_bridge import FanqieDownloaderBridge
 from oohstory_library.services.ixdzs_provider import AuthorizedIxdzsProvider
 from oohstory_library.services.linovelib_provider import LinovelibProvider
@@ -56,7 +60,10 @@ from oohstory_library.services.library_cache import (
     LibraryCacheSettings,
     RedisHotCache,
 )
-from oohstory_library.services.library_covers import sync_fanqie_cover, sync_remote_cover
+from oohstory_library.services.library_covers import (
+    sync_fanqie_cover,
+    sync_remote_cover,
+)
 from oohstory_library.services.library_database import (
     LibraryInfrastructureSettings,
     MySQLConnectionPool,
@@ -65,7 +72,6 @@ from oohstory_library.services.library_database import (
 from oohstory_library.services.library_object_store import NasObjectStore
 from oohstory_library.services.runtime_controls import (
     COVER_MAX_WORKERS,
-    COVER_TARGET_PER_HOUR_DEFAULT,
     OOHStoryRuntimeControls,
     SITE_IDS,
     SITE_BOOKS_PER_CYCLE_DEFAULT,
@@ -82,21 +88,11 @@ from oohstory_library.services.library_task_runners import (
 )
 from oohstory_library.services.unit_names import library_unit_name
 from oohstory_library.services.oh_story_contracts import (
-    long_contract_failed_stages,
     long_pipeline_stages,
-    long_progress_state,
-    long_summary_coverage,
-    project_long_contract_failures,
-    read_short_meta,
-    short_pipeline_stages,
-    validate_long_output_contract,
-    validate_short_output_contract,
 )
 import aiohttp
 from oohstory_library import library_env
 from oohstory_library.services.tone_catalog import (
-    CATEGORY_TONE_PRIORS,
-    DEFAULT_TONE_PRIORS,
     TONE_DESCRIPTIONS,
     TONE_RULES,
     TONE_RULE_VERSION,
@@ -108,19 +104,15 @@ from oohstory_library.services.zlibrary_provider import AuthorizedZLibraryProvid
 
 
 APP_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_LIBRARY_ROOT = APP_ROOT / "electronic-library" / "txt80"
+DEFAULT_LIBRARY_ROOT = APP_ROOT / "electronic-library"
 DEFAULT_RUNTIME_DIR = DEFAULT_LIBRARY_ROOT / "全局索引"
 WORKER_PATH = Path(__file__).with_name("library_task_worker.py")
 BATCH_WORKER_PATH = Path(__file__).with_name("library_batch_worker.py")
 TASK_WORKER_SYSTEMD_TEMPLATE = library_unit_name(
     "oohstory-library-task-worker@{task_id}.service"
 )
-DERIVED_INDEX_SERVICE = library_unit_name(
-    "oohstory-library-derived-index.service"
-)
-INGESTION_INDEX_SERVICE = library_unit_name(
-    "oohstory-library-ingestion-index.service"
-)
+DERIVED_INDEX_SERVICE = library_unit_name("oohstory-library-derived-index.service")
+INGESTION_INDEX_SERVICE = library_unit_name("oohstory-library-ingestion-index.service")
 MANUAL_PLOT_REASON_PREFIX = "manual_plot_"
 GLOBAL_DECONSTRUCTION_DIRNAME = "全局拆书库"
 PROJECT_DECONSTRUCTION_LINKS_FILENAME = ".project-deconstruction-links.json"
@@ -139,21 +131,16 @@ LOCAL_CATALOG_PROVIDER = "local_txt80_catalog"
 SERIALIZATION_STATUS_ONGOING = "连载中"
 SERIALIZATION_STATUS_COMPLETED = "已完结"
 LEGACY_LIBRARY_NOTICE = "本书为八零电子书(txt8080.com)"
-PUBLIC_DOMAIN = os.getenv("OOHSTORY_PUBLIC_DOMAIN", "reader.example.com").strip() or "reader.example.com"
-LEGACY_REBRANDED_NOTICE = f"本书为八零电子书({PUBLIC_DOMAIN})"
-PUBLIC_LIBRARY_NOTICE = f"本书为Ooh！好故事({PUBLIC_DOMAIN})"
+LEGACY_REBRANDED_NOTICE = "本书为八零电子书(reader.example.com)"
+PUBLIC_LIBRARY_NOTICE = "本书为Ooh！好故事(reader.example.com)"
 IXDZS_PROMOTIONAL_NOTICE = (
     "爱下电子书Txt版阅读,下载和分享更多电子书请访问，"
     "简体:https://ixdzs8.com,繁体:https://ixdzs8.tw,"
     "E-mail:support@ixdzs.com"
 )
-OOHSTORY_EBOOK_NOTICE = f"{PUBLIC_DOMAIN}，好故事电子书"
-LOCAL_MEDIA_MARKER_RE = re.compile(
-    r"^\[本地(?:分卷封面|插图)：[^\]\r\n]+\]$"
-)
-SUMMARY_HEADING_RE = re.compile(
-    r"^(?:(?:作品|内容|小说)简介|简介)[：:\s]*(.*)$"
-)
+OOHSTORY_EBOOK_NOTICE = "reader.example.com，好故事电子书"
+LOCAL_MEDIA_MARKER_RE = re.compile(r"^\[本地(?:分卷封面|插图)：[^\]\r\n]+\]$")
+SUMMARY_HEADING_RE = re.compile(r"^(?:(?:作品|内容|小说)简介|简介)[：:\s]*(.*)$")
 CHAPTER_HEADING_TOKEN_RE = re.compile(
     r"(?:^|\s)(?:序章|楔子|引子|前言|"
     r"第\s*[0-9零〇一二三四五六七八九十百千万两]+\s*[章回节]|"
@@ -180,10 +167,7 @@ def _automatic_full_pipeline_needs_recovery(task: Dict[str, Any]) -> bool:
     )
     full_scope = bool(
         task.get("automatic_full_pipeline")
-        or (
-            task.get("requested_mode") == "full"
-            and analyze_was_running
-        )
+        or (task.get("requested_mode") == "full" and analyze_was_running)
     )
     if not full_scope or task.get("runner_requested") != "openclaw":
         return False
@@ -196,9 +180,7 @@ def _automatic_full_pipeline_needs_recovery(task: Dict[str, Any]) -> bool:
     )
 
 
-READER_HEADING_DECORATION = (
-    r"(?:[☆★◆◇●○◎※·•▶▷]+\s*[、.．:：\-—]?\s*)?"
-)
+READER_HEADING_DECORATION = r"(?:[☆★◆◇●○◎※·•▶▷]+\s*[、.．:：\-—]?\s*)?"
 READER_HEADING_LINE = re.compile(
     rf"^\s*{READER_HEADING_DECORATION}(?:(?:正文)\s*)?"
     r"(?:0*[1-9]\d{0,5}\s*)?"
@@ -361,42 +343,76 @@ SITE_FULL_SYNC_CONFIG: Dict[str, Dict[str, str]] = {
     "txt80": {
         "label": "TXT80 本地书库正文",
         "group": "local",
-        "unit": library_unit_name(
-            "oohstory-library-site-full-sync@txt80.service"
-        ),
+        "unit": library_unit_name("oohstory-library-site-full-sync@txt80.service"),
     },
     "xbiquge": {
         "label": "新笔趣阁授权正文",
         "group": "fanqie",
-        "unit": library_unit_name(
-            "oohstory-library-site-full-sync@xbiquge.service"
-        ),
+        "unit": library_unit_name("oohstory-library-site-full-sync@xbiquge.service"),
     },
     "ixdzs": {
         "label": "爱下授权正文",
         "group": "fanqie",
-        "unit": library_unit_name(
-            "oohstory-library-site-full-sync@ixdzs.service"
-        ),
+        "unit": library_unit_name("oohstory-library-site-full-sync@ixdzs.service"),
     },
     "shubaow": {
         "label": "书宝授权正文",
         "group": "fanqie",
-        "unit": library_unit_name(
-            "oohstory-library-site-full-sync@shubaow.service"
-        ),
+        "unit": library_unit_name("oohstory-library-site-full-sync@shubaow.service"),
     },
     "linovelib": {
         "label": "哔哩轻小说授权正文",
         "group": "fanqie",
-        "unit": library_unit_name(
-            "oohstory-library-site-full-sync@linovelib.service"
-        ),
+        "unit": library_unit_name("oohstory-library-site-full-sync@linovelib.service"),
     },
 }
+SITE_FULL_SYNC_LANES: Dict[str, str] = {
+    "txt80": "local",
+    "xbiquge": "http-xbiquge",
+    "ixdzs": "http-ixdzs",
+    "shubaow": "browser-shubaow",
+    "linovelib": "browser-shubaow",
+}
+SERIALIZED_UPDATE_SOURCE_CONFIG: Dict[str, Dict[str, str]] = {
+    "xbiquge": {
+        "label": "新笔趣阁连载追更",
+        "lane": "update-xbiquge",
+    },
+    "ixdzs": {
+        "label": "爱下连载追更",
+        "lane": "update-ixdzs",
+    },
+    "shubaow": {
+        "label": "书宝连载追更",
+        "lane": "update-shubaow",
+    },
+    "linovelib": {
+        "label": "哔哩轻小说连载追更",
+        "lane": "update-linovelib",
+    },
+}
+SERIALIZED_UPDATE_TIMER_TEMPLATE = library_unit_name(
+    "oohstory-library-serialized-update-sync@{source}.timer"
+)
+SERIALIZED_UPDATE_SERVICE_TEMPLATE = library_unit_name(
+    "oohstory-library-serialized-update-sync@{source}.service"
+)
 
 GENRE_KEYWORDS: Dict[str, tuple[str, ...]] = {
-    "科幻": ("科幻", "星际", "星舰", "宇宙", "机甲", "末日", "末世", "废土", "赛博", "基因", "人工智能", "机器人"),
+    "科幻": (
+        "科幻",
+        "星际",
+        "星舰",
+        "宇宙",
+        "机甲",
+        "末日",
+        "末世",
+        "废土",
+        "赛博",
+        "基因",
+        "人工智能",
+        "机器人",
+    ),
     "玄幻": ("玄幻", "异界", "魔法", "斗气", "血脉", "神魔", "诸天", "万族"),
     "仙侠": ("仙侠", "修仙", "修真", "飞升", "宗门", "灵气", "元婴", "渡劫", "剑修"),
     "武侠": ("武侠", "江湖", "武林", "侠客", "门派", "内功", "刀法", "剑法"),
@@ -470,8 +486,24 @@ PROFILE_FILES = (
 )
 
 GENERIC_PROFILE_TERMS = {
-    "世界", "生活", "日常", "现实", "历史", "成长", "势力", "命运", "秘密",
-    "环境", "众人", "同伴", "团队", "爱情", "家庭", "社会", "职场", "战争",
+    "世界",
+    "生活",
+    "日常",
+    "现实",
+    "历史",
+    "成长",
+    "势力",
+    "命运",
+    "秘密",
+    "环境",
+    "众人",
+    "同伴",
+    "团队",
+    "爱情",
+    "家庭",
+    "社会",
+    "职场",
+    "战争",
 }
 
 _index_lock = threading.Lock()
@@ -494,9 +526,7 @@ def _pid_is_alive(pid: Any) -> bool:
         os.kill(value, 0)
         proc_stat = Path(f"/proc/{value}/stat")
         if proc_stat.is_file():
-            fields = proc_stat.read_text(
-                encoding="utf-8", errors="replace"
-            ).split()
+            fields = proc_stat.read_text(encoding="utf-8", errors="replace").split()
             if len(fields) >= 3 and fields[2] == "Z":
                 return False
         return True
@@ -513,16 +543,9 @@ def _openclaw_session_exists(
     if not value or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", selected_agent):
         return False
     state_root = Path(
-        os.environ.get("OPENCLAW_STATE_DIR")
-        or (Path.home() / ".openclaw")
+        os.environ.get("OPENCLAW_STATE_DIR") or (Path.home() / ".openclaw")
     ).expanduser()
-    registry = (
-        state_root
-        / "agents"
-        / selected_agent
-        / "sessions"
-        / "sessions.json"
-    )
+    registry = state_root / "agents" / selected_agent / "sessions" / "sessions.json"
     sessions = _read_json(registry, {})
     return isinstance(sessions, dict) and (
         f"agent:{selected_agent}:explicit:{value}" in sessions
@@ -569,13 +592,22 @@ PLOT_MOTIFS: Dict[str, Dict[str, tuple[str, ...]]] = {
 }
 
 PLOT_QUERY_EXPANSIONS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
-    (("仇恨", "仇人", "敌人", "宿敌", "死对头"), ("仇恨", "仇人", "死对头", "宿敌", "复仇", "报仇")),
-    (("爱情", "爱上", "相爱", "恋人", "心动"), ("爱上", "相爱", "心动", "喜欢上", "恋人", "爱情", "动情")),
+    (
+        ("仇恨", "仇人", "敌人", "宿敌", "死对头"),
+        ("仇恨", "仇人", "死对头", "宿敌", "复仇", "报仇"),
+    ),
+    (
+        ("爱情", "爱上", "相爱", "恋人", "心动"),
+        ("爱上", "相爱", "心动", "喜欢上", "恋人", "爱情", "动情"),
+    ),
     (("背叛", "出卖"), ("背叛", "出卖", "欺骗", "陷害")),
     (("和解", "原谅"), ("和解", "原谅", "赎罪", "道歉", "重归于好")),
     (("复仇", "报仇"), ("复仇", "报仇", "灭门", "陷害", "幕后", "真相")),
     (("救赎", "治愈"), ("救赎", "治愈", "陪伴", "温暖", "守护")),
-    (("身份", "卧底", "伪装"), ("隐藏身份", "真实身份", "卧底", "伪装", "揭穿", "暴露")),
+    (
+        ("身份", "卧底", "伪装"),
+        ("隐藏身份", "真实身份", "卧底", "伪装", "揭穿", "暴露"),
+    ),
     (("逆袭", "打脸"), ("逆袭", "崛起", "反杀", "打脸", "碾压")),
 )
 
@@ -588,7 +620,7 @@ PLOT_RULE_VERSION = "2026-07-28.1"
 
 
 def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -601,7 +633,7 @@ def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
 def _read_json(path: Path, default: Any) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except RECOVERABLE_OPERATION_ERRORS:
         return default
 
 
@@ -631,15 +663,17 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
-class ElectronicLibraryService:
+class ElectronicLibraryService(
+    DeconstructionCatalogMixin,
+    LibraryFeatureAnalysisMixin,
+    ReaderHeadingIndexMixin,
+):
     def __init__(
         self,
         library_root: Optional[Path] = None,
         runtime_dir: Optional[Path] = None,
     ):
-        configured_root = str(
-            library_env("WEBNOVEL_LIBRARY_ROOT", "") or ""
-        ).strip()
+        configured_root = str(library_env("WEBNOVEL_LIBRARY_ROOT", "") or "").strip()
         self.library_root = (
             Path(configured_root).expanduser().resolve()
             if configured_root
@@ -654,9 +688,9 @@ class ElectronicLibraryService:
             self.library_root / GLOBAL_DECONSTRUCTION_DIRNAME
         ).resolve()
         if configured_deconstruction_root:
-            configured_deconstruction_path = Path(
-                configured_deconstruction_root
-            ).expanduser().resolve()
+            configured_deconstruction_path = (
+                Path(configured_deconstruction_root).expanduser().resolve()
+            )
             if configured_deconstruction_path != canonical_deconstruction_root:
                 raise ValueError(
                     "WEBNOVEL_GLOBAL_DECONSTRUCTION_ROOT 必须固定为 "
@@ -669,8 +703,7 @@ class ElectronicLibraryService:
         self.global_task_root = self.global_deconstruction_root / ".tasks"
         self.global_batch_root = self.global_deconstruction_root / ".batches"
         self.project_deconstruction_links_path = (
-            self.global_deconstruction_root
-            / PROJECT_DECONSTRUCTION_LINKS_FILENAME
+            self.global_deconstruction_root / PROJECT_DECONSTRUCTION_LINKS_FILENAME
         )
         self.project_deconstruction_links_lock_path = (
             self.global_deconstruction_root
@@ -686,15 +719,17 @@ class ElectronicLibraryService:
         )
         self.runtime_controls = OOHStoryRuntimeControls(self.runtime_dir)
         self.index_path = self.runtime_dir / "electronic_library_index.sqlite3"
-        self.content_metrics_path = (
-            self.runtime_dir / "library_content_metrics.sqlite3"
-        )
+        self.content_metrics_path = self.runtime_dir / "library_content_metrics.sqlite3"
         self.membership_path = self.runtime_dir / "library_memberships.sqlite3"
-        self.index_status_path = self.runtime_dir / "electronic_library_index_status.json"
+        self.index_status_path = (
+            self.runtime_dir / "electronic_library_index_status.json"
+        )
         self.tone_review_status_path = (
             self.runtime_dir / "electronic_library_tone_review_status.json"
         )
-        self.plot_index_status_path = self.runtime_dir / "electronic_library_plot_index_status.json"
+        self.plot_index_status_path = (
+            self.runtime_dir / "electronic_library_plot_index_status.json"
+        )
         self.derived_index_request_path = (
             self.runtime_dir / "electronic_library_derived_index_request.json"
         )
@@ -738,44 +773,30 @@ class ElectronicLibraryService:
         self.download_scanner = DownloadSecurityScanner(
             self.runtime_dir / ".download-security-staging"
         )
-        self.infrastructure_settings = (
-            LibraryInfrastructureSettings.from_env()
-        )
+        self.infrastructure_settings = LibraryInfrastructureSettings.from_env()
         self.mysql_pool: Optional[MySQLConnectionPool] = None
         self.mysql_catalog: Optional[MySQLCatalogStore] = None
         self.redis_queue: Optional[RedisQueueClient] = None
         self.hot_cache = RedisHotCache(
-            LibraryCacheSettings.from_infrastructure(
-                self.infrastructure_settings
-            )
+            LibraryCacheSettings.from_infrastructure(self.infrastructure_settings)
         )
         if self.infrastructure_settings.catalog_backend in {"shadow", "mysql"}:
-            self.mysql_pool = MySQLConnectionPool(
-                self.infrastructure_settings
-            )
-            self.redis_queue = RedisQueueClient(
-                self.infrastructure_settings
-            )
+            self.mysql_pool = MySQLConnectionPool(self.infrastructure_settings)
+            self.redis_queue = RedisQueueClient(self.infrastructure_settings)
             self.mysql_catalog = MySQLCatalogStore(
                 self.infrastructure_settings,
                 self.mysql_pool,
                 self.hot_cache,
             )
-        self.object_store = NasObjectStore(
-            self.infrastructure_settings.object_root
-        )
-        self._authorized_catalog_identity_keys: Optional[
-            set[tuple[str, str]]
-        ] = None
+        self.object_store = NasObjectStore(self.infrastructure_settings.object_root)
+        self._authorized_catalog_identity_keys: Optional[set[tuple[str, str]]] = None
         self._deconstruction_status_cache: Dict[str, Dict[str, Any]] = {}
         self._deconstruction_cache_refreshing: set[str] = set()
         self._deconstruction_cache_lock = threading.Lock()
 
     def _require_legacy_sqlite(self, operation: str) -> None:
         if self.infrastructure_settings.catalog_backend == "mysql":
-            raise RuntimeError(
-                f"MySQL 模式禁止访问 SQLite：{operation}"
-            )
+            raise RuntimeError(f"MySQL 模式禁止访问 SQLite：{operation}")
 
     def infrastructure_status(self) -> Dict[str, Any]:
         """Report each final-architecture dependency without changing state."""
@@ -808,8 +829,7 @@ class ElectronicLibraryService:
                     )
                     catalog_row = dict(cursor.fetchone())
                     mysql["catalog"] = {
-                        key: int(value or 0)
-                        for key, value in catalog_row.items()
+                        key: int(value or 0) for key, value in catalog_row.items()
                     }
                     cursor.execute(
                         """
@@ -822,7 +842,7 @@ class ElectronicLibraryService:
                         str(row["status"]): int(row["count"])
                         for row in cursor.fetchall()
                     }
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             mysql = {
                 "ok": False,
                 "error": f"{type(exc).__name__}: {str(exc)[:500]}",
@@ -834,14 +854,14 @@ class ElectronicLibraryService:
             redis_status["download_stream_length"] = int(
                 redis_queue.client.xlen(stream)
             )
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             redis_status = {
                 "ok": False,
                 "error": f"{type(exc).__name__}: {str(exc)[:500]}",
             }
         try:
             object_status = self.object_store.health()
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             object_status = {
                 "ok": False,
                 "error": f"{type(exc).__name__}: {str(exc)[:500]}",
@@ -852,9 +872,7 @@ class ElectronicLibraryService:
             "redis": redis_status,
             "cache": self.hot_cache.stats(),
             "object_store": object_status,
-            "ready_for_mysql_reads": bool(
-                mysql.get("ok") and object_status.get("ok")
-            ),
+            "ready_for_mysql_reads": bool(mysql.get("ok") and object_status.get("ok")),
         }
 
     def _materialize_mysql_catalog_row(
@@ -888,7 +906,14 @@ class ElectronicLibraryService:
         if normalized:
             if any(
                 marker in normalized
-                for marker in ("已完结", "完结", "完本", "全本", "completed", "finished")
+                for marker in (
+                    "已完结",
+                    "完结",
+                    "完本",
+                    "全本",
+                    "completed",
+                    "finished",
+                )
             ):
                 return SERIALIZATION_STATUS_COMPLETED
             if any(
@@ -898,7 +923,8 @@ class ElectronicLibraryService:
                 return SERIALIZATION_STATUS_ONGOING
         return (
             default
-            if default in {
+            if default
+            in {
                 SERIALIZATION_STATUS_ONGOING,
                 SERIALIZATION_STATUS_COMPLETED,
             }
@@ -921,20 +947,13 @@ class ElectronicLibraryService:
                     and Path(object_key).name == object_key
                     and object_key not in {".", ".."}
                 ):
-                    path = self.object_store.resolve(
-                        f"封面/{object_key}"
-                    )
+                    path = self.object_store.resolve(f"封面/{object_key}")
                 if not path.is_file():
                     return ""
-                version = str(
-                    item.get("row_version") or path.stat().st_mtime_ns
-                )[:20]
+                version = str(item.get("row_version") or path.stat().st_mtime_ns)[:20]
             except (OSError, ValueError):
                 return "/api/admin/library/default-cover?v=d421cee15a266d25"
-            return (
-                f"/api/library/covers/{int(item['catalog_id'])}"
-                f"?v={version}"
-            )
+            return f"/api/library/covers/{int(item['catalog_id'])}?v={version}"
         if not self.cover_index_path.exists():
             return ""
         try:
@@ -946,8 +965,10 @@ class ElectronicLibraryService:
                       AND status='done'
                     """,
                     (
-                        int(item["catalog_id"]), str(item.get("source_id") or ""),
-                        str(item.get("title") or ""), str(item.get("author") or ""),
+                        int(item["catalog_id"]),
+                        str(item.get("source_id") or ""),
+                        str(item.get("title") or ""),
+                        str(item.get("author") or ""),
                     ),
                 ).fetchone()
         except sqlite3.Error:
@@ -955,10 +976,7 @@ class ElectronicLibraryService:
         if not row or not (self.cover_root / str(row[0])).is_file():
             return ""
         version = str(row[1] or "")[:16]
-        return (
-            f"/api/library/covers/{int(item['catalog_id'])}"
-            f"?v={version}"
-        )
+        return f"/api/library/covers/{int(item['catalog_id'])}?v={version}"
 
     def get_cover_path(self, catalog_id: int) -> Path:
         if (
@@ -980,9 +998,7 @@ class ElectronicLibraryService:
                     and Path(object_key).name == object_key
                     and object_key not in {".", ".."}
                 ):
-                    path = self.object_store.resolve(
-                        f"封面/{object_key}"
-                    )
+                    path = self.object_store.resolve(f"封面/{object_key}")
             except ValueError as exc:
                 raise KeyError("封面对象键无效") from exc
             if not path.is_file():
@@ -991,7 +1007,7 @@ class ElectronicLibraryService:
         with sqlite3.connect(self.cover_index_path, timeout=15) as conn:
             row = conn.execute(
                 "SELECT filename FROM covers WHERE catalog_id=? AND status='done'",
-                (int(catalog_id),)
+                (int(catalog_id),),
             ).fetchone()
         if not row:
             raise KeyError("封面不存在")
@@ -1040,10 +1056,7 @@ class ElectronicLibraryService:
         now = _now()
         if self.infrastructure_settings.catalog_backend == "mysql":
             source_id = str(item.get("source_id") or catalog_id)
-            if (
-                str(item.get("library_id") or "") != "local"
-                or not source_id.isdigit()
-            ):
+            if str(item.get("library_id") or "") != "local" or not source_id.isdigit():
                 raise ValueError(
                     "AI 重绘不能人工绕过真实书源；请先同步原站封面，"
                     "仅确定无资源或 404 后才会自动转 AI"
@@ -1062,7 +1075,7 @@ class ElectronicLibraryService:
         else:
             with sqlite3.connect(self.cover_index_path, timeout=30) as conn:
                 conn.execute(
-                """
+                    """
                 CREATE TABLE IF NOT EXISTS clean_cover_jobs (
                   catalog_id INTEGER PRIMARY KEY,
                   source_id TEXT NOT NULL,
@@ -1085,7 +1098,7 @@ class ElectronicLibraryService:
                 """
                 )
                 conn.execute(
-                """
+                    """
                 INSERT INTO clean_cover_jobs (
                   catalog_id,source_id,title,author,status,original_filename,
                   attempts,last_error,updated_at
@@ -1098,22 +1111,21 @@ class ElectronicLibraryService:
                   verification_source=NULL,attempts=0,ai_session_id=NULL,
                   last_error=NULL,updated_at=excluded.updated_at
                 """,
-                (
-                    catalog_id,
-                    str(item.get("source_id") or catalog_id),
-                    str(item.get("title") or ""),
-                    str(item.get("author") or ""),
-                    cover_path.name,
-                    now,
-                ),
+                    (
+                        catalog_id,
+                        str(item.get("source_id") or catalog_id),
+                        str(item.get("title") or ""),
+                        str(item.get("author") or ""),
+                        cover_path.name,
+                        now,
+                    ),
                 )
                 conn.commit()
         subprocess.run(
             [
-                "systemctl", "start",
-                library_unit_name(
-                    "oohstory-library-local-source-upgrade.service"
-                ),
+                "systemctl",
+                "start",
+                library_unit_name("oohstory-library-local-source-upgrade.service"),
             ],
             capture_output=True,
             text=True,
@@ -1233,11 +1245,9 @@ class ElectronicLibraryService:
                     request_bytes=self.linovelib_provider.download_cover,
                     max_attempts=3,
                 )
-            elif (
-                source_id.isdigit()
-                and (urlparse(detail_url).hostname or "").lower()
-                in {"www.txt80.cc", "txt80.cc"}
-            ):
+            elif source_id.isdigit() and (
+                urlparse(detail_url).hostname or ""
+            ).lower() in {"www.txt80.cc", "txt80.cc"}:
                 detail = await asyncio.to_thread(
                     self.txt80_provider.detail,
                     source_id,
@@ -1282,11 +1292,9 @@ class ElectronicLibraryService:
         items: List[Dict[str, Any]] = []
         for catalog_id in ids:
             try:
-                result = await self.sync_catalog_cover(
-                    catalog_id, action=action
-                )
+                result = await self.sync_catalog_cover(catalog_id, action=action)
                 items.append({"catalog_id": catalog_id, "ok": True, **result})
-            except Exception as exc:
+            except RECOVERABLE_OPERATION_ERRORS as exc:
                 items.append(
                     {
                         "catalog_id": catalog_id,
@@ -1338,8 +1346,7 @@ class ElectronicLibraryService:
         source_id = str(item.get("source_id") or catalog_id)
         safe_source = re.sub(r"[^A-Za-z0-9_-]+", "-", source_id).strip("-")
         stored_name = (
-            f"{int(catalog_id)}-{safe_source[:80]}-manual-{digest[:16]}"
-            f"{extension}"
+            f"{int(catalog_id)}-{safe_source[:80]}-manual-{digest[:16]}{extension}"
         )
         self.cover_root.mkdir(parents=True, exist_ok=True)
         target = (self.cover_root / stored_name).resolve()
@@ -1373,8 +1380,7 @@ class ElectronicLibraryService:
                 "original_filename": Path(filename or "cover").name,
                 "content_type": str(content_type or ""),
                 "cover_url": (
-                    f"/api/library/covers/{int(catalog_id)}"
-                    f"?v={stored.sha256[:16]}"
+                    f"/api/library/covers/{int(catalog_id)}?v={stored.sha256[:16]}"
                 ),
                 "security_scan": scan,
             }
@@ -1493,16 +1499,14 @@ class ElectronicLibraryService:
                     author=str(author),
                     reason=message,
                 )
-            except Exception as exc:
+            except RECOVERABLE_OPERATION_ERRORS as exc:
                 return {
                     "status": "failed",
                     "local_url": "",
                     "attempts": attempts,
                     "error": message,
                     "ai_fallback_queued": False,
-                    "ai_fallback_error": (
-                        f"{type(exc).__name__}: {str(exc)[:300]}"
-                    ),
+                    "ai_fallback_error": (f"{type(exc).__name__}: {str(exc)[:300]}"),
                 }
             return {
                 "status": "ai_fallback",
@@ -1549,7 +1553,7 @@ class ElectronicLibraryService:
                         f"?v={str(result['sha256'])[:16]}"
                     )
                 return {**result, "local_url": local_url}
-            except Exception as exc:
+            except RECOVERABLE_OPERATION_ERRORS as exc:
                 last_error = exc
                 if attempt < attempts:
                     await asyncio.sleep(0.25 * attempt)
@@ -1569,12 +1573,7 @@ class ElectronicLibraryService:
         profile = str(profile or "").strip().lower()
         if profile not in {"ixdzs", "shubaow"}:
             raise ValueError("当前来源没有正文清洗规则")
-        tool = (
-            APP_ROOT
-            / "scripts"
-            / "electronic-library"
-            / "replace_ixdzs_branding.py"
-        )
+        tool = APP_ROOT / "scripts" / "electronic-library" / "replace_ixdzs_branding.py"
         completed = subprocess.run(
             [
                 sys.executable,
@@ -1594,13 +1593,9 @@ class ElectronicLibraryService:
         )
         if completed.returncode:
             detail = (
-                completed.stderr
-                or completed.stdout
-                or "正文来源清洗失败"
+                completed.stderr or completed.stdout or "正文来源清洗失败"
             ).strip()
-            raise RuntimeError(
-                f"replace_ixdzs_branding.py: {detail[-1200:]}"
-            )
+            raise RuntimeError(f"replace_ixdzs_branding.py: {detail[-1200:]}")
         try:
             return json.loads(completed.stdout or "{}")
         except json.JSONDecodeError:
@@ -1680,6 +1675,57 @@ class ElectronicLibraryService:
     def _sync_timer_status(self, unit: str) -> Dict[str, Any]:
         return self._sync_units_status((unit,))[unit]
 
+    def _serialized_update_state_path(self, source: str) -> Path:
+        return self.runtime_dir / f"serialized-source-updates-{source}.json"
+
+    @staticmethod
+    def _format_epoch_timestamp(value: Any) -> str:
+        try:
+            epoch = float(value or 0)
+        except (TypeError, ValueError):
+            return ""
+        if epoch <= 0:
+            return ""
+        return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _serialized_update_counts(self) -> Dict[str, Dict[str, int]]:
+        counts: Dict[str, Dict[str, int]] = {
+            source: {} for source in SERIALIZED_UPDATE_SOURCE_CONFIG
+        }
+        if self.mysql_pool is None:
+            return counts
+        with self.mysql_pool.connection(readonly=True) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT source_name, state, COUNT(*) AS count
+                    FROM authorized_source_updates
+                    WHERE source_url_state='active'
+                    GROUP BY source_name, state
+                    """
+                )
+                for row in cursor.fetchall():
+                    source = str(row.get("source_name") or "")
+                    state = str(row.get("state") or "unknown")
+                    if source in counts:
+                        counts[source][state] = int(row.get("count") or 0)
+                cursor.execute(
+                    """
+                    SELECT SUBSTRING_INDEX(source_id, '-', 1) AS source_name,
+                           COUNT(*) AS count
+                    FROM books
+                    WHERE is_active=1 AND status='done'
+                      AND body_available=1 AND book_status=%s
+                    GROUP BY source_name
+                    """,
+                    (SERIALIZATION_STATUS_ONGOING,),
+                )
+                for row in cursor.fetchall():
+                    source = str(row.get("source_name") or "")
+                    if source in counts:
+                        counts[source]["ongoing_books"] = int(row.get("count") or 0)
+        return counts
+
     def sync_controls_status(self) -> Dict[str, Any]:
         runtime_controls = self.runtime_controls.read()
         cover_target_per_hour = validate_cover_target_per_hour(
@@ -1687,57 +1733,40 @@ class ElectronicLibraryService:
         )
         desired_cover_workers = cover_worker_count(cover_target_per_hour)
         desired_cover_units = SYNC_AI_COVER_UNITS[:desired_cover_workers]
-        all_units = [
-            unit
-            for units in SYNC_TIMER_UNITS.values()
-            for unit in units
-        ]
+        all_units = [unit for units in SYNC_TIMER_UNITS.values() for unit in units]
         all_units.extend(SYNC_ON_DEMAND_UNITS.values())
         all_units.extend(
-            unit
-            for units in SYNC_CONTENT_SERVICE_UNITS.values()
-            for unit in units
+            unit for units in SYNC_CONTENT_SERVICE_UNITS.values() for unit in units
         )
         all_units.extend(
-            unit
-            for units in SYNC_LIBRARY_ASSET_UNITS.values()
-            for unit in units
+            unit for units in SYNC_LIBRARY_ASSET_UNITS.values() for unit in units
         )
         all_units.extend(SYNC_AI_COVER_UNITS)
-        all_units.extend(
-            config["unit"] for config in SITE_FULL_SYNC_CONFIG.values()
-        )
+        all_units.extend(config["unit"] for config in SITE_FULL_SYNC_CONFIG.values())
+        for source in SERIALIZED_UPDATE_SOURCE_CONFIG:
+            all_units.append(SERIALIZED_UPDATE_TIMER_TEMPLATE.format(source=source))
+            all_units.append(SERIALIZED_UPDATE_SERVICE_TEMPLATE.format(source=source))
         statuses = self._sync_units_status(all_units)
         controls: Dict[str, Any] = {}
         for library_id, units in SYNC_TIMER_UNITS.items():
             timers = [statuses[unit] for unit in units]
             content_pipeline = statuses[SYNC_ON_DEMAND_UNITS[library_id]]
             content_services = [
-                statuses[unit]
-                for unit in SYNC_CONTENT_SERVICE_UNITS[library_id]
+                statuses[unit] for unit in SYNC_CONTENT_SERVICE_UNITS[library_id]
             ]
             asset_pipeline = [
-                statuses[unit]
-                for unit in SYNC_LIBRARY_ASSET_UNITS[library_id]
+                statuses[unit] for unit in SYNC_LIBRARY_ASSET_UNITS[library_id]
             ]
-            next_runs = [
-                timer["next_run"] for timer in timers if timer["next_run"]
-            ]
-            last_runs = [
-                timer["last_run"] for timer in timers if timer["last_run"]
-            ]
+            next_runs = [timer["next_run"] for timer in timers if timer["next_run"]]
+            last_runs = [timer["last_run"] for timer in timers if timer["last_run"]]
             controls[library_id] = {
                 "id": library_id,
                 "label": SYNC_CONTROL_LABELS[library_id],
                 # ``enabled`` remains the compatibility alias for the content
                 # switch.  Covers are controlled independently.
                 "enabled": all(timer["enabled"] for timer in timers),
-                "content_enabled": all(
-                    timer["enabled"] for timer in timers
-                ),
-                "primary_sync_enabled": all(
-                    timer["enabled"] for timer in timers
-                ),
+                "content_enabled": all(timer["enabled"] for timer in timers),
+                "primary_sync_enabled": all(timer["enabled"] for timer in timers),
                 "active": any(timer["active"] for timer in timers),
                 "content_pipeline": content_pipeline,
                 "content_services": content_services,
@@ -1751,15 +1780,9 @@ class ElectronicLibraryService:
                 "asset_pipeline_enabled": all(
                     unit["enabled"] for unit in asset_pipeline
                 ),
-                "asset_pipeline_active": all(
-                    unit["active"] for unit in asset_pipeline
-                ),
-                "cover_enabled": all(
-                    unit["enabled"] for unit in asset_pipeline
-                ),
-                "cover_active": all(
-                    unit["active"] for unit in asset_pipeline
-                ),
+                "asset_pipeline_active": all(unit["active"] for unit in asset_pipeline),
+                "cover_enabled": all(unit["enabled"] for unit in asset_pipeline),
+                "cover_active": all(unit["active"] for unit in asset_pipeline),
                 "pipeline_description": (
                     "书目总量 + 新书下载 + 源站更新版本"
                     if library_id == "local"
@@ -1774,8 +1797,7 @@ class ElectronicLibraryService:
                     )
                 ),
                 "ai_cover_enabled": all(
-                    statuses[unit]["enabled"]
-                    for unit in desired_cover_units
+                    statuses[unit]["enabled"] for unit in desired_cover_units
                 ),
             }
         cover_operational: Dict[str, Any] = {
@@ -1796,7 +1818,7 @@ class ElectronicLibraryService:
                     ).clean_cover_operational_status()
                 )
                 cover_operational["available"] = True
-            except Exception as exc:
+            except RECOVERABLE_OPERATION_ERRORS as exc:
                 cover_operational["error"] = str(exc)[:240]
         cover_units = [statuses[unit] for unit in SYNC_AI_COVER_UNITS]
         controls["cover_redraw"] = {
@@ -1806,16 +1828,31 @@ class ElectronicLibraryService:
             "active_workers": sum(
                 1 for unit in desired_cover_units if statuses[unit]["active"]
             ),
-            "enabled": all(
-                statuses[unit]["enabled"] for unit in desired_cover_units
-            ),
-            "active": all(
-                statuses[unit]["active"] for unit in desired_cover_units
-            ),
+            "enabled": all(statuses[unit]["enabled"] for unit in desired_cover_units),
+            "active": all(statuses[unit]["active"] for unit in desired_cover_units),
             "units": cover_units,
             "actual": cover_operational,
             "updated_at": runtime_controls.get("updated_at", ""),
         }
+        authorized_progress_payload = _read_json(
+            self.runtime_dir / "authorized-site-catalog-sync.json", {}
+        )
+        authorized_phases = (
+            authorized_progress_payload.get("download_phases")
+            if isinstance(authorized_progress_payload, dict)
+            else None
+        )
+        authorized_phases = (
+            authorized_phases if isinstance(authorized_phases, dict) else {}
+        )
+        authorized_phase = (
+            authorized_progress_payload.get("download_phase")
+            if isinstance(authorized_progress_payload, dict)
+            else None
+        )
+        authorized_phase = (
+            authorized_phase if isinstance(authorized_phase, dict) else {}
+        )
         full_speed_sites: list[dict[str, Any]] = []
         for site_id, config in SITE_FULL_SYNC_CONFIG.items():
             unit_status = statuses[config["unit"]]
@@ -1823,6 +1860,57 @@ class ElectronicLibraryService:
                 self.runtime_dir / f"oohstory-site-full-sync-{site_id}.json",
                 {},
             )
+            status = str(state.get("status") or "idle")
+            stored_batch = state.get("batch")
+            stored_batch = stored_batch if isinstance(stored_batch, dict) else {}
+            site_authorized_phase = authorized_phases.get(site_id)
+            if not isinstance(site_authorized_phase, dict):
+                site_authorized_phase = (
+                    authorized_phase
+                    if str(authorized_phase.get("source") or "") == site_id
+                    else {}
+                )
+            live_batch: Dict[str, Any] = {}
+            if (
+                status in {"running", "slot_acquired"}
+                and str(site_authorized_phase.get("source") or "") == site_id
+            ):
+                live_batch = {
+                    "selected": int(site_authorized_phase.get("selected") or 0),
+                    "attempted": int(site_authorized_phase.get("attempted") or 0),
+                    "completed": (
+                        int(site_authorized_phase.get("imported") or 0)
+                        + int(site_authorized_phase.get("already_available") or 0)
+                        + int(site_authorized_phase.get("duplicates") or 0)
+                    ),
+                    "failed": int(site_authorized_phase.get("failed") or 0),
+                    "deferred": int(site_authorized_phase.get("deferred") or 0),
+                }
+            batch = live_batch or {
+                "selected": int(stored_batch.get("selected") or 0),
+                "attempted": int(stored_batch.get("attempted") or 0),
+                "completed": int(stored_batch.get("completed") or 0),
+                "failed": int(stored_batch.get("failed") or 0),
+                "deferred": int(stored_batch.get("deferred") or 0),
+            }
+            stored_cumulative = state.get("cumulative")
+            stored_cumulative = (
+                stored_cumulative if isinstance(stored_cumulative, dict) else {}
+            )
+            cumulative = {
+                "attempted": int(stored_cumulative.get("attempted") or 0),
+                "completed": int(stored_cumulative.get("completed") or 0),
+                "failed": int(stored_cumulative.get("failed") or 0),
+                "deferred": int(stored_cumulative.get("deferred") or 0),
+            }
+            if live_batch:
+                cumulative = {
+                    "attempted": cumulative["attempted"] + int(live_batch["attempted"]),
+                    "completed": cumulative["completed"] + int(live_batch["completed"]),
+                    "failed": cumulative["failed"] + int(live_batch["failed"]),
+                    "deferred": cumulative["deferred"] + int(live_batch["deferred"]),
+                }
+            raw_backlog = state.get("backlog")
             full_speed_sites.append(
                 {
                     "id": site_id,
@@ -1838,25 +1926,108 @@ class ElectronicLibraryService:
                             SITE_FULL_SYNC_TARGET_BOOKS_PER_MINUTE,
                         )
                     ),
-                    "books_per_cycle": runtime_controls[
-                        "site_books_per_cycle"
-                    ].get(site_id, SITE_FULL_SYNC_TARGET_BOOKS_PER_MINUTE),
+                    "books_per_cycle": runtime_controls["site_books_per_cycle"].get(
+                        site_id, SITE_FULL_SYNC_TARGET_BOOKS_PER_MINUTE
+                    ),
                     "configurable": site_id in SITE_IDS,
-                    "status": str(state.get("status") or "idle"),
+                    "status": status,
                     "message": str(state.get("message") or "尚未启动"),
+                    "slot_lane": SITE_FULL_SYNC_LANES.get(site_id, "http"),
                     "cycle": int(state.get("cycle") or 0),
                     "last_cycle_seconds": state.get("last_cycle_seconds"),
                     "updated_at": str(state.get("updated_at") or ""),
+                    "batch": batch,
+                    "batch_live": bool(live_batch),
+                    "backlog": (
+                        int(raw_backlog)
+                        if isinstance(raw_backlog, (int, float))
+                        else None
+                    ),
+                    "cumulative": cumulative,
+                    "last_error": str(state.get("last_error") or ""),
                 }
             )
         controls["site_full_sync"] = {
             "target_books_per_minute": SITE_FULL_SYNC_TARGET_BOOKS_PER_MINUTE,
+            "min_books_per_round": 1,
+            "max_books_per_round": 500,
             "rate_contract": (
-                "授权站点每轮本数可独立配置，周期不少于 60 秒；"
-                "上游较慢时以实际完成速度为准"
+                "新笔趣阁、爱下与 CDP 浏览器源均按独立执行 lane 并行；"
+                "共用同一浏览器的来源仍在该 lane 内 FIFO；导入写库全局串行，"
+                "周期不少于 60 秒"
             ),
-            "authorized_sites_share_slot": True,
+            "authorized_sites_share_slot": False,
+            "execution_lanes": dict(SITE_FULL_SYNC_LANES),
             "sites": full_speed_sites,
+        }
+        serialized_counts = self._serialized_update_counts()
+        serialized_sources: list[dict[str, Any]] = []
+        for source, config in SERIALIZED_UPDATE_SOURCE_CONFIG.items():
+            timer_unit = SERIALIZED_UPDATE_TIMER_TEMPLATE.format(source=source)
+            service_unit = SERIALIZED_UPDATE_SERVICE_TEMPLATE.format(source=source)
+            state = _read_json(self._serialized_update_state_path(source), {})
+            totals = state.get("totals") if isinstance(state, dict) else {}
+            totals = totals if isinstance(totals, dict) else {}
+            source_state: dict[str, Any] = {}
+            if isinstance(state, dict):
+                sources_payload = state.get("sources")
+                if isinstance(sources_payload, dict):
+                    raw_source_state = sources_payload.get(source)
+                    if isinstance(raw_source_state, dict):
+                        source_state = raw_source_state
+            errors = source_state.get("errors")
+            errors = errors if isinstance(errors, list) else []
+            serialized_sources.append(
+                {
+                    "id": source,
+                    "label": config["label"],
+                    "lane": config["lane"],
+                    "timer_unit": timer_unit,
+                    "service_unit": service_unit,
+                    "enabled": statuses[timer_unit]["enabled"],
+                    "timer_active": statuses[timer_unit]["active"],
+                    "service_active": statuses[service_unit]["active"],
+                    "active_state": statuses[service_unit]["active_state"],
+                    "next_run": statuses[timer_unit]["next_run"],
+                    "last_run": statuses[timer_unit]["last_run"],
+                    "status": str(state.get("status") or "never_run")
+                    if isinstance(state, dict)
+                    else "never_run",
+                    "mode": str(state.get("mode") or "")
+                    if isinstance(state, dict)
+                    else "",
+                    "pages_per_source": int(state.get("pages_per_source") or 0)
+                    if isinstance(state, dict)
+                    else 0,
+                    "limit_per_source": int(state.get("limit_per_source") or 0)
+                    if isinstance(state, dict)
+                    else 0,
+                    "checked_at": self._format_epoch_timestamp(
+                        state.get("completed_at_epoch")
+                        if isinstance(state, dict)
+                        else 0
+                    ),
+                    "totals": {
+                        "seen": int(totals.get("seen") or 0),
+                        "local_matches": int(totals.get("local_matches") or 0),
+                        "already_current": int(totals.get("already_current") or 0),
+                        "refresh_selected": int(totals.get("refresh_selected") or 0),
+                        "refresh_applied": int(totals.get("refresh_applied") or 0),
+                        "refresh_deferred": int(totals.get("refresh_deferred") or 0),
+                        "not_ready": int(totals.get("not_ready") or 0),
+                        "failed": int(totals.get("failed") or 0),
+                    },
+                    "tracked": serialized_counts.get(source, {}),
+                    "last_errors": [str(error) for error in errors[-3:]],
+                }
+            )
+        controls["serialized_update"] = {
+            "label": "连载追更",
+            "rate_contract": (
+                "每个来源独立 update lane 定时扫描最近更新榜；命中本地连载书后"
+                "比对远端末章/修订号并原子刷新正文，刷新成功后更新入库索引。"
+            ),
+            "sources": serialized_sources,
         }
         return controls
 
@@ -1874,17 +2045,28 @@ class ElectronicLibraryService:
                 site_id,
                 validate_site_books_per_cycle(books_per_cycle),
             )
-        current = self.sync_controls_status()
         if enabled:
-            group = str(config["group"])
-            scheduled = current[group]
-            if scheduled["content_enabled"] or scheduled["content_pipeline_active"]:
-                raise ValueError(
-                    "请先停用对应书库的定时正文同步，并等待当前任务结束"
-                )
             self._run_systemctl("enable", "--now", config["unit"])
         else:
             self._run_systemctl("disable", "--now", config["unit"])
+        return self.sync_controls_status()
+
+    def set_serialized_update_source(
+        self,
+        source_id: str,
+        enabled: bool,
+    ) -> Dict[str, Any]:
+        source = str(source_id or "").strip()
+        if source not in SERIALIZED_UPDATE_SOURCE_CONFIG:
+            raise ValueError("未知连载追更来源")
+        timer_unit = SERIALIZED_UPDATE_TIMER_TEMPLATE.format(source=source)
+        service_unit = SERIALIZED_UPDATE_SERVICE_TEMPLATE.format(source=source)
+        if enabled:
+            self._run_systemctl("enable", "--now", timer_unit)
+            self._run_systemctl("start", "--no-block", service_unit)
+        else:
+            self._run_systemctl("disable", "--now", timer_unit)
+            self._run_systemctl("stop", "--no-block", service_unit, check=False)
         return self.sync_controls_status()
 
     def set_cover_redraw_control(
@@ -2160,8 +2342,7 @@ class ElectronicLibraryService:
             """
         )
         columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(library_index)")
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(library_index)")
         }
         migrations = {
             "primary_tone_tags": "TEXT NOT NULL DEFAULT '[]'",
@@ -2227,9 +2408,7 @@ class ElectronicLibraryService:
         self,
         catalog_ids: Iterable[int],
     ) -> Dict[int, Dict[str, Any]]:
-        normalized = sorted(
-            {int(value) for value in catalog_ids if int(value) > 0}
-        )
+        normalized = sorted({int(value) for value in catalog_ids if int(value) > 0})
         if (
             normalized
             and self.infrastructure_settings.catalog_backend == "mysql"
@@ -2238,13 +2417,9 @@ class ElectronicLibraryService:
             rows = self.mysql_catalog.metadata_for_ids(normalized)
             for row in rows.values():
                 row["index_status"] = row.get("reader_index_status") or ""
-                row["schema_version"] = int(
-                    row.get("reader_schema_version") or 0
-                )
+                row["schema_version"] = int(row.get("reader_schema_version") or 0)
                 row["indexed_at"] = (
-                    row.get("reader_indexed_at")
-                    or row.get("indexed_at")
-                    or ""
+                    row.get("reader_indexed_at") or row.get("indexed_at") or ""
                 )
             return rows
         if not normalized or not self.content_metrics_path.exists():
@@ -2276,9 +2451,7 @@ class ElectronicLibraryService:
             exact = metrics.get(int(item.get("catalog_id") or 0))
             if not exact:
                 continue
-            mysql_metrics = (
-                self.infrastructure_settings.catalog_backend == "mysql"
-            )
+            mysql_metrics = self.infrastructure_settings.catalog_backend == "mysql"
             if int(exact.get("source_bytes") or 0) != int(
                 item.get("source_bytes") or 0
             ) or (
@@ -2449,9 +2622,7 @@ class ElectronicLibraryService:
         """Return file-backed index state without running catalog queries."""
         status = dict(self._load_index_status())
         status["pipeline"] = self._load_derived_index_refresh_status()
-        status["ingestion_pipeline"] = (
-            self._load_ingestion_index_refresh_status()
-        )
+        status["ingestion_pipeline"] = self._load_ingestion_index_refresh_status()
         return status
 
     def plot_index_probe_status(self) -> Dict[str, Any]:
@@ -2504,15 +2675,11 @@ class ElectronicLibraryService:
                     "run_tone": bool(run_tone or (pending and request.get("run_tone"))),
                     "run_plot": merged_plot,
                     "force_tone": bool(
-                        (force and run_tone)
-                        or (pending and request.get("force_tone"))
+                        (force and run_tone) or (pending and request.get("force_tone"))
                     ),
                     "force_plot": bool(
                         (force and run_plot)
-                        or (
-                            pending_plot_authorized
-                            and request.get("force_plot")
-                        )
+                        or (pending_plot_authorized and request.get("force_plot"))
                     ),
                     "manual_plot_authorized": merged_plot,
                     "plot_reason": (
@@ -2634,11 +2801,7 @@ class ElectronicLibraryService:
         start_args.append(INGESTION_INDEX_SERVICE)
         started = self._run_systemctl(*start_args, check=False)
         if started.returncode == 0:
-            return (
-                self._load_ingestion_index_refresh_status()
-                if wait
-                else pipeline
-            )
+            return self._load_ingestion_index_refresh_status() if wait else pipeline
         message = (started.stderr or started.stdout).strip()
         failed = {
             **pipeline,
@@ -2682,9 +2845,7 @@ class ElectronicLibraryService:
                 fcntl.flock(queue_lock, fcntl.LOCK_EX)
                 current = _read_json(self.ingestion_index_request_path, {})
                 pending_ids = (
-                    current.get("catalog_ids") or []
-                    if current.get("pending")
-                    else []
+                    current.get("catalog_ids") or [] if current.get("pending") else []
                 )
                 merged_ids = self._normalized_catalog_ids(
                     [*pending_ids, *requested_ids]
@@ -2734,9 +2895,7 @@ class ElectronicLibraryService:
         """Start a previously batched ingestion queue without adding work."""
 
         request = _read_json(self.ingestion_index_request_path, {})
-        catalog_ids = self._normalized_catalog_ids(
-            request.get("catalog_ids") or []
-        )
+        catalog_ids = self._normalized_catalog_ids(request.get("catalog_ids") or [])
         if not request.get("pending") or not catalog_ids:
             return {
                 "status": "completed",
@@ -2813,8 +2972,7 @@ class ElectronicLibraryService:
                     """
                 )
                 pages = {
-                    str(row["status"]): int(row["count"])
-                    for row in cursor.fetchall()
+                    str(row["status"]): int(row["count"]) for row in cursor.fetchall()
                 }
                 cursor.execute(
                     """
@@ -2910,9 +3068,7 @@ class ElectronicLibraryService:
             self.infrastructure_settings.catalog_backend == "mysql"
             and self.mysql_pool is not None
         ):
-            counts, pages, categories, libraries = (
-                self._mysql_source_status_counts()
-            )
+            counts, pages, categories, libraries = self._mysql_source_status_counts()
         else:
             with self._catalog_connection() as conn:
                 catalog_tables = {
@@ -2957,8 +3113,7 @@ class ElectronicLibraryService:
                         counts["duplicate"] = duplicate_count
                 else:
                     for row in conn.execute(
-                        "SELECT status, COUNT(*) AS count "
-                        "FROM books GROUP BY status"
+                        "SELECT status, COUNT(*) AS count FROM books GROUP BY status"
                     ):
                         counts[row["status"]] = row["count"]
                     for row in conn.execute(
@@ -2986,9 +3141,7 @@ class ElectronicLibraryService:
                         elif row["status"] == "failed":
                             library["failed"] += count
                 page_table = (
-                    "listing_pages"
-                    if "listing_pages" in catalog_tables
-                    else "pages"
+                    "listing_pages" if "listing_pages" in catalog_tables else "pages"
                 )
                 for row in conn.execute(
                     f"SELECT status, COUNT(*) AS count "
@@ -3030,20 +3183,24 @@ class ElectronicLibraryService:
                 indexed_count = asset_counts["tone_books"]
                 plot_books = asset_counts["plot_books"]
                 plot_segments = asset_counts["plot_segments"]
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 indexed_count = plot_books = plot_segments = 0
         elif self.index_path.exists():
             try:
                 with self._index_connection() as conn:
-                    indexed_count = conn.execute("SELECT COUNT(*) FROM library_index").fetchone()[0]
-                    plot_books = conn.execute("SELECT COUNT(*) FROM plot_index_meta").fetchone()[0]
-                    plot_segments = conn.execute("SELECT COUNT(*) FROM plot_segments").fetchone()[0]
-            except Exception:
+                    indexed_count = conn.execute(
+                        "SELECT COUNT(*) FROM library_index"
+                    ).fetchone()[0]
+                    plot_books = conn.execute(
+                        "SELECT COUNT(*) FROM plot_index_meta"
+                    ).fetchone()[0]
+                    plot_segments = conn.execute(
+                        "SELECT COUNT(*) FROM plot_segments"
+                    ).fetchone()[0]
+            except RECOVERABLE_OPERATION_ERRORS:
                 indexed_count = plot_books = plot_segments = 0
         unique_total = sum(
-            count
-            for status, count in counts.items()
-            if status != "duplicate"
+            count for status, count in counts.items() if status != "duplicate"
         )
         downloaded = counts.get("done", 0)
         indexable_books = downloaded
@@ -3057,16 +3214,14 @@ class ElectronicLibraryService:
                 # Tone visibility must therefore be measured against the same
                 # active/body-available population consumed by the indexer.
                 indexable_books = self.mysql_catalog.derived_index_catalog_total()
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 indexable_books = downloaded
         stored_duplicates = int(counts.get("duplicate", 0) or 0)
         if (
             self.infrastructure_settings.catalog_backend == "mysql"
             and self.mysql_catalog is not None
         ):
-            authorized_duplicates = (
-                self.mysql_catalog.authorized_deduplicated_count()
-            )
+            authorized_duplicates = self.mysql_catalog.authorized_deduplicated_count()
         else:
             authorized_catalog_sync = _read_json(
                 self.authorized_catalog_sync_status_path,
@@ -3079,9 +3234,7 @@ class ElectronicLibraryService:
             )
             if not isinstance(authorized_stats, dict):
                 authorized_stats = {}
-            authorized_duplicates = int(
-                authorized_stats.get("deduplicated", 0) or 0
-            )
+            authorized_duplicates = int(authorized_stats.get("deduplicated", 0) or 0)
         intercepted_duplicates = stored_duplicates + authorized_duplicates
         sync_status = _read_json(
             self.sync_status_path,
@@ -3091,9 +3244,7 @@ class ElectronicLibraryService:
                 "message": "尚未执行书库同步审计",
             },
         )
-        deconstruction_status = self.list_global_deconstructions_cached(
-            project_root
-        )
+        deconstruction_status = self.list_global_deconstructions_cached(project_root)
         return {
             "library_root": str(self.library_root),
             "catalog_path": (
@@ -3192,7 +3343,12 @@ class ElectronicLibraryService:
             },
             "runners": {
                 "codex_cli_installed": (
-                    APP_ROOT / ".tools" / "codex-cli" / "node_modules" / ".bin" / "codex"
+                    APP_ROOT
+                    / ".tools"
+                    / "codex-cli"
+                    / "node_modules"
+                    / ".bin"
+                    / "codex"
                 ).exists(),
                 "openclaw_available": bool(shutil.which("openclaw")),
                 "fallback_order": ["Codex CLI（已登录时）", "OpenClaw Gateway"],
@@ -3255,10 +3411,8 @@ class ElectronicLibraryService:
                 first_newline = text.find("\n")
                 last_newline = text.rfind("\n")
                 if 0 <= first_newline < last_newline:
-                    text = text[first_newline + 1:last_newline]
-                parts.append(
-                    f"<<<TONE_SAMPLE:{int(ratio * 100):02d}>>>\n{text}"
-                )
+                    text = text[first_newline + 1 : last_newline]
+                parts.append(f"<<<TONE_SAMPLE:{int(ratio * 100):02d}>>>\n{text}")
         return "\n\n".join(parts)
 
     @staticmethod
@@ -3275,108 +3429,18 @@ class ElectronicLibraryService:
         )
         sections: List[str] = []
         for raw in raw_sections:
-            lines = [
-                re.sub(r"\s+", " ", line).strip()
-                for line in raw.splitlines()
-            ]
+            lines = [re.sub(r"\s+", " ", line).strip() for line in raw.splitlines()]
             cleaned = "\n".join(
                 line
                 for line in lines
-                if line and not any(marker.lower() in line.lower() for marker in boilerplate)
+                if line
+                and not any(marker.lower() in line.lower() for marker in boilerplate)
             )
             if cleaned:
                 sections.append(cleaned)
         return sections or [sample]
 
     @staticmethod
-    def _summary_from_sample(sample: str) -> str:
-        """Return a real synopsis or the first chapter's first 300 characters."""
-
-        def normalized_lines(value: str) -> List[str]:
-            return [
-                re.sub(r"\s+", " ", line).strip()
-                for line in value.splitlines()
-            ]
-
-        def is_noise(line: str) -> bool:
-            return bool(
-                not line
-                or line.startswith("<<<TONE_SAMPLE:")
-                or LOCAL_MEDIA_MARKER_RE.fullmatch(line)
-                or line in {"分卷封面", "插画", "插图", "展开", "收起"}
-                or re.fullmatch(r"[（(]?插图\s*\d+[）)]?", line)
-            )
-
-        # Explicit source synopsis wins. Stop at a volume/chapter/media boundary
-        # so local asset references can never leak into public metadata.
-        intro_lines: List[str] = []
-        capturing = False
-        for line in normalized_lines(sample):
-            match = SUMMARY_HEADING_RE.match(line)
-            if match:
-                capturing = True
-                remainder = match.group(1).strip()
-                if remainder and not is_noise(remainder):
-                    intro_lines.append(remainder)
-                continue
-            if not capturing:
-                if (
-                    line.startswith("【")
-                    or CHAPTER_HEADING_TOKEN_RE.search(line)
-                    or LOCAL_MEDIA_MARKER_RE.fullmatch(line)
-                    or line in {"分卷封面", "插画", "插图"}
-                ):
-                    break
-                continue
-            if (
-                line.startswith("<<<TONE_SAMPLE:")
-                or line.startswith("【")
-                or CHAPTER_HEADING_TOKEN_RE.search(line)
-                or LOCAL_MEDIA_MARKER_RE.fullmatch(line)
-                or line in {"分卷封面", "插画", "插图"}
-            ):
-                break
-            if not is_noise(line):
-                intro_lines.append(line)
-            if len("\n".join(intro_lines)) >= 600:
-                break
-        explicit = "\n".join(intro_lines).strip()[:600].rstrip()
-        if explicit:
-            return explicit
-
-        # For large files only the 00% section is guaranteed to contain the
-        # first chapter. Later tone samples must never become the fallback.
-        marked_sections = re.split(
-            r"(?m)^<<<TONE_SAMPLE:\d+>>>\s*$",
-            sample,
-        )
-        leading = next((part for part in marked_sections if part.strip()), sample)
-        lines = normalized_lines(leading)
-        start = None
-        for index, line in enumerate(lines):
-            if CHAPTER_HEADING_TOKEN_RE.search(line) and "人物介绍" not in line:
-                start = index + 1
-                break
-        candidates = lines[start:] if start is not None else lines
-        body_lines: List[str] = []
-        for line in candidates:
-            if start is not None and CHAPTER_HEADING_TOKEN_RE.search(line):
-                break
-            if (
-                is_noise(line)
-                or SUMMARY_METADATA_RE.match(line)
-                or SUMMARY_HEADING_RE.match(line)
-                or line.startswith("【")
-                or line.startswith("声明：本书为")
-                or line.startswith("用户上传之内容")
-            ):
-                continue
-            body_lines.append(line)
-            compact = re.sub(r"\s+", " ", " ".join(body_lines)).strip()
-            if len(compact) >= 300:
-                return compact[:300].rstrip()
-        return re.sub(r"\s+", " ", " ".join(body_lines)).strip()[:300].rstrip()
-
     @staticmethod
     def _tone_idf(
         keyword: str,
@@ -3392,211 +3456,6 @@ class ElectronicLibraryService:
         return min(2.25, max(0.75, 0.75 + normalized * 1.5))
 
     @staticmethod
-    def _extract_features(
-        title: str,
-        category: str,
-        sample: str,
-        tone_document_frequency: Optional[Dict[str, int]] = None,
-        corpus_size: int = 0,
-    ) -> Dict[str, Any]:
-        sections = ElectronicLibraryService._tone_sections(sample)
-        clean_sample = "\n".join(sections)
-        haystack = f"{title}\n{category}\n{clean_sample}"
-        genre_scores: Counter[str] = Counter()
-        tone_scores: Counter[str] = Counter()
-        keyword_counts: Dict[str, int] = {}
-        genre_match_counts = Counter(
-            match.group(0) for match in GENRE_KEYWORD_PATTERN.finditer(haystack)
-        )
-        title_tone_counts = Counter(
-            match.group(0) for match in TONE_KEYWORD_PATTERN.finditer(title)
-        )
-        section_tone_counts = [
-            Counter(match.group(0) for match in TONE_KEYWORD_PATTERN.finditer(section))
-            for section in sections
-        ]
-        body_tone_counts: Counter[str] = Counter()
-        for counts in section_tone_counts:
-            body_tone_counts.update(counts)
-
-        primary_genres = list(CATEGORY_GENRES.get(category, ()))
-        for genre in primary_genres:
-            genre_scores[genre] += 30
-        for genre, keywords in GENRE_KEYWORDS.items():
-            score = 0
-            for keyword in keywords:
-                count = genre_match_counts.get(keyword, 0)
-                if count:
-                    keyword_counts[keyword] = count
-                    score += min(count, 8)
-            if score:
-                genre_scores[genre] += score
-        # 规则证据先用语料逆文档频率降噪，再与题材先验合成候选。
-        # 先验只提供低置信度兜底，确保每本小说至少有一个主基调。
-        tone_evidence: Dict[str, Dict[str, Any]] = {}
-        for tone, rule in TONE_RULES.items():
-            evidence_score = 0.0
-            distinct_hits = 0
-            strong_hits = 0
-            title_hits = 0
-            matched: Dict[str, int] = {}
-            covered_sections: set[int] = set()
-            for level, body_weight, title_weight, cap in (
-                ("strong", 12.0, 24.0, 3),
-                ("medium", 5.0, 18.0, 4),
-                ("weak", 2.0, 10.0, 3),
-            ):
-                for keyword in rule.get(level, ()):
-                    title_count = title_tone_counts.get(keyword, 0)
-                    body_count = body_tone_counts.get(keyword, 0)
-                    total_count = title_count + body_count
-                    if not total_count:
-                        continue
-                    matched[keyword] = total_count
-                    keyword_counts[keyword] = max(
-                        keyword_counts.get(keyword, 0), total_count
-                    )
-                    distinct_hits += 1
-                    title_hits += title_count
-                    if level == "strong":
-                        strong_hits += total_count
-                    idf = ElectronicLibraryService._tone_idf(
-                        keyword, tone_document_frequency, corpus_size
-                    )
-                    evidence_score += min(body_count, cap) * body_weight * idf
-                    if title_count:
-                        evidence_score += title_weight * idf
-                    for index, section_counts in enumerate(section_tone_counts):
-                        if section_counts.get(keyword, 0):
-                            covered_sections.add(index)
-            if distinct_hits >= 2:
-                evidence_score += min(distinct_hits - 1, 4) * 2
-            if len(covered_sections) >= 2:
-                evidence_score += min(len(covered_sections) - 1, 4) * 2
-            eligible = bool(
-                evidence_score >= 18
-                and (strong_hits or title_hits or distinct_hits >= 2)
-            )
-            if eligible:
-                tone_scores[tone] = round(evidence_score, 2)
-                tone_evidence[tone] = {
-                    "evidence_score": round(evidence_score, 2),
-                    "matched": matched,
-                    "section_coverage": len(covered_sections),
-                    "title_hits": title_hits,
-                }
-
-        inferred_genres = [
-            name
-            for name, score in genre_scores.most_common()
-            if name not in primary_genres and score >= 10
-        ]
-        genre_tags = [*primary_genres, *inferred_genres[:2]]
-        if not genre_tags:
-            genre_tags = [category or "网络小说"]
-        priors = CATEGORY_TONE_PRIORS.get(category, DEFAULT_TONE_PRIORS)
-        candidate_scores: Dict[str, float] = {
-            tone: float(score) for tone, score in tone_scores.items()
-        }
-        for index, tone in enumerate(priors):
-            candidate_scores[tone] = candidate_scores.get(tone, 0.0) + max(
-                2.0, 8.0 - index * 1.5
-            )
-        ranked_tones = sorted(
-            candidate_scores.items(),
-            key=lambda item: (-item[1], list(TONE_RULES).index(item[0])),
-        )
-        if not ranked_tones:
-            ranked_tones = [(DEFAULT_TONE_PRIORS[0], 1.0)]
-        top_score = ranked_tones[0][1]
-        candidate_names = [name for name, _ in ranked_tones[:5]]
-        primary_tones = [candidate_names[0]]
-        if (
-            len(ranked_tones) > 1
-            and ranked_tones[1][1] >= top_score * 0.82
-            and ranked_tones[1][0] in tone_scores
-        ):
-            primary_tones.append(ranked_tones[1][0])
-        secondary_floor = max(18.0, float(tone_scores.get(primary_tones[0], 0)) * 0.55)
-        secondary_tones = [
-            name
-            for name in candidate_names
-            if (
-                name not in primary_tones
-                and name in tone_scores
-                and float(tone_scores[name]) >= secondary_floor
-            )
-        ][:3]
-        tone_tags = [*primary_tones, *secondary_tones]
-
-        top_name = primary_tones[0]
-        top_rule_score = float(tone_scores.get(top_name, 0))
-        if top_rule_score >= 50:
-            tone_confidence = 0.9
-        elif top_rule_score >= 32:
-            tone_confidence = 0.8
-        elif top_rule_score >= 18:
-            tone_confidence = 0.68
-        else:
-            tone_confidence = 0.38
-        if tone_evidence.get(top_name, {}).get("title_hits"):
-            tone_confidence = max(tone_confidence, 0.84)
-        if tone_evidence.get(top_name, {}).get("section_coverage", 0) >= 3:
-            tone_confidence = min(0.95, tone_confidence + 0.05)
-        score_gap = (
-            top_score - ranked_tones[1][1]
-            if len(ranked_tones) > 1
-            else top_score
-        )
-        review_required = bool(
-            tone_confidence < 0.72 or score_gap < max(4.0, top_score * 0.12)
-        )
-        tone_source = "rule_evidence" if top_rule_score else "category_prior"
-
-        # 模型只接收短代表片段，不接收全文。
-        representative_fragments: List[str] = []
-        for section in sections:
-            compact = re.sub(r"\s+", " ", section).strip()
-            if len(compact) >= 80:
-                representative_fragments.append(compact[:240])
-            if len(representative_fragments) >= 4:
-                break
-        candidate_details = []
-        for name, score in ranked_tones[:5]:
-            detail = tone_evidence.get(name, {})
-            candidate_details.append(
-                {
-                    "name": name,
-                    "score": round(float(score), 2),
-                    "matched": detail.get("matched", {}),
-                    "section_coverage": detail.get("section_coverage", 0),
-                }
-            )
-        tone_evidence_payload = {
-            "primary": primary_tones,
-            "secondary": secondary_tones,
-            "candidates": candidate_details,
-            "fragments": representative_fragments,
-            "local_confidence": round(tone_confidence, 3),
-            "source": tone_source,
-            "review_required": review_required,
-        }
-        summary = ElectronicLibraryService._summary_from_sample(sample)
-        searchable = f"{title} {category} {' '.join(genre_tags)} {' '.join(tone_tags)} {summary}"[:5000]
-        return {
-            "genre_tags": genre_tags,
-            "tone_tags": tone_tags,
-            "primary_tone_tags": primary_tones,
-            "secondary_tone_tags": secondary_tones,
-            "tone_confidence": round(tone_confidence, 3),
-            "tone_source": tone_source,
-            "tone_evidence": tone_evidence_payload,
-            "tone_review_status": "pending" if review_required else "not_needed",
-            "keyword_counts": keyword_counts,
-            "summary": summary,
-            "searchable_text": searchable,
-        }
-
     def _build_index_mysql(
         self,
         rows: List[Dict[str, Any]],
@@ -3635,14 +3494,14 @@ class ElectronicLibraryService:
                         title = str(row.get("title") or "")
                         clean_sample = str(row.get("searchable_text") or "")
                     else:
-                        source_path = Path(
-                            str(row.get("output_path") or "")
-                        ).expanduser().resolve()
+                        source_path = (
+                            Path(str(row.get("output_path") or ""))
+                            .expanduser()
+                            .resolve()
+                        )
                         title = str(row.get("title") or source_path.stem)
                         clean_sample = "\n".join(
-                            self._tone_sections(
-                                self._read_sample(source_path)
-                            )
+                            self._tone_sections(self._read_sample(source_path))
                         )
                     document_frequency.update(
                         {
@@ -3652,12 +3511,9 @@ class ElectronicLibraryService:
                             )
                         }
                     )
-                except Exception:
+                except RECOVERABLE_OPERATION_ERRORS:
                     continue
-                if (
-                    position == len(frequency_sources)
-                    or position % 100 == 0
-                ):
+                if position == len(frequency_sources) or position % 100 == 0:
                     self._save_index_status(
                         {
                             "processed": 0,
@@ -3689,12 +3545,13 @@ class ElectronicLibraryService:
                 pending = []
 
         for candidate_position, row in enumerate(rows, start=1):
-            position = baseline + candidate_position
             catalog_id = int(row.get("catalog_id") or row.get("id") or 0)
             try:
-                source_path = Path(
-                    str(row.get("output_path") or row.get("source_path") or "")
-                ).expanduser().resolve()
+                source_path = (
+                    Path(str(row.get("output_path") or row.get("source_path") or ""))
+                    .expanduser()
+                    .resolve()
+                )
                 if not (
                     _is_within(source_path, self.books_root)
                     or _is_within(source_path, object_root)
@@ -3727,7 +3584,7 @@ class ElectronicLibraryService:
                         **features,
                     }
                 )
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 failed += 1
 
             if candidate_position == len(rows) or candidate_position % 10 == 0:
@@ -3767,11 +3624,7 @@ class ElectronicLibraryService:
                 "finished_at": _now(),
                 "message": (
                     f"书籍基调与索引完成，共 {count} 本"
-                    + (
-                        "；基调规则升级已逐书重算"
-                        if rules_changed
-                        else ""
-                    )
+                    + ("；基调规则升级已逐书重算" if rules_changed else "")
                 ),
             }
         )
@@ -3849,9 +3702,11 @@ class ElectronicLibraryService:
         for row in rows:
             catalog_id = int(row.get("catalog_id") or row.get("id") or 0)
             try:
-                source_path = Path(
-                    str(row.get("output_path") or row.get("source_path") or "")
-                ).expanduser().resolve()
+                source_path = (
+                    Path(str(row.get("output_path") or row.get("source_path") or ""))
+                    .expanduser()
+                    .resolve()
+                )
                 if not (
                     _is_within(source_path, self.books_root)
                     or _is_within(source_path, object_root)
@@ -3871,15 +3726,9 @@ class ElectronicLibraryService:
                 )
                 if reader_ready:
                     word_count = int(cached_reader.get("word_count") or 0)
-                    chapter_count = int(
-                        cached_reader.get("chapter_count") or 0
-                    )
-                    section_count = int(
-                        cached_reader.get("section_count") or 0
-                    )
-                    reader_status = str(
-                        cached_reader.get("index_status") or "exact"
-                    )
+                    chapter_count = int(cached_reader.get("chapter_count") or 0)
+                    section_count = int(cached_reader.get("section_count") or 0)
+                    reader_status = str(cached_reader.get("index_status") or "exact")
                     reader_schema_version = int(
                         cached_reader.get("schema_version") or 0
                     )
@@ -3921,7 +3770,7 @@ class ElectronicLibraryService:
                         **features,
                     }
                 )
-            except Exception as exc:
+            except RECOVERABLE_OPERATION_ERRORS as exc:
                 failures.append(
                     {
                         "catalog_id": catalog_id,
@@ -3963,8 +3812,7 @@ class ElectronicLibraryService:
             and self.mysql_catalog is not None
         ):
             previous_rule_version = str(
-                self.mysql_catalog.metadata_state_get("tone_rule_version", "")
-                or ""
+                self.mysql_catalog.metadata_state_get("tone_rule_version", "") or ""
             )
             rules_changed = previous_rule_version != TONE_RULE_VERSION
             catalog_total = self.mysql_catalog.derived_index_catalog_total()
@@ -4017,11 +3865,8 @@ class ElectronicLibraryService:
             rows = [
                 row
                 for row in rows
-                if int(
-                    row["id"]
-                    if "id" in row.keys()
-                    else row["catalog_id"]
-                ) in selected_ids
+                if int(row["id"] if "id" in row.keys() else row["catalog_id"])
+                in selected_ids
             ]
         self._save_index_status(
             {
@@ -4080,9 +3925,7 @@ class ElectronicLibraryService:
                             )
                             title = str(row["title"] or source_path.stem)
                             sample = self._read_sample(source_path)
-                            clean_sample = "\n".join(
-                                self._tone_sections(sample)
-                            )
+                            clean_sample = "\n".join(self._tone_sections(sample))
                         found = {
                             match.group(0)
                             for match in TONE_KEYWORD_PATTERN.finditer(
@@ -4090,12 +3933,9 @@ class ElectronicLibraryService:
                             )
                         }
                         document_frequency.update(found)
-                    except Exception:
+                    except RECOVERABLE_OPERATION_ERRORS:
                         continue
-                    if (
-                        position == len(frequency_sources)
-                        or position % 100 == 0
-                    ):
+                    if position == len(frequency_sources) or position % 100 == 0:
                         self._save_index_status(
                             {
                                 "processed": 0,
@@ -4296,14 +4136,16 @@ class ElectronicLibraryService:
                                 features["tone_review_status"],
                                 "",
                                 None,
-                                json.dumps(features["keyword_counts"], ensure_ascii=False),
+                                json.dumps(
+                                    features["keyword_counts"], ensure_ascii=False
+                                ),
                                 _now(),
                             ),
                         )
                         indexed += 1
                     if position % 25 == 0:
                         index_conn.commit()
-                except Exception:
+                except RECOVERABLE_OPERATION_ERRORS:
                     failed += 1
 
                 if position == len(rows) or position % 10 == 0:
@@ -4335,7 +4177,9 @@ class ElectronicLibraryService:
                 (TONE_RULE_VERSION,),
             )
             index_conn.commit()
-            count = index_conn.execute("SELECT COUNT(*) FROM library_index").fetchone()[0]
+            count = index_conn.execute("SELECT COUNT(*) FROM library_index").fetchone()[
+                0
+            ]
 
         return self._save_index_status(
             {
@@ -4350,11 +4194,7 @@ class ElectronicLibraryService:
                 "finished_at": _now(),
                 "message": (
                     f"派生索引完成，共 {count} 本"
-                    + (
-                        "；基调规则升级已全量重算"
-                        if rules_changed
-                        else ""
-                    )
+                    + ("；基调规则升级已全量重算" if rules_changed else "")
                 ),
             }
         )
@@ -4440,8 +4280,7 @@ class ElectronicLibraryService:
             and self.mysql_catalog is not None
         ):
             evidence_by_source = self.mysql_catalog.tone_evidence_for_sources(
-                str(review.get("source_id") or "")
-                for review in reviews
+                str(review.get("source_id") or "") for review in reviews
             )
             prepared: List[Dict[str, Any]] = []
             for review in reviews:
@@ -4456,11 +4295,7 @@ class ElectronicLibraryService:
                     for tag in review.get("secondary_tones", [])
                     if str(tag) in valid_tags and str(tag) not in primary
                 ][:3]
-                if (
-                    not source_id
-                    or not primary
-                    or source_id not in evidence_by_source
-                ):
+                if not source_id or not primary or source_id not in evidence_by_source:
                     continue
                 evidence = _read_json_value(
                     evidence_by_source[source_id],
@@ -4621,20 +4456,16 @@ class ElectronicLibraryService:
                     "finished_at": _now(),
                     **counts,
                     "processed": counts["cumulative_reviewed"],
-                    "total": (
-                        counts["cumulative_reviewed"] + counts["pending"]
-                    ),
+                    "total": (counts["cumulative_reviewed"] + counts["pending"]),
                     "reviewed": counts["cumulative_reviewed"],
                     "failed": counts["pending"],
                     "message": "全部低置信度作品均已完成模型复核",
                 }
             )
 
-        definitions = {
-            tag: TONE_DESCRIPTIONS[tag] for tag in TONE_TAG_CATALOG
-        }
+        definitions = {tag: TONE_DESCRIPTIONS[tag] for tag in TONE_TAG_CATALOG}
         batches = [
-            rows[index:index + max(1, min(batch_size, 40))]
+            rows[index : index + max(1, min(batch_size, 40))]
             for index in range(0, total, max(1, min(batch_size, 40)))
         ]
         semaphore = asyncio.Semaphore(max(1, min(concurrency, 8)))
@@ -4648,6 +4479,7 @@ class ElectronicLibraryService:
             connector=connector,
             trust_env=False,
         ) as client:
+
             async def review_batch(batch: List[Any]) -> None:
                 nonlocal reviewed, failed, processed
                 books = [self._tone_review_payload(row) for row in batch]
@@ -4656,8 +4488,8 @@ class ElectronicLibraryService:
                     "和本地候选，只判断整部作品的长期主导阅读体验，不把单个场景"
                     "误当全书基调。每本必须给1-2个主基调，可给0-3个辅助基调；"
                     "标签只能来自给定目录，reason不超过30个汉字。严格返回JSON对象"
-                    "{\"items\":[{\"source_id\":\"...\",\"primary_tones\":[],"
-                    "\"secondary_tones\":[],\"confidence\":0.0,\"reason\":\"\"}]}。\n"
+                    '{"items":[{"source_id":"...","primary_tones":[],'
+                    '"secondary_tones":[],"confidence":0.0,"reason":""}]}。\n'
                     f"基调定义：{json.dumps(definitions, ensure_ascii=False)}\n"
                     f"作品：{json.dumps(books, ensure_ascii=False)}"
                 )
@@ -4696,7 +4528,7 @@ class ElectronicLibraryService:
                             model=config["model"],
                         )
                         batch_failed = len(batch) - applied
-                    except Exception:
+                    except RECOVERABLE_OPERATION_ERRORS:
                         applied = 0
                         batch_failed = len(batch)
                 async with status_lock:
@@ -4750,7 +4582,7 @@ class ElectronicLibraryService:
                     batch_size=batch_size,
                     concurrency=concurrency,
                 )
-            except Exception as exc:
+            except RECOVERABLE_OPERATION_ERRORS as exc:
                 self._save_tone_review_status(
                     {
                         "status": "error",
@@ -4811,7 +4643,10 @@ class ElectronicLibraryService:
             best_distance = 20_001
             b_cursor = 0
             for pos_a in positions_a[:240]:
-                while b_cursor + 1 < len(positions_b) and positions_b[b_cursor + 1] <= pos_a:
+                while (
+                    b_cursor + 1 < len(positions_b)
+                    and positions_b[b_cursor + 1] <= pos_a
+                ):
                     b_cursor += 1
                 for pos_b in positions_b[max(0, b_cursor - 1) : b_cursor + 3]:
                     distance = abs(pos_a - pos_b)
@@ -4864,14 +4699,15 @@ class ElectronicLibraryService:
         indexed = failed = 0
         object_root = self.infrastructure_settings.object_root.resolve()
         for candidate_position, row in enumerate(rows, start=1):
-            position = baseline + candidate_position
             source_id = str(
                 row.get("source_id") or row.get("catalog_id") or row.get("id")
             )
             try:
-                source_path = Path(
-                    str(row.get("output_path") or row.get("source_path") or "")
-                ).expanduser().resolve()
+                source_path = (
+                    Path(str(row.get("output_path") or row.get("source_path") or ""))
+                    .expanduser()
+                    .resolve()
+                )
                 if not (
                     _is_within(source_path, self.books_root)
                     or _is_within(source_path, object_root)
@@ -4890,7 +4726,7 @@ class ElectronicLibraryService:
                     indexed_at=_now(),
                 )
                 indexed += 1
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 failed += 1
             if candidate_position == len(rows) or candidate_position % 10 == 0:
                 self._save_plot_index_status(
@@ -5062,7 +4898,7 @@ class ElectronicLibraryService:
                         indexed += 1
                     if position % 10 == 0:
                         conn.commit()
-                except Exception:
+                except RECOVERABLE_OPERATION_ERRORS:
                     failed += 1
                 if position == len(rows) or position % 10 == 0:
                     self._save_plot_index_status(
@@ -5081,11 +4917,19 @@ class ElectronicLibraryService:
                 if row["source_id"] not in seen_source_ids
             ]
             for source_id in stale_ids:
-                conn.execute("DELETE FROM plot_segments WHERE source_id=?", (source_id,))
-                conn.execute("DELETE FROM plot_index_meta WHERE source_id=?", (source_id,))
+                conn.execute(
+                    "DELETE FROM plot_segments WHERE source_id=?", (source_id,)
+                )
+                conn.execute(
+                    "DELETE FROM plot_index_meta WHERE source_id=?", (source_id,)
+                )
             conn.commit()
-            book_count = conn.execute("SELECT COUNT(*) FROM plot_index_meta").fetchone()[0]
-            segment_count = conn.execute("SELECT COUNT(*) FROM plot_segments").fetchone()[0]
+            book_count = conn.execute(
+                "SELECT COUNT(*) FROM plot_index_meta"
+            ).fetchone()[0]
+            segment_count = conn.execute(
+                "SELECT COUNT(*) FROM plot_segments"
+            ).fetchone()[0]
 
         return self._save_plot_index_status(
             {
@@ -5143,7 +4987,12 @@ class ElectronicLibraryService:
         substyle = info.get("substyle") or state.get("substyle") or ""
         tone_tags = info.get("tone_tags") or []
         tone = info.get("tone") or ""
-        logline = info.get("logline") or info.get("description") or state.get("description") or ""
+        logline = (
+            info.get("logline")
+            or info.get("description")
+            or state.get("description")
+            or ""
+        )
         parts = [genre, substyle, tone, logline, " ".join(tone_tags)]
         files_used: List[str] = []
         for relative in PROFILE_FILES:
@@ -5154,7 +5003,7 @@ class ElectronicLibraryService:
                 content = path.read_text(encoding="utf-8", errors="replace")[:12000]
                 parts.append(content)
                 files_used.append(relative)
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 continue
         profile_text = "\n".join(part for part in parts if part)
         detected_terms = sorted(
@@ -5177,7 +5026,9 @@ class ElectronicLibraryService:
         }
 
     @staticmethod
-    def _score_book(book: Dict[str, Any], profile: Dict[str, Any]) -> tuple[int, List[str]]:
+    def _score_book(
+        book: Dict[str, Any], profile: Dict[str, Any]
+    ) -> tuple[int, List[str]]:
         score = 0
         reasons: List[str] = []
         genre_tags = set(book.get("genre_tags") or [])
@@ -5225,9 +5076,7 @@ class ElectronicLibraryService:
         requested_tones = set(profile.get("tone_tags") or [])
         if profile.get("tone"):
             tone_text = profile["tone"]
-            requested_tones.update(
-                tone for tone in TONE_KEYWORDS if tone in tone_text
-            )
+            requested_tones.update(tone for tone in TONE_KEYWORDS if tone in tone_text)
         tone_overlap = requested_tones & tone_tags
         if tone_overlap:
             score += min(28, len(tone_overlap) * 9)
@@ -5297,24 +5146,17 @@ class ElectronicLibraryService:
             return []
         columns = ", ".join(self._index_list_columns())
         with self._index_connection() as conn:
-            rows = conn.execute(
-                f"SELECT {columns} FROM library_index"
-            ).fetchall()
+            rows = conn.execute(f"SELECT {columns} FROM library_index").fetchall()
         # 派生索引只保存特征；正文状态与对象位置必须回查当前书目真值。
         if (
             self.infrastructure_settings.catalog_backend == "mysql"
             and self.mysql_catalog is not None
         ):
             catalog_by_id = {
-                int(item["catalog_id"]): self._materialize_mysql_catalog_row(
-                    item
-                )
+                int(item["catalog_id"]): self._materialize_mysql_catalog_row(item)
                 for item in self.mysql_catalog.list_book_projection(
                     include_unavailable=True,
-                    catalog_ids=[
-                        int(row["catalog_id"])
-                        for row in rows
-                    ],
+                    catalog_ids=[int(row["catalog_id"]) for row in rows],
                 )
             }
         else:
@@ -5358,9 +5200,7 @@ class ElectronicLibraryService:
             item["indexed"] = True
             result.append(item)
         return (
-            self._apply_content_metrics(result)
-            if include_reader_metadata
-            else result
+            self._apply_content_metrics(result) if include_reader_metadata else result
         )
 
     def _catalog_books_fallback(
@@ -5421,9 +5261,9 @@ class ElectronicLibraryService:
                 item.get("book_status"),
                 default=(
                     SERIALIZATION_STATUS_ONGOING
-                    if str(item.get("source_id") or "").lower().startswith(
-                        ("fanqie-", "xbiquge-", "shubaow-", "linovelib-")
-                    )
+                    if str(item.get("source_id") or "")
+                    .lower()
+                    .startswith(("fanqie-", "xbiquge-", "shubaow-", "linovelib-"))
                     else SERIALIZATION_STATUS_COMPLETED
                 ),
             )
@@ -5441,7 +5281,9 @@ class ElectronicLibraryService:
                             *category_genres,
                         ]
                     ),
-                    "approx_word_count": max(int(item.get("source_bytes") or 0) // 3, 0),
+                    "approx_word_count": max(
+                        int(item.get("source_bytes") or 0) // 3, 0
+                    ),
                     "approx_chapter_count": 0,
                     "indexed": False,
                     "available_for_analysis": item.get("download_status") == "done",
@@ -5449,9 +5291,7 @@ class ElectronicLibraryService:
             )
             result.append(item)
         return (
-            self._apply_content_metrics(result)
-            if include_reader_metadata
-            else result
+            self._apply_content_metrics(result) if include_reader_metadata else result
         )
 
     def _browse_catalog_mysql(
@@ -5478,16 +5318,12 @@ class ElectronicLibraryService:
         metadata_by_catalog_id: Dict[int, Dict[str, Any]] = {}
         if rows:
             catalog_ids = [int(row["catalog_id"]) for row in rows]
-            metadata_by_catalog_id = self.mysql_catalog.metadata_for_ids(
-                catalog_ids
-            )
+            metadata_by_catalog_id = self.mysql_catalog.metadata_for_ids(catalog_ids)
 
         items: List[Dict[str, Any]] = []
         for row in rows:
             item = dict(row)
-            indexed_metadata = metadata_by_catalog_id.get(
-                int(item["catalog_id"]), {}
-            )
+            indexed_metadata = metadata_by_catalog_id.get(int(item["catalog_id"]), {})
             item_library = str(item.pop("library_id") or "local")
             object_key = str(item.pop("body_object_key") or "").strip()
             if object_key:
@@ -5500,21 +5336,17 @@ class ElectronicLibraryService:
             item["source_path"] = source_path
             default_book_status = (
                 SERIALIZATION_STATUS_ONGOING
-                if str(item.get("source_id") or "").lower().startswith(
-                    ("fanqie-", "xbiquge-", "shubaow-", "linovelib-")
-                )
+                if str(item.get("source_id") or "")
+                .lower()
+                .startswith(("fanqie-", "xbiquge-", "shubaow-", "linovelib-"))
                 else SERIALIZATION_STATUS_COMPLETED
             )
             item["book_status"] = self.normalize_book_status(
                 item.get("book_status"),
                 default=default_book_status,
             )
-            source_exists = bool(
-                source_path and Path(source_path).is_file()
-            )
-            readable = bool(
-                item.get("download_status") == "done" and source_exists
-            )
+            source_exists = bool(source_path and Path(source_path).is_file())
+            readable = bool(item.get("download_status") == "done" and source_exists)
             status = str(item.get("download_status") or "")
             published_at = ""
             for source_url in (item.get("detail_url"), item.get("file_url")):
@@ -5524,16 +5356,12 @@ class ElectronicLibraryService:
                 )
                 if published_match:
                     year, month, day = published_match.groups()
-                    published_at = (
-                        f"{year}-{int(month):02d}-{int(day):02d}"
-                    )
+                    published_at = f"{year}-{int(month):02d}-{int(day):02d}"
                     break
             if readable:
                 recovery_reason = ""
             elif status == "done":
-                recovery_reason = (
-                    "目录已标记完成，但正文对象暂不可访问，请同步书库恢复"
-                )
+                recovery_reason = "目录已标记完成，但正文对象暂不可访问，请同步书库恢复"
             elif item.get("last_error"):
                 last_error = str(item["last_error"]).casefold()
                 if "404" in last_error or "link not found" in last_error:
@@ -5565,28 +5393,14 @@ class ElectronicLibraryService:
                     ),
                     "source_exists": source_exists,
                     "available_for_reading": readable,
-                    "availability": (
-                        "readable" if readable else "recovery"
-                    ),
-                    "availability_label": (
-                        "正文可读" if readable else "待恢复"
-                    ),
+                    "availability": ("readable" if readable else "recovery"),
+                    "availability_label": ("正文可读" if readable else "待恢复"),
                     "recovery_reason": recovery_reason,
                     "published_at": published_at,
-                    "summary": str(
-                        indexed_metadata.get("summary") or ""
-                    ).strip(),
-                    "word_count": int(
-                        item.get("approx_word_count")
-                        or 0
-                    ),
-                    "chapter_count": int(
-                        item.get("approx_chapter_count")
-                        or 0
-                    ),
-                    "section_count": int(
-                        indexed_metadata.get("section_count") or 0
-                    ),
+                    "summary": str(indexed_metadata.get("summary") or "").strip(),
+                    "word_count": int(item.get("approx_word_count") or 0),
+                    "chapter_count": int(item.get("approx_chapter_count") or 0),
+                    "section_count": int(indexed_metadata.get("section_count") or 0),
                     "reader_index_status": str(
                         indexed_metadata.get("reader_index_status") or ""
                     ),
@@ -5597,9 +5411,7 @@ class ElectronicLibraryService:
                             0,
                         )
                     ),
-                    "approx_chapter_count": int(
-                        item.get("approx_chapter_count") or 0
-                    ),
+                    "approx_chapter_count": int(item.get("approx_chapter_count") or 0),
                 }
             )
             item["cover_url"] = self._cover_for_catalog_item(item)
@@ -5669,15 +5481,12 @@ class ElectronicLibraryService:
                 snapshot_id = requested_snapshot_id
             else:
                 snapshot_id = int(
-                    conn.execute(
-                        "SELECT COALESCE(MAX(id), 0) FROM books"
-                    ).fetchone()[0]
+                    conn.execute("SELECT COALESCE(MAX(id), 0) FROM books").fetchone()[0]
                 )
             if snapshot_id:
                 base_conditions.append("id <= ?")
             catalog_columns = {
-                str(row["name"])
-                for row in conn.execute("PRAGMA table_xinfo(books)")
+                str(row["name"]) for row in conn.execute("PRAGMA table_xinfo(books)")
             }
             catalog_tables = {
                 str(row["name"])
@@ -5732,20 +5541,22 @@ class ElectronicLibraryService:
             )
             category_params = [*base_params]
             last_error_select = (
-                "last_error" if "last_error" in catalog_columns
+                "last_error"
+                if "last_error" in catalog_columns
                 else "NULL AS last_error"
             )
             discovered_at_select = (
-                "discovered_at" if "discovered_at" in catalog_columns
+                "discovered_at"
+                if "discovered_at" in catalog_columns
                 else "NULL AS discovered_at"
             )
             detail_url_select = (
-                "detail_url" if "detail_url" in catalog_columns
+                "detail_url"
+                if "detail_url" in catalog_columns
                 else "NULL AS detail_url"
             )
             file_url_select = (
-                "file_url" if "file_url" in catalog_columns
-                else "NULL AS file_url"
+                "file_url" if "file_url" in catalog_columns else "NULL AS file_url"
             )
             book_status_select = (
                 "book_status"
@@ -5927,15 +5738,13 @@ class ElectronicLibraryService:
         items: List[Dict[str, Any]] = []
         for row in rows:
             item = dict(row)
-            indexed_metadata = metadata_by_catalog_id.get(
-                int(item["catalog_id"]), {}
-            )
+            indexed_metadata = metadata_by_catalog_id.get(int(item["catalog_id"]), {})
             item_library = str(item.pop("library_id") or "local")
             default_book_status = (
                 SERIALIZATION_STATUS_ONGOING
-                if str(item.get("source_id") or "").lower().startswith(
-                    ("fanqie-", "xbiquge-", "shubaow-", "linovelib-")
-                )
+                if str(item.get("source_id") or "")
+                .lower()
+                .startswith(("fanqie-", "xbiquge-", "shubaow-", "linovelib-"))
                 else SERIALIZATION_STATUS_COMPLETED
             )
             item["book_status"] = self.normalize_book_status(
@@ -5944,9 +5753,7 @@ class ElectronicLibraryService:
             )
             source_path = str(item.get("source_path") or "")
             source_exists = bool(source_path and Path(source_path).is_file())
-            readable = bool(
-                item.get("download_status") == "done" and source_exists
-            )
+            readable = bool(item.get("download_status") == "done" and source_exists)
             status = str(item.get("download_status") or "")
             published_at = ""
             for source_url in (item.get("detail_url"), item.get("file_url")):
@@ -5999,12 +5806,8 @@ class ElectronicLibraryService:
                     "published_at": published_at,
                     "summary": str(indexed_metadata.get("summary") or "").strip(),
                     "word_count": int(indexed_metadata.get("word_count") or 0),
-                    "chapter_count": int(
-                        indexed_metadata.get("chapter_count") or 0
-                    ),
-                    "section_count": int(
-                        indexed_metadata.get("section_count") or 0
-                    ),
+                    "chapter_count": int(indexed_metadata.get("chapter_count") or 0),
+                    "section_count": int(indexed_metadata.get("section_count") or 0),
                     "reader_index_status": str(
                         indexed_metadata.get("reader_index_status") or ""
                     ),
@@ -6060,11 +5863,7 @@ class ElectronicLibraryService:
         if target_library not in {"local", "fanqie"}:
             raise ValueError("目标书库必须是 local 或 fanqie")
         normalized_ids = sorted(
-            {
-                int(catalog_id)
-                for catalog_id in catalog_ids
-                if int(catalog_id) > 0
-            }
+            {int(catalog_id) for catalog_id in catalog_ids if int(catalog_id) > 0}
         )
         if not normalized_ids:
             raise ValueError("请至少选择一本小说")
@@ -6087,8 +5886,7 @@ class ElectronicLibraryService:
         else:
             with self._catalog_connection() as conn:
                 catalog_columns = {
-                    str(row["name"])
-                    for row in conn.execute("PRAGMA table_info(books)")
+                    str(row["name"]) for row in conn.execute("PRAGMA table_info(books)")
                 }
                 library_expression = self._catalog_effective_library_expression(
                     catalog_columns, "books"
@@ -6105,9 +5903,7 @@ class ElectronicLibraryService:
                 ).fetchall()
         found_ids = {int(row["catalog_id"]) for row in rows}
         missing_ids = [
-            catalog_id
-            for catalog_id in normalized_ids
-            if catalog_id not in found_ids
+            catalog_id for catalog_id in normalized_ids if catalog_id not in found_ids
         ]
         if missing_ids:
             raise ValueError(
@@ -6121,9 +5917,7 @@ class ElectronicLibraryService:
                     catalog_id = int(row["catalog_id"])
                     inferred_library = (
                         "fanqie"
-                        if str(row["source_id"]).casefold().startswith(
-                            "fanqie-"
-                        )
+                        if str(row["source_id"]).casefold().startswith("fanqie-")
                         else "local"
                     )
                     if target_library == inferred_library:
@@ -6161,16 +5955,11 @@ class ElectronicLibraryService:
         # Keep the indexed materialized key in sync when the scalable schema
         # has been installed.  The separate override database remains the
         # backwards-compatible source of truth for legacy catalogs.
-        if (
-            not using_mysql and "library_id" in catalog_columns
-        ):
+        if not using_mysql and "library_id" in catalog_columns:
             with sqlite3.connect(self.catalog_path, timeout=30) as conn:
                 conn.executemany(
                     "UPDATE books SET library_id=? WHERE id=?",
-                    [
-                        (target_library, int(row["catalog_id"]))
-                        for row in rows
-                    ],
+                    [(target_library, int(row["catalog_id"])) for row in rows],
                 )
                 conn.commit()
 
@@ -6181,10 +5970,7 @@ class ElectronicLibraryService:
             with sqlite3.connect(self.catalog_path, timeout=30) as conn:
                 conn.executemany(
                     "UPDATE books SET library_id=? WHERE id=?",
-                    [
-                        (target_library, int(row["catalog_id"]))
-                        for row in rows
-                    ],
+                    [(target_library, int(row["catalog_id"])) for row in rows],
                 )
                 conn.commit()
 
@@ -6268,9 +6054,7 @@ class ElectronicLibraryService:
                     book_id = 0
                 output_value = str(task.get("output_dir") or "").strip()
                 output = (
-                    Path(output_value).expanduser().resolve()
-                    if output_value
-                    else None
+                    Path(output_value).expanduser().resolve() if output_value else None
                 )
                 if output and _is_within(output, self.global_deconstruction_root):
                     output_owners.setdefault(output, set()).add(book_id)
@@ -6327,10 +6111,17 @@ class ElectronicLibraryService:
                 book_ids = self._normalized_catalog_ids(batch.get("book_ids") or [])
                 if not (set(book_ids) & catalog_ids):
                     continue
-                if batch.get("status") in {"queued", "running", "dispatching", "waiting"}:
+                if batch.get("status") in {
+                    "queued",
+                    "running",
+                    "dispatching",
+                    "waiting",
+                }:
                     raise ValueError("所选书目仍属于运行中的批量拆书任务")
                 batch_paths.append(batch_path)
-                retained_book_ids = [value for value in book_ids if value not in catalog_ids]
+                retained_book_ids = [
+                    value for value in book_ids if value not in catalog_ids
+                ]
                 if retained_book_ids:
                     updated = dict(batch)
                     updated["book_ids"] = retained_book_ids
@@ -6421,9 +6212,8 @@ class ElectronicLibraryService:
                 source_value = str(book.get("legacy_output_path") or "").strip()
                 if source_value:
                     source_path = Path(source_value).expanduser().resolve()
-                    if (
-                        source_path.name == "总文件.txt"
-                        and _is_within(source_path.parent, self.books_root)
+                    if source_path.name == "总文件.txt" and _is_within(
+                        source_path.parent, self.books_root
                     ):
                         paths.append(source_path.parent)
 
@@ -6458,7 +6248,7 @@ class ElectronicLibraryService:
             for batch_path, payload in deconstruction["batch_updates"]:
                 _atomic_write_json(batch_path, payload)
             database_result = self.mysql_catalog.delete_books(ids)
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             archive.restore()
             try:
                 archive.write_manifest(
@@ -6468,7 +6258,7 @@ class ElectronicLibraryService:
                         **manifest_payload,
                     }
                 )
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 pass
             raise
 
@@ -6482,7 +6272,10 @@ class ElectronicLibraryService:
             project_root = Path(project_value).expanduser().resolve()
             link_path = Path(link_value).expanduser().absolute()
             expected_link_root = (project_root / "拆文库").resolve()
-            if not _is_within(link_path, expected_link_root) or not link_path.is_symlink():
+            if (
+                not _is_within(link_path, expected_link_root)
+                or not link_path.is_symlink()
+            ):
                 continue
             try:
                 if link_path.resolve() == Path(output_value).expanduser().resolve():
@@ -6508,7 +6301,7 @@ class ElectronicLibraryService:
             try:
                 self.browse_catalog(library=library, page=1, page_size=28)
                 warmed.append(library)
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 pass
         return {
             "status": "deleted",
@@ -6573,10 +6366,7 @@ class ElectronicLibraryService:
                 ORDER BY count DESC, name
                 """
             ).fetchall()
-        return [
-            {"name": str(row["name"]), "count": int(row["count"])}
-            for row in rows
-        ]
+        return [{"name": str(row["name"]), "count": int(row["count"])} for row in rows]
 
     def browse_asset_index(
         self,
@@ -6614,12 +6404,8 @@ class ElectronicLibraryService:
             items: List[Dict[str, Any]] = []
             for row in rows:
                 item = self._materialize_mysql_catalog_row(dict(row))
-                item["genre_tags"] = _read_json_text(
-                    item.get("genre_tags"), []
-                )
-                item["tone_tags"] = _read_json_text(
-                    item.get("tone_tags"), []
-                )
+                item["genre_tags"] = _read_json_text(item.get("genre_tags"), [])
+                item["tone_tags"] = _read_json_text(item.get("tone_tags"), [])
                 item["primary_tone_tags"] = _read_json_text(
                     item.get("primary_tone_tags"), []
                 )
@@ -6629,19 +6415,13 @@ class ElectronicLibraryService:
                 item["tone_confidence"] = round(
                     float(item.get("tone_confidence") or 0), 3
                 )
-                item["tone_evidence"] = _read_json_value(
-                    item.get("tone_evidence"), {}
-                )
+                item["tone_evidence"] = _read_json_value(item.get("tone_evidence"), {})
                 if asset == "plot":
                     item["indexed_at"] = item.pop(
                         "plot_indexed_at", item.get("indexed_at")
                     )
-                item["available_for_reading"] = bool(
-                    item.pop("readable", 0)
-                )
-                item["library"] = str(
-                    item.pop("library_id", "local") or "local"
-                )
+                item["available_for_reading"] = bool(item.pop("readable", 0))
+                item["library"] = str(item.pop("library_id", "local") or "local")
                 item["cover_url"] = self._cover_for_catalog_item(item)
                 item.pop("body_object_key", None)
                 item.pop("cover_object_key", None)
@@ -6672,7 +6452,7 @@ class ElectronicLibraryService:
             "library_index li JOIN catalog.books b ON b.id = li.catalog_id"
             if asset == "tone"
             else "plot_index_meta pm JOIN catalog.books b ON b.id = pm.catalog_id "
-                 "LEFT JOIN library_index li ON li.catalog_id = pm.catalog_id"
+            "LEFT JOIN library_index li ON li.catalog_id = pm.catalog_id"
         )
         conditions = ["b.status != 'duplicate'"]
         params: List[Any] = []
@@ -6687,7 +6467,9 @@ class ElectronicLibraryService:
             conditions.append("COALESCE(b.category, '未分类') = ?")
             params.append(category)
         if query:
-            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            escaped = (
+                query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
             like = f"%{escaped}%"
             search_fields = [
                 "COALESCE(b.title, '')",
@@ -6699,7 +6481,12 @@ class ElectronicLibraryService:
                     ["COALESCE(li.genre_tags, '')", "COALESCE(li.tone_tags, '')"]
                 )
             conditions.append(
-                "(" + " OR ".join(f"{field} LIKE ? ESCAPE '\\' COLLATE NOCASE" for field in search_fields) + ")"
+                "("
+                + " OR ".join(
+                    f"{field} LIKE ? ESCAPE '\\' COLLATE NOCASE"
+                    for field in search_fields
+                )
+                + ")"
             )
             params.extend([like] * len(search_fields))
         if tag:
@@ -6715,7 +6502,9 @@ class ElectronicLibraryService:
 
         with self._asset_connection() as conn:
             total = int(
-                conn.execute(f"SELECT COUNT(*) FROM {from_sql} WHERE {where_sql}", params).fetchone()[0]
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {from_sql} WHERE {where_sql}", params
+                ).fetchone()[0]
             )
             categories = [
                 {"name": row["name"], "count": int(row["count"])}
@@ -6791,8 +6580,7 @@ class ElectronicLibraryService:
                     GROUP BY name ORDER BY count DESC, name LIMIT 100
                     """,
                     [*category_scope_params, *category_scope_params],
-                )
-                .fetchall()
+                ).fetchall()
                 if asset == "tone"
                 else []
             )
@@ -6802,24 +6590,21 @@ class ElectronicLibraryService:
             item = dict(row)
             item["genre_tags"] = self._json_list(item.get("genre_tags"))
             item["tone_tags"] = self._json_list(item.get("tone_tags"))
-            item["primary_tone_tags"] = self._json_list(
-                item.get("primary_tone_tags")
-            )
+            item["primary_tone_tags"] = self._json_list(item.get("primary_tone_tags"))
             item["secondary_tone_tags"] = self._json_list(
                 item.get("secondary_tone_tags")
             )
-            item["tone_confidence"] = round(
-                float(item.get("tone_confidence") or 0), 3
+            item["tone_confidence"] = round(float(item.get("tone_confidence") or 0), 3)
+            item["tone_evidence"] = _read_json_value(item.get("tone_evidence"), {})
+            item["available_for_reading"] = (
+                bool(item.pop("readable", 0))
+                and Path(item.get("source_path") or "").is_file()
             )
-            item["tone_evidence"] = _read_json_value(
-                item.get("tone_evidence"), {}
-            )
-            item["available_for_reading"] = bool(item.pop("readable", 0)) and Path(
-                item.get("source_path") or ""
-            ).is_file()
             item["library"] = (
                 "fanqie"
-                if str(item.get("catalog_source_id") or "").lower().startswith("fanqie-")
+                if str(item.get("catalog_source_id") or "")
+                .lower()
+                .startswith("fanqie-")
                 else "local"
             )
             items.append(item)
@@ -6835,7 +6620,9 @@ class ElectronicLibraryService:
             "tag": tag,
             "source": source,
             "categories": categories,
-            "tags": [{"name": row["name"], "count": int(row["count"])} for row in tag_rows],
+            "tags": [
+                {"name": row["name"], "count": int(row["count"])} for row in tag_rows
+            ],
         }
 
     def plot_evidence(
@@ -6863,9 +6650,7 @@ class ElectronicLibraryService:
                 "items": [
                     {
                         **dict(row),
-                        "motif_tags": _read_json_text(
-                            row.get("motif_tags"), []
-                        ),
+                        "motif_tags": _read_json_text(row.get("motif_tags"), []),
                     }
                     for row in rows
                 ],
@@ -6933,19 +6718,13 @@ class ElectronicLibraryService:
                 page_size=page_size,
             )
             rows = payload.pop("rows")
-            deconstruction_by_catalog = self.deconstruction_lookup(
-                project_root
-            )
+            deconstruction_by_catalog = self.deconstruction_lookup(project_root)
             items: List[Dict[str, Any]] = []
             query_lower = query.strip().lower()
             for row in rows:
                 item = self._materialize_mysql_catalog_row(dict(row))
-                item["genre_tags"] = _read_json_text(
-                    item.get("genre_tags"), []
-                )
-                item["tone_tags"] = _read_json_text(
-                    item.get("tone_tags"), []
-                )
+                item["genre_tags"] = _read_json_text(item.get("genre_tags"), [])
+                item["tone_tags"] = _read_json_text(item.get("tone_tags"), [])
                 item["keyword_counts"] = _read_json_value(
                     item.get("keyword_counts"), {}
                 )
@@ -6975,12 +6754,10 @@ class ElectronicLibraryService:
                 item["match_reasons"] = reasons
                 item["indexed"] = True
                 item["source_exists"] = bool(
-                    item.get("source_path")
-                    and Path(str(item["source_path"])).is_file()
+                    item.get("source_path") and Path(str(item["source_path"])).is_file()
                 )
                 item["available_for_analysis"] = bool(
-                    item.get("download_status") == "done"
-                    and item["source_exists"]
+                    item.get("download_status") == "done" and item["source_exists"]
                 )
                 item["cover_url"] = self._cover_for_catalog_item(item)
                 deconstruction = deconstruction_by_catalog.get(
@@ -6991,24 +6768,16 @@ class ElectronicLibraryService:
                         "id": deconstruction.get("id"),
                         "status": deconstruction.get("status"),
                         "progress": deconstruction.get("progress", 0),
-                        "current_stage": deconstruction.get(
-                            "current_stage"
-                        ),
-                        "artifact_level": deconstruction.get(
-                            "artifact_level"
-                        ),
+                        "current_stage": deconstruction.get("current_stage"),
+                        "artifact_level": deconstruction.get("artifact_level"),
                         "has_quick_preview": deconstruction.get(
                             "has_quick_preview", False
                         ),
-                        "has_full_report": deconstruction.get(
-                            "has_full_report", False
-                        ),
+                        "has_full_report": deconstruction.get("has_full_report", False),
                         "completed_chapters": deconstruction.get(
                             "completed_chapters", 0
                         ),
-                        "total_chapters": deconstruction.get(
-                            "total_chapters", 0
-                        ),
+                        "total_chapters": deconstruction.get("total_chapters", 0),
                         "updated_at": deconstruction.get("updated_at"),
                     }
                     if deconstruction
@@ -7036,9 +6805,7 @@ class ElectronicLibraryService:
         deconstruction_by_catalog = self.deconstruction_lookup(project_root)
         query_lower = query.strip().lower()
         if query_lower:
-            indexed_by_id = {
-                int(item["catalog_id"]): item for item in indexed_books
-            }
+            indexed_by_id = {int(item["catalog_id"]): item for item in indexed_books}
             books = []
             for catalog_item in self._catalog_books_fallback(
                 include_unavailable=True,
@@ -7046,10 +6813,9 @@ class ElectronicLibraryService:
             ):
                 item = indexed_by_id.get(int(catalog_item["catalog_id"]), catalog_item)
                 item["download_status"] = catalog_item.get("download_status", "done")
-                item["available_for_analysis"] = (
-                    item["download_status"] == "done"
-                    and bool(item.get("source_path"))
-                )
+                item["available_for_analysis"] = item[
+                    "download_status"
+                ] == "done" and bool(item.get("source_path"))
                 books.append(item)
         else:
             books = indexed_books or self._catalog_books_fallback()
@@ -7124,18 +6890,10 @@ class ElectronicLibraryService:
                     "progress": deconstruction.get("progress", 0),
                     "current_stage": deconstruction.get("current_stage"),
                     "artifact_level": deconstruction.get("artifact_level"),
-                    "has_quick_preview": deconstruction.get(
-                        "has_quick_preview", False
-                    ),
-                    "has_full_report": deconstruction.get(
-                        "has_full_report", False
-                    ),
-                    "completed_chapters": deconstruction.get(
-                        "completed_chapters", 0
-                    ),
-                    "total_chapters": deconstruction.get(
-                        "total_chapters", 0
-                    ),
+                    "has_quick_preview": deconstruction.get("has_quick_preview", False),
+                    "has_full_report": deconstruction.get("has_full_report", False),
+                    "completed_chapters": deconstruction.get("completed_chapters", 0),
+                    "total_chapters": deconstruction.get("total_chapters", 0),
                     "updated_at": deconstruction.get("updated_at"),
                 }
                 if deconstruction
@@ -7172,9 +6930,7 @@ class ElectronicLibraryService:
                 )
             ]
         else:
-            source_items = self._catalog_books_fallback(
-                include_unavailable=True
-            )
+            source_items = self._catalog_books_fallback(include_unavailable=True)
         for item in source_items:
             title = str(item.get("title") or "")
             author = str(item.get("author") or "")
@@ -7253,10 +7009,10 @@ class ElectronicLibraryService:
                 continue
             parsed = urlparse(url)
             host = (parsed.hostname or "").lower()
-            if (
-                parsed.scheme != "https"
-                or host not in {"www.gutenberg.org", "gutenberg.org"}
-            ):
+            if parsed.scheme != "https" or host not in {
+                "www.gutenberg.org",
+                "gutenberg.org",
+            }:
                 continue
             score = 3 if "utf-8" in content_type.lower() else 2
             if url.lower().endswith(".zip"):
@@ -7272,11 +7028,10 @@ class ElectronicLibraryService:
                 continue
             url = str(value or "").strip()
             parsed = urlparse(url)
-            if (
-                parsed.scheme == "https"
-                and (parsed.hostname or "").lower()
-                in {"www.gutenberg.org", "gutenberg.org"}
-            ):
+            if parsed.scheme == "https" and (parsed.hostname or "").lower() in {
+                "www.gutenberg.org",
+                "gutenberg.org",
+            }:
                 return url
         return ""
 
@@ -7287,9 +7042,7 @@ class ElectronicLibraryService:
         query = query.strip()
         if len(query) < 2:
             raise ValueError("作品名或作者名至少需要 2 个字符")
-        payload = self._fetch_json(
-            f"{GUTENDEX_API}/?search={quote(query)}", timeout=30
-        )
+        payload = self._fetch_json(f"{GUTENDEX_API}/?search={quote(query)}", timeout=30)
         results: List[Dict[str, Any]] = []
         for item in payload.get("results") or []:
             if not isinstance(item, dict):
@@ -7311,9 +7064,7 @@ class ElectronicLibraryService:
                     "author": "、".join(authors) or "作者未知",
                     "languages": item.get("languages") or [],
                     "subjects": (item.get("subjects") or [])[:12],
-                    "cover_url": self._public_cover_url(
-                        item.get("formats") or {}
-                    ),
+                    "cover_url": self._public_cover_url(item.get("formats") or {}),
                     "download_count": int(item.get("download_count") or 0),
                     "book_status": SERIALIZATION_STATUS_COMPLETED,
                     "license": "Public Domain / Project Gutenberg",
@@ -7353,9 +7104,7 @@ class ElectronicLibraryService:
                     )
                     rows = [dict(row) for row in cursor.fetchall()]
             for row in rows:
-                remote_id = str(row.get("source_id") or "").removeprefix(
-                    "shubaow-"
-                )
+                remote_id = str(row.get("source_id") or "").removeprefix("shubaow-")
                 source_ref = urlparse(str(row.get("detail_url") or "")).path
                 try:
                     source_ref = self.shubaow_provider.validate_source_ref(
@@ -7387,7 +7136,7 @@ class ElectronicLibraryService:
                         ),
                     }
                 )
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             indexed = []
         merged: List[Dict[str, Any]] = []
         seen: set[str] = set()
@@ -7518,9 +7267,7 @@ class ElectronicLibraryService:
             "remote_count": len(remote),
             "search_source": source,
             "search_source_label": (
-                "全部来源（兼容模式）"
-                if source == "all"
-                else provider_names[source]
+                "全部来源（兼容模式）" if source == "all" else provider_names[source]
             ),
             "remote_provider": provider_names.get(source, "全部来源"),
             "remote_error": remote_error,
@@ -7563,8 +7310,7 @@ class ElectronicLibraryService:
             ) / len(sample)
             cjk = sum("\u3400" <= char <= "\u9fff" for char in sample) / len(sample)
             mojibake = sum(
-                token in sample
-                for token in ("Ã", "Â", "¤", "锟斤拷", "\ufffd")
+                token in sample for token in ("Ã", "Â", "¤", "锟斤拷", "\ufffd")
             )
             score = printable * 4 + min(cjk * 8, 3) - control * 20 - mojibake
             if encoding.startswith("utf-8"):
@@ -7581,73 +7327,7 @@ class ElectronicLibraryService:
 
     @staticmethod
     def _epub_to_text(raw: bytes) -> str:
-        """Convert an in-memory EPUB to ordered plain text without extracting files."""
-        try:
-            archive = zipfile.ZipFile(io.BytesIO(raw))
-        except zipfile.BadZipFile as exc:
-            raise ValueError("远程 EPUB 文件损坏") from exc
-        with archive:
-            names = set(archive.namelist())
-            ordered_names: List[str] = []
-            try:
-                container = ElementTree.fromstring(
-                    archive.read("META-INF/container.xml")
-                )
-                rootfile = next(
-                    node
-                    for node in container.iter()
-                    if node.tag.endswith("rootfile")
-                )
-                opf_name = str(rootfile.attrib["full-path"])
-                opf = ElementTree.fromstring(archive.read(opf_name))
-                manifest = {
-                    str(node.attrib.get("id") or ""): str(
-                        node.attrib.get("href") or ""
-                    )
-                    for node in opf.iter()
-                    if node.tag.endswith("item")
-                    and (
-                        "html" in str(node.attrib.get("media-type") or "")
-                        or str(node.attrib.get("href") or "").lower().endswith(
-                            (".xhtml", ".html", ".htm")
-                        )
-                    )
-                }
-                opf_parent = Path(opf_name).parent
-                for node in opf.iter():
-                    if not node.tag.endswith("itemref"):
-                        continue
-                    href = manifest.get(str(node.attrib.get("idref") or ""))
-                    if not href:
-                        continue
-                    candidate = (opf_parent / href).as_posix()
-                    if candidate in names and candidate not in ordered_names:
-                        ordered_names.append(candidate)
-            except (KeyError, StopIteration, ElementTree.ParseError):
-                ordered_names = []
-            if not ordered_names:
-                ordered_names = sorted(
-                    name
-                    for name in names
-                    if name.lower().endswith((".xhtml", ".html", ".htm"))
-                )
-            sections: List[str] = []
-            for name in ordered_names:
-                page = archive.read(name)
-                soup = BeautifulSoup(page, "html.parser")
-                for node in soup(["script", "style", "nav", "svg"]):
-                    node.decompose()
-                text = "\n".join(
-                    line.strip()
-                    for line in soup.get_text("\n").splitlines()
-                    if line.strip()
-                )
-                if text:
-                    sections.append(text)
-            content = "\n\n".join(sections).strip()
-            if len(content) < 128:
-                raise ValueError("远程 EPUB 未提取到有效正文")
-            return content
+        return epub_to_text(raw)
 
     @classmethod
     def _remote_bytes_to_text(cls, raw: bytes, extension: str) -> str:
@@ -7662,10 +7342,10 @@ class ElectronicLibraryService:
     def _download_public_text(url: str) -> str:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
-        if (
-            parsed.scheme != "https"
-            or host not in {"www.gutenberg.org", "gutenberg.org"}
-        ):
+        if parsed.scheme != "https" or host not in {
+            "www.gutenberg.org",
+            "gutenberg.org",
+        }:
             raise ValueError("远程下载地址不属于已授权书源")
         request = Request(
             url,
@@ -7702,8 +7382,8 @@ class ElectronicLibraryService:
 
 书名：{title}
 作者：{author}
-来源主题：{'；'.join(subjects[:12]) or '无'}
-可选分类：{'、'.join(categories)}
+来源主题：{"；".join(subjects[:12]) or "无"}
+可选分类：{"、".join(categories)}
 正文开头样本：
 {sample[:5000]}
 
@@ -7736,7 +7416,7 @@ class ElectronicLibraryService:
             if category not in categories:
                 category = "未分类"
             return category, True, str(parsed.get("reason") or "")[:300]
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             failure = (
                 f"AI 分类等待超过 {int(wait_seconds)} 秒，已终止子进程并继续队列"
                 if isinstance(exc, asyncio.TimeoutError)
@@ -7794,31 +7474,26 @@ class ElectronicLibraryService:
         canonical_output_path = output_path.expanduser().resolve(strict=True)
         canonical_books_root = self.books_root.resolve(strict=True)
         canonical_library_root = self.library_root.resolve(strict=True)
-        if (
-            not canonical_output_path.is_file()
-            or not _is_within(canonical_output_path, canonical_books_root)
+        if not canonical_output_path.is_file() or not _is_within(
+            canonical_output_path, canonical_books_root
         ):
-            raise ValueError("正文必须存放在 txt80/书籍/ 下的分类目录")
+            raise ValueError("正文必须存放在电子书库根目录的书籍/分类目录下")
         try:
             canonical_body_key = canonical_output_path.relative_to(
                 canonical_library_root
             ).as_posix()
         except ValueError as exc:
             raise ValueError("正文路径不在电子书库根目录内") from exc
-        if (
-            not canonical_body_key.startswith("书籍/")
-            or canonical_body_key in {"书籍", "书籍/"}
-        ):
-            raise ValueError("正文对象键必须直接引用 txt80/书籍/ 分类文件")
+        if not canonical_body_key.startswith("书籍/") or canonical_body_key in {
+            "书籍",
+            "书籍/",
+        }:
+            raise ValueError("正文对象键必须直接引用电子书库根目录的书籍/分类文件")
         if self.infrastructure_settings.catalog_backend == "mysql":
             if self.mysql_catalog is None:
                 raise RuntimeError("MySQL 书目后端未初始化")
             return self.mysql_catalog.mirror_imported_book(
-                catalog_id=(
-                    int(catalog_id_override)
-                    if catalog_id_override
-                    else None
-                ),
+                catalog_id=(int(catalog_id_override) if catalog_id_override else None),
                 source_id=source_id,
                 detail_url=detail_url,
                 title=title,
@@ -7836,9 +7511,7 @@ class ElectronicLibraryService:
             )
         with sqlite3.connect(self.catalog_path, timeout=30) as conn:
             conn.row_factory = sqlite3.Row
-            columns = {
-                str(row[1]) for row in conn.execute("PRAGMA table_info(books)")
-            }
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(books)")}
             existing = None
             if "source_id" in columns:
                 existing = conn.execute(
@@ -7877,10 +7550,10 @@ class ElectronicLibraryService:
             }
             usable = {key: value for key, value in values.items() if key in columns}
             if existing:
-                assignments = ", ".join(f"{key}=?" for key in usable if key != "source_id")
-                update_values = [
-                    usable[key] for key in usable if key != "source_id"
-                ]
+                assignments = ", ".join(
+                    f"{key}=?" for key in usable if key != "source_id"
+                )
+                update_values = [usable[key] for key in usable if key != "source_id"]
                 conn.execute(
                     f"UPDATE books SET {assignments} WHERE id=?",
                     (*update_values, int(existing["id"])),
@@ -7948,9 +7621,7 @@ class ElectronicLibraryService:
                         remote_id, source_ref
                     )
                     source_id = f"xbiquge-{remote_id}"
-                    detail_url = (
-                        self.xbiquge_provider.base_url + source_ref
-                    )
+                    detail_url = self.xbiquge_provider.base_url + source_ref
                     default_book_status = SERIALIZATION_STATUS_ONGOING
                 elif provider == AUTHORIZED_IXDZS_PROVIDER:
                     source_ref = self.ixdzs_provider.validate_source_ref(
@@ -7982,9 +7653,7 @@ class ElectronicLibraryService:
                     )
                     source_id = remote_id
                     detail_url = (
-                        self.txt80_provider.base_url
-                        + "/"
-                        + source_ref.lstrip("/")
+                        self.txt80_provider.base_url + "/" + source_ref.lstrip("/")
                     )
                     default_book_status = SERIALIZATION_STATUS_COMPLETED
                     library_id = "local"
@@ -8052,8 +7721,7 @@ class ElectronicLibraryService:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout=30000")
             columns = {
-                str(row["name"])
-                for row in conn.execute("PRAGMA table_info(books)")
+                str(row["name"]) for row in conn.execute("PRAGMA table_info(books)")
             }
             required_columns = {
                 "detail_url": "TEXT",
@@ -8064,9 +7732,7 @@ class ElectronicLibraryService:
             }
             for column, declaration in required_columns.items():
                 if column not in columns:
-                    conn.execute(
-                        f"ALTER TABLE books ADD COLUMN {column} {declaration}"
-                    )
+                    conn.execute(f"ALTER TABLE books ADD COLUMN {column} {declaration}")
                     columns.add(column)
             source_ids = [item["source_id"] for item in prepared]
             detail_urls = [item["detail_url"] for item in prepared]
@@ -8083,9 +7749,7 @@ class ElectronicLibraryService:
                 (*source_ids, *detail_urls),
             ).fetchall()
             by_source_id = {
-                str(row["source_id"]): row
-                for row in existing_rows
-                if row["source_id"]
+                str(row["source_id"]): row for row in existing_rows if row["source_id"]
             }
             by_detail_url = {
                 str(row["detail_url"]): row
@@ -8099,9 +7763,7 @@ class ElectronicLibraryService:
             prepared_identity_keys.discard("")
             identity_keys: set[str] = set()
             if "identity_key" in columns and prepared_identity_keys:
-                identity_placeholders = ",".join(
-                    "?" for _ in prepared_identity_keys
-                )
+                identity_placeholders = ",".join("?" for _ in prepared_identity_keys)
                 identity_keys.update(
                     str(row["identity_key"])
                     for row in conn.execute(
@@ -8141,9 +7803,8 @@ class ElectronicLibraryService:
                 identity_keys.discard("")
 
             for item in prepared:
-                existing = (
-                    by_source_id.get(item["source_id"])
-                    or by_detail_url.get(item["detail_url"])
+                existing = by_source_id.get(item["source_id"]) or by_detail_url.get(
+                    item["detail_url"]
                 )
                 if existing:
                     catalog_id = int(existing["id"])
@@ -8180,9 +7841,7 @@ class ElectronicLibraryService:
                         for key, value in update_fields.items()
                         if key in columns
                     }
-                    assignments = [
-                        f"{key}=?" for key in usable_updates
-                    ]
+                    assignments = [f"{key}=?" for key in usable_updates]
                     values: List[Any] = list(usable_updates.values())
                     conn.execute(
                         f"UPDATE books SET {', '.join(assignments)} WHERE id=?",
@@ -8191,9 +7850,7 @@ class ElectronicLibraryService:
                     updated += 1
                     continue
 
-                identity_key = self._catalog_identity_key(
-                    item["title"], item["author"]
-                )
+                identity_key = self._catalog_identity_key(item["title"], item["author"])
                 if identity_key in identity_keys:
                     duplicates += 1
                     continue
@@ -8214,15 +7871,12 @@ class ElectronicLibraryService:
                     "updated_at": stamp,
                     "book_status": item["book_status"],
                 }
-                usable = {
-                    key: value for key, value in values.items()
-                    if key in columns
-                }
+                usable = {key: value for key, value in values.items() if key in columns}
                 names = list(usable)
                 cursor = conn.execute(
                     f"""
-                    INSERT INTO books ({', '.join(names)})
-                    VALUES ({', '.join('?' for _ in names)})
+                    INSERT INTO books ({", ".join(names)})
+                    VALUES ({", ".join("?" for _ in names)})
                     """,
                     [usable[name] for name in names],
                 )
@@ -8254,10 +7908,7 @@ class ElectronicLibraryService:
                         target_library=excluded.target_library,
                         moved_at=excluded.moved_at
                     """,
-                    [
-                        (catalog_id, stamp)
-                        for catalog_id in sorted(fanqie_catalog_ids)
-                    ],
+                    [(catalog_id, stamp) for catalog_id in sorted(fanqie_catalog_ids)],
                 )
                 conn.commit()
 
@@ -8296,12 +7947,10 @@ class ElectronicLibraryService:
                 for item in prepared
                 if ids_by_source.get(item["source_id"])
             ]
-            result["mysql_shadow"] = (
-                self.mysql_catalog.register_authorized_items(
-                    shadow_items,
-                    stamp=stamp,
-                    invalid=invalid,
-                )
+            result["mysql_shadow"] = self.mysql_catalog.register_authorized_items(
+                shadow_items,
+                stamp=stamp,
+                invalid=invalid,
             )
         return result
 
@@ -8324,9 +7973,7 @@ class ElectronicLibraryService:
             )
             return normalized
         with sqlite3.connect(self.catalog_path, timeout=30) as conn:
-            columns = {
-                str(row[1]) for row in conn.execute("PRAGMA table_info(books)")
-            }
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(books)")}
             if "book_status" in columns:
                 conn.execute(
                     "UPDATE books SET book_status=?, updated_at=? WHERE id=?",
@@ -8353,13 +8000,10 @@ class ElectronicLibraryService:
             }
         with self._catalog_connection() as conn:
             columns = {
-                str(row["name"])
-                for row in conn.execute("PRAGMA table_info(books)")
+                str(row["name"]) for row in conn.execute("PRAGMA table_info(books)")
             }
             book_status_select = (
-                "book_status"
-                if "book_status" in columns
-                else "NULL AS book_status"
+                "book_status" if "book_status" in columns else "NULL AS book_status"
             )
             row = conn.execute(
                 f"""
@@ -8383,9 +8027,7 @@ class ElectronicLibraryService:
 
         if int(catalog_id or 0) <= 0 or self.mysql_catalog is None:
             return None
-        rows = self.mysql_catalog.list_book_projection(
-            catalog_ids=[int(catalog_id)]
-        )
+        rows = self.mysql_catalog.list_book_projection(catalog_ids=[int(catalog_id)])
         if not rows:
             return None
         item = self._materialize_mysql_catalog_row(rows[0])
@@ -8418,8 +8060,7 @@ class ElectronicLibraryService:
             }
         with self._catalog_connection() as conn:
             columns = {
-                str(row["name"])
-                for row in conn.execute("PRAGMA table_info(books)")
+                str(row["name"]) for row in conn.execute("PRAGMA table_info(books)")
             }
             status_select = (
                 "book_status" if "book_status" in columns else "NULL AS book_status"
@@ -8456,22 +8097,15 @@ class ElectronicLibraryService:
                     (str(title).strip(),),
                 ).fetchall()
         for row in rows:
-            if (
-                _normalize_book_identity(row["title"]) == title_key
-                and (
-                    not author_key
-                    or _normalize_book_identity(row["author"]) == author_key
-                )
+            if _normalize_book_identity(row["title"]) == title_key and (
+                not author_key or _normalize_book_identity(row["author"]) == author_key
             ):
                 return dict(row)
         return None
 
     def _rebuild_imported_metadata_tool(self, catalog_id: int) -> Dict[str, Any]:
         tool = (
-            APP_ROOT
-            / "scripts"
-            / "electronic-library"
-            / "rebuild_library_metadata.py"
+            APP_ROOT / "scripts" / "electronic-library" / "rebuild_library_metadata.py"
         )
         result = subprocess.run(
             [
@@ -8543,9 +8177,7 @@ class ElectronicLibraryService:
                 )
             if rebind_existing_source:
                 txt80_kwargs["rebind_existing_source"] = True
-            return await self._import_authorized_txt80_book(
-                **txt80_kwargs
-            )
+            return await self._import_authorized_txt80_book(**txt80_kwargs)
         if provider == AUTHORIZED_XBIQUGE_PROVIDER:
             xbiquge_kwargs = {
                 "remote_id": remote_id,
@@ -8562,9 +8194,7 @@ class ElectronicLibraryService:
             if rebind_existing_source:
                 xbiquge_kwargs["rebind_existing_source"] = True
             if expected_latest_chapter:
-                xbiquge_kwargs["expected_latest_chapter"] = str(
-                    expected_latest_chapter
-                )
+                xbiquge_kwargs["expected_latest_chapter"] = str(expected_latest_chapter)
             return await self._import_authorized_xbiquge_book(**xbiquge_kwargs)
         if provider == LINOVELIB_PROVIDER:
             linovelib_kwargs = {
@@ -8598,9 +8228,7 @@ class ElectronicLibraryService:
             if rebind_existing_source:
                 shubaow_kwargs["rebind_existing_source"] = True
             if expected_latest_chapter:
-                shubaow_kwargs["expected_latest_chapter"] = str(
-                    expected_latest_chapter
-                )
+                shubaow_kwargs["expected_latest_chapter"] = str(expected_latest_chapter)
             return await self._import_authorized_shubaow_book(**shubaow_kwargs)
         if provider == AUTHORIZED_IXDZS_PROVIDER:
             ixdzs_kwargs = {
@@ -8702,25 +8330,25 @@ class ElectronicLibraryService:
         title = str(detail.get("title") or f"Project Gutenberg {remote_id}")
         author = "、".join(authors) or "作者未知"
         content = await asyncio.to_thread(self._download_public_text, text_url)
-        category, ai_classified, classification_reason = (
-            await self._classify_imported_book(
-                title=title,
-                author=author,
-                subjects=[
-                    str(value) for value in (detail.get("subjects") or [])
-                ],
-                sample=content,
-                ai_service=ai_service,
-            )
+        (
+            category,
+            ai_classified,
+            classification_reason,
+        ) = await self._classify_imported_book(
+            title=title,
+            author=author,
+            subjects=[str(value) for value in (detail.get("subjects") or [])],
+            sample=content,
+            ai_service=ai_service,
         )
         filename = (
             f"{self._safe_import_name(title, f'未命名-{remote_id}')}"
             f"__{self._safe_import_name(author, '作者未知', 60)}"
             f"__gutenberg-{remote_id}.txt"
         )
-        output_path = self.books_root / self._safe_import_name(
-            category, "未分类", 60
-        ) / filename
+        output_path = (
+            self.books_root / self._safe_import_name(category, "未分类", 60) / filename
+        )
         data = content.encode("utf-8")
         security_scan = await asyncio.to_thread(
             self.download_scanner.scan_bytes,
@@ -8783,9 +8411,7 @@ class ElectronicLibraryService:
         detail = await asyncio.to_thread(
             self.zlibrary_provider.detail, remote_id, source_ref
         )
-        raw = await asyncio.to_thread(
-            self.zlibrary_provider.download, detail
-        )
+        raw = await asyncio.to_thread(self.zlibrary_provider.download, detail)
         extension = str(detail.get("extension") or "").lower()
         security_scan = await asyncio.to_thread(
             self.download_scanner.scan_bytes,
@@ -8793,22 +8419,20 @@ class ElectronicLibraryService:
             extension=extension,
             source=AUTHORIZED_ZLIBRARY_PROVIDER,
         )
-        content = await asyncio.to_thread(
-            self._remote_bytes_to_text, raw, extension
-        )
+        content = await asyncio.to_thread(self._remote_bytes_to_text, raw, extension)
         title = str(detail.get("title") or f"Z-Library {remote_id}")
         author = str(detail.get("author") or "作者未知")
-        categories = [
-            str(value) for value in (detail.get("categories") or [])
-        ]
-        category, ai_classified, classification_reason = (
-            await self._classify_imported_book(
-                title=title,
-                author=author,
-                subjects=categories,
-                sample=content,
-                ai_service=ai_service,
-            )
+        categories = [str(value) for value in (detail.get("categories") or [])]
+        (
+            category,
+            ai_classified,
+            classification_reason,
+        ) = await self._classify_imported_book(
+            title=title,
+            author=author,
+            subjects=categories,
+            sample=content,
+            ai_service=ai_service,
         )
         source_book_id = str(
             detail.get("source_book_id")
@@ -8819,9 +8443,9 @@ class ElectronicLibraryService:
             f"__{self._safe_import_name(author, '作者未知', 60)}"
             f"__zlibrary-{self._safe_import_name(source_book_id, 'unknown', 40)}.txt"
         )
-        output_path = self.books_root / self._safe_import_name(
-            category, "未分类", 60
-        ) / filename
+        output_path = (
+            self.books_root / self._safe_import_name(category, "未分类", 60) / filename
+        )
         data = content.encode("utf-8")
         digest = hashlib.sha256(data).hexdigest()
         with _import_lock:
@@ -8835,11 +8459,13 @@ class ElectronicLibraryService:
                 author=author,
                 category=category,
                 detail_url=str(detail["detail_url"]),
-                file_url=urlparse(self.zlibrary_provider.base_url)._replace(
+                file_url=urlparse(self.zlibrary_provider.base_url)
+                ._replace(
                     path=str(detail["download_path"]),
                     query="",
                     fragment="",
-                ).geturl(),
+                )
+                .geturl(),
                 output_path=output_path,
                 sha256=digest,
             )
@@ -8928,39 +8554,35 @@ class ElectronicLibraryService:
             extension="txt",
             source=AUTHORIZED_TXT80_PROVIDER,
         )
-        content = await asyncio.to_thread(
-            self._remote_bytes_to_text, raw, "txt"
-        )
+        content = await asyncio.to_thread(self._remote_bytes_to_text, raw, "txt")
         content = LEGACY_LIBRARY_DOMAIN_RE.sub(
-            PUBLIC_DOMAIN,
+            "reader.example.com",
             content.replace(
                 LEGACY_LIBRARY_NOTICE,
                 PUBLIC_LIBRARY_NOTICE,
             ),
         ).replace(LEGACY_REBRANDED_NOTICE, PUBLIC_LIBRARY_NOTICE)
-        subjects = [
-            str(value) for value in (detail.get("categories") or [])
-        ]
-        category, ai_classified, classification_reason = (
-            await self._classify_imported_book(
-                title=title,
-                author=author,
-                subjects=subjects,
-                sample=content,
-                ai_service=ai_service,
-            )
+        subjects = [str(value) for value in (detail.get("categories") or [])]
+        (
+            category,
+            ai_classified,
+            classification_reason,
+        ) = await self._classify_imported_book(
+            title=title,
+            author=author,
+            subjects=subjects,
+            sample=content,
+            ai_service=ai_service,
         )
         filename = (
             f"{self._safe_import_name(title, f'未命名-{source_book_id}')}"
             f"__{self._safe_import_name(author, '作者未知', 60)}"
             f"__{self._safe_import_name(source_book_id, 'unknown', 40)}.txt"
         )
-        output_path = self.books_root / self._safe_import_name(
-            category, "未分类", 60
-        ) / filename
-        refresh_path = self._refresh_target_output_path(
-            refresh_existing_catalog_id
+        output_path = (
+            self.books_root / self._safe_import_name(category, "未分类", 60) / filename
         )
+        refresh_path = self._refresh_target_output_path(refresh_existing_catalog_id)
         if refresh_path:
             output_path = refresh_path
         data = content.encode("utf-8")
@@ -9033,9 +8655,7 @@ class ElectronicLibraryService:
         expected_latest_chapter: str = "",
         ai_service: Any,
     ) -> Dict[str, Any]:
-        source_ref = self.xbiquge_provider.validate_source_ref(
-            remote_id, source_ref
-        )
+        source_ref = self.xbiquge_provider.validate_source_ref(remote_id, source_ref)
         source_book_id = str(remote_id)
         source_id = f"xbiquge-{source_book_id}"
         existing = self._existing_done_catalog(source_id)
@@ -9072,9 +8692,7 @@ class ElectronicLibraryService:
                 "author": existing.get("author") or "",
                 "category": existing.get("category") or "",
                 "output_path": str(
-                    Path(str(existing["output_path"])).relative_to(
-                        self.library_root
-                    )
+                    Path(str(existing["output_path"])).relative_to(self.library_root)
                 ),
                 "sha256": existing.get("sha256") or "",
                 "status": "already_available",
@@ -9096,9 +8714,7 @@ class ElectronicLibraryService:
             re.sub(
                 r"\s+",
                 " ",
-                unicodedata.normalize(
-                    "NFKC", str(chapter.get("title") or "")
-                ),
+                unicodedata.normalize("NFKC", str(chapter.get("title") or "")),
             ).strip()
             for chapter in detail_chapters
         }
@@ -9107,9 +8723,7 @@ class ElectronicLibraryService:
             " ",
             unicodedata.normalize(
                 "NFKC",
-                str(detail_chapters[-1].get("title") or "")
-                if detail_chapters
-                else "",
+                str(detail_chapters[-1].get("title") or "") if detail_chapters else "",
             ),
         ).strip()
         if expected_latest and expected_latest not in normalized_chapter_titles:
@@ -9120,9 +8734,7 @@ class ElectronicLibraryService:
             )
         detail_title = str(detail.get("title") or f"新笔趣阁 {remote_id}")
         detail_author = str(detail.get("author") or "作者未知")
-        identity_match = self._existing_catalog_identity(
-            detail_title, detail_author
-        )
+        identity_match = self._existing_catalog_identity(detail_title, detail_author)
         if identity_match and not refresh_existing_catalog_id:
             cover = await self._sync_remote_catalog_cover(
                 catalog_id=int(identity_match["id"]),
@@ -9153,40 +8765,36 @@ class ElectronicLibraryService:
             extension="txt",
             source=AUTHORIZED_XBIQUGE_PROVIDER,
         )
-        content = await asyncio.to_thread(
-            self._remote_bytes_to_text, raw, "txt"
-        )
+        content = await asyncio.to_thread(self._remote_bytes_to_text, raw, "txt")
         title = detail_title
         author = detail_author
-        subjects = [
-            str(value) for value in (detail.get("categories") or [])
-        ]
+        subjects = [str(value) for value in (detail.get("categories") or [])]
         normalized_hint = str(category_hint or "").strip()
         if normalized_hint and normalized_hint != "未分类":
             category = normalized_hint
             ai_classified = False
             classification_reason = "沿用授权源站目录的标准分类"
         else:
-            category, ai_classified, classification_reason = (
-                await self._classify_imported_book(
-                    title=title,
-                    author=author,
-                    subjects=subjects,
-                    sample=content,
-                    ai_service=ai_service,
-                )
+            (
+                category,
+                ai_classified,
+                classification_reason,
+            ) = await self._classify_imported_book(
+                title=title,
+                author=author,
+                subjects=subjects,
+                sample=content,
+                ai_service=ai_service,
             )
         filename = (
             f"{self._safe_import_name(title, f'未命名-{source_book_id}')}"
             f"__{self._safe_import_name(author, '作者未知', 60)}"
             f"__{source_id}.txt"
         )
-        output_path = self.books_root / self._safe_import_name(
-            category, "未分类", 60
-        ) / filename
-        refresh_path = self._refresh_target_output_path(
-            refresh_existing_catalog_id
+        output_path = (
+            self.books_root / self._safe_import_name(category, "未分类", 60) / filename
         )
+        refresh_path = self._refresh_target_output_path(refresh_existing_catalog_id)
         if refresh_path:
             output_path = refresh_path
         data = content.encode("utf-8")
@@ -9278,9 +8886,7 @@ class ElectronicLibraryService:
         ai_service: Any,
     ) -> Dict[str, Any]:
         del ai_service
-        source_ref = self.linovelib_provider.validate_source_ref(
-            remote_id, source_ref
-        )
+        source_ref = self.linovelib_provider.validate_source_ref(remote_id, source_ref)
         source_book_id = str(remote_id)
         source_id = f"linovelib-{source_book_id}"
         allowed_hosts = {
@@ -9324,9 +8930,7 @@ class ElectronicLibraryService:
                 "author": existing.get("author") or "",
                 "category": existing.get("category") or "轻小说",
                 "output_path": str(
-                    Path(str(existing["output_path"])).relative_to(
-                        self.library_root
-                    )
+                    Path(str(existing["output_path"])).relative_to(self.library_root)
                 ),
                 "sha256": existing.get("sha256") or "",
                 "status": "already_available",
@@ -9374,9 +8978,7 @@ class ElectronicLibraryService:
             extension="txt",
             source=LINOVELIB_PROVIDER,
         )
-        content = await asyncio.to_thread(
-            self._remote_bytes_to_text, raw, "txt"
-        )
+        content = await asyncio.to_thread(self._remote_bytes_to_text, raw, "txt")
         normalized_hint = str(category_hint or "").strip()
         category = (
             normalized_hint
@@ -9407,9 +9009,7 @@ class ElectronicLibraryService:
                 catalog_id_override=refresh_existing_catalog_id or None,
                 rebind_source=rebind_existing_source,
             )
-        self.move_catalog_books(
-            catalog_ids=[catalog_id], target_library="fanqie"
-        )
+        self.move_catalog_books(catalog_ids=[catalog_id], target_library="fanqie")
         if defer_postprocess:
             metadata_rebuild = {
                 "status": "deferred",
@@ -9445,9 +9045,7 @@ class ElectronicLibraryService:
             "source_extension": "txt",
             "chapter_count": int(detail.get("chapter_count") or 0),
             "volume_count": int(detail.get("volume_count") or 1),
-            "volume_cover_count": int(
-                detail.get("volume_cover_count") or 0
-            ),
+            "volume_cover_count": int(detail.get("volume_cover_count") or 0),
             "illustration_count": int(detail.get("illustration_count") or 0),
             "volume_directory": str(book_directory.relative_to(self.library_root)),
             "download_mode": "按分卷保存封面、章节和插画，并合并总文件 TXT",
@@ -9522,13 +9120,15 @@ class ElectronicLibraryService:
         detail_chapters = list(detail.get("chapters") or [])
         normalized_titles = {
             re.sub(
-                r"\s+", " ",
+                r"\s+",
+                " ",
                 unicodedata.normalize("NFKC", str(chapter.get("title") or "")),
             ).strip()
             for chapter in detail_chapters
         }
         actual_latest = re.sub(
-            r"\s+", " ",
+            r"\s+",
+            " ",
             unicodedata.normalize(
                 "NFKC",
                 str(detail_chapters[-1].get("title") or "") if detail_chapters else "",
@@ -9568,23 +9168,25 @@ class ElectronicLibraryService:
             ai_classified = False
             classification_reason = "沿用授权源站目录的标准分类"
         else:
-            category, ai_classified, classification_reason = (
-                await self._classify_imported_book(
-                    title=title,
-                    author=author,
-                    subjects=subjects,
-                    sample=content,
-                    ai_service=ai_service,
-                )
+            (
+                category,
+                ai_classified,
+                classification_reason,
+            ) = await self._classify_imported_book(
+                title=title,
+                author=author,
+                subjects=subjects,
+                sample=content,
+                ai_service=ai_service,
             )
         filename = (
             f"{self._safe_import_name(title, f'未命名-{source_book_id}')}"
             f"__{self._safe_import_name(author, '作者未知', 60)}"
             f"__{source_id}.txt"
         )
-        output_path = self.books_root / self._safe_import_name(
-            category, "未分类", 60
-        ) / filename
+        output_path = (
+            self.books_root / self._safe_import_name(category, "未分类", 60) / filename
+        )
         refresh_path = self._refresh_target_output_path(refresh_existing_catalog_id)
         if refresh_path:
             output_path = refresh_path
@@ -9721,9 +9323,7 @@ class ElectronicLibraryService:
             extension="zip",
             source=AUTHORIZED_IXDZS_PROVIDER,
         )
-        content = await asyncio.to_thread(
-            self.ixdzs_provider.extract_text, archive
-        )
+        content = await asyncio.to_thread(self.ixdzs_provider.extract_text, archive)
         if not downloaded_text_matches_identity(content, title, author):
             raise ValueError("爱下电子书下载正文身份与详情不匹配")
         content = content.replace(
@@ -9736,16 +9336,16 @@ class ElectronicLibraryService:
             ai_classified = False
             classification_reason = "沿用授权源站目录的标准分类"
         else:
-            category, ai_classified, classification_reason = (
-                await self._classify_imported_book(
-                    title=title,
-                    author=author,
-                    subjects=[
-                        str(value) for value in detail.get("categories") or []
-                    ],
-                    sample=content,
-                    ai_service=ai_service,
-                )
+            (
+                category,
+                ai_classified,
+                classification_reason,
+            ) = await self._classify_imported_book(
+                title=title,
+                author=author,
+                subjects=[str(value) for value in detail.get("categories") or []],
+                sample=content,
+                ai_service=ai_service,
             )
         source_id = f"ixdzs-{remote_id}"
         filename = (
@@ -9753,12 +9353,10 @@ class ElectronicLibraryService:
             f"__{self._safe_import_name(author, '作者未知', 60)}"
             f"__{source_id}.txt"
         )
-        output_path = self.books_root / self._safe_import_name(
-            category, "未分类", 60
-        ) / filename
-        refresh_path = self._refresh_target_output_path(
-            refresh_existing_catalog_id
+        output_path = (
+            self.books_root / self._safe_import_name(category, "未分类", 60) / filename
         )
+        refresh_path = self._refresh_target_output_path(refresh_existing_catalog_id)
         if refresh_path:
             output_path = refresh_path
         data = content.encode("utf-8")
@@ -9868,9 +9466,7 @@ class ElectronicLibraryService:
                 "author": existing.get("author") or "",
                 "category": existing.get("category") or "",
                 "output_path": str(
-                    Path(str(existing["output_path"])).relative_to(
-                        self.library_root
-                    )
+                    Path(str(existing["output_path"])).relative_to(self.library_root)
                 ),
                 "sha256": existing.get("sha256") or "",
                 "status": "already_available",
@@ -9881,10 +9477,7 @@ class ElectronicLibraryService:
             }
         source_path = Path(source_path).expanduser().resolve()
         export_root = self.fanqie_downloader.export_root.resolve()
-        if (
-            not source_path.is_file()
-            or not source_path.is_relative_to(export_root)
-        ):
+        if not source_path.is_file() or not source_path.is_relative_to(export_root):
             raise ValueError("番茄导入文件必须来自受控下载器导出目录")
         extension = source_path.suffix.lower().lstrip(".")
         if extension not in {"txt", "epub"}:
@@ -9898,9 +9491,7 @@ class ElectronicLibraryService:
             extension=extension,
             source=FANQIE_DOWNLOADER_PROVIDER,
         )
-        content = await asyncio.to_thread(
-            self._remote_bytes_to_text, raw, extension
-        )
+        content = await asyncio.to_thread(self._remote_bytes_to_text, raw, extension)
         if not title or not author:
             stem = source_path.stem
             parsed_title, separator, parsed_author = stem.rpartition(" - ")
@@ -9909,28 +9500,26 @@ class ElectronicLibraryService:
             if not author:
                 author = parsed_author if separator else "作者未知"
         title = (
-            str(existing.get("title") or "").strip()
-            if existing
-            else title.strip()
+            str(existing.get("title") or "").strip() if existing else title.strip()
         ) or f"番茄作品 {book_id}"
         author = (
-            str(existing.get("author") or "").strip()
-            if existing
-            else author.strip()
+            str(existing.get("author") or "").strip() if existing else author.strip()
         ) or "作者未知"
         if existing:
             category = str(existing.get("category") or "未分类")
             ai_classified = False
             classification_reason = "更新现有番茄正文，保留原分类"
         else:
-            category, ai_classified, classification_reason = (
-                await self._classify_imported_book(
-                    title=title,
-                    author=author,
-                    subjects=["番茄小说", "线上扫榜选中作品"],
-                    sample=content,
-                    ai_service=ai_service,
-                )
+            (
+                category,
+                ai_classified,
+                classification_reason,
+            ) = await self._classify_imported_book(
+                title=title,
+                author=author,
+                subjects=["番茄小说", "线上扫榜选中作品"],
+                sample=content,
+                ai_service=ai_service,
             )
         source_id = f"fanqie-{book_id}"
         filename = (
@@ -9939,23 +9528,21 @@ class ElectronicLibraryService:
             f"__{source_id}.txt"
         )
         if existing and existing.get("output_path"):
-            output_path = Path(
-                str(existing["output_path"])
-            ).expanduser().resolve()
+            output_path = Path(str(existing["output_path"])).expanduser().resolve()
             if not _is_within(output_path, self.books_root):
                 raise ValueError("现有番茄正文路径超出电子书库范围")
         else:
-            output_path = self.books_root / self._safe_import_name(
-                category, "未分类", 60
-            ) / filename
+            output_path = (
+                self.books_root
+                / self._safe_import_name(category, "未分类", 60)
+                / filename
+            )
         data = content.encode("utf-8")
         digest = hashlib.sha256(data).hexdigest()
         detail_url = f"https://fanqienovel.com/page/{book_id}"
         with _import_lock:
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = output_path.with_suffix(
-                output_path.suffix + ".part"
-            )
+            temp_path = output_path.with_suffix(output_path.suffix + ".part")
             temp_path.write_bytes(data)
             temp_path.replace(output_path)
             catalog_id = self._insert_imported_catalog_row(
@@ -9968,7 +9555,9 @@ class ElectronicLibraryService:
                 output_path=output_path,
                 sha256=digest,
                 book_status=self.normalize_book_status(
-                    book_status or existing.get("book_status") if existing else book_status,
+                    book_status or existing.get("book_status")
+                    if existing
+                    else book_status,
                     default=SERIALIZATION_STATUS_ONGOING,
                 ),
             )
@@ -10178,14 +9767,11 @@ class ElectronicLibraryService:
                     continue
                 heading = READER_HEADING_LINE.fullmatch(text.strip())
                 if heading:
-                    labels.append(
-                        re.sub(r"\s+", "", heading.group("label"))
-                    )
+                    labels.append(re.sub(r"\s+", "", heading.group("label")))
         if not labels:
             raise ValueError("番茄完整下载未识别到章节，拒绝将残本加入书库")
         has_first_chapter = any(
-            re.fullmatch(r"第(?:0*1|一|壹)[章回节]", label)
-            for label in labels[:5]
+            re.fullmatch(r"第(?:0*1|一|壹)[章回节]", label) for label in labels[:5]
         )
         if not has_first_chapter:
             raise ValueError("番茄完整下载缺少第 1 章，拒绝将残本加入书库")
@@ -10196,18 +9782,12 @@ class ElectronicLibraryService:
         ]
         if numeric_chapters:
             missing = sorted(
-                set(range(1, max(numeric_chapters) + 1))
-                - set(numeric_chapters)
+                set(range(1, max(numeric_chapters) + 1)) - set(numeric_chapters)
             )
             if missing:
                 sample = "、".join(str(value) for value in missing[:8])
-                raise ValueError(
-                    f"番茄完整下载章节序号不连续，缺少第 {sample} 章"
-                )
-        if (
-            metadata_chapter_count
-            and len(labels) < metadata_chapter_count
-        ):
+                raise ValueError(f"番茄完整下载章节序号不连续，缺少第 {sample} 章")
+        if metadata_chapter_count and len(labels) < metadata_chapter_count:
             raise ValueError(
                 "番茄完整下载章节不全："
                 f"文件头标记 {metadata_chapter_count} 章，"
@@ -10237,9 +9817,26 @@ class ElectronicLibraryService:
                 terms.extend(expansions)
         stripped = normalized
         for stop in (
-            "书库中", "有没有", "是否有", "类似", "这类", "这种", "剧情",
-            "情节", "桥段", "小说", "作品", "哪些", "寻找", "查询", "参考",
-            "写法", "存在", "关于", "请问", "帮我",
+            "书库中",
+            "有没有",
+            "是否有",
+            "类似",
+            "这类",
+            "这种",
+            "剧情",
+            "情节",
+            "桥段",
+            "小说",
+            "作品",
+            "哪些",
+            "寻找",
+            "查询",
+            "参考",
+            "写法",
+            "存在",
+            "关于",
+            "请问",
+            "帮我",
         ):
             stripped = stripped.replace(stop, "")
         if len(stripped) >= 3:
@@ -10249,7 +9846,9 @@ class ElectronicLibraryService:
                     stripped[index : index + 4]
                     for index in range(0, min(len(stripped) - 3, 20), 3)
                 )
-        return list(dict.fromkeys(term for term in terms if len(term) >= 2))[:32], motif_tags
+        return list(dict.fromkeys(term for term in terms if len(term) >= 2))[
+            :32
+        ], motif_tags
 
     @staticmethod
     def _evidence_excerpt(content: str, terms: List[str], limit: int = 520) -> str:
@@ -10291,9 +9890,7 @@ class ElectronicLibraryService:
             }
         terms, motif_tags = self._plot_query_terms(question)
         expanded_terms = self._normalize_plot_expansion_terms(extra_terms or [])
-        expanded_groups = self._normalize_plot_expansion_groups(
-            extra_term_groups or []
-        )
+        expanded_groups = self._normalize_plot_expansion_groups(extra_term_groups or [])
         # trigram FTS 不索引两个汉字的词。组内二字词仍用于候选二次校验，
         # 同时补充少量“动作+对象”组合，避免为支持二字词而扫描 47 万段正文。
         group_pairs = (
@@ -10306,15 +9903,10 @@ class ElectronicLibraryService:
             else []
         )
         group_fts_terms = [
-            term
-            for group in expanded_groups
-            for term in group
-            if len(term) >= 3
+            term for group in expanded_groups for term in group if len(term) >= 3
         ]
         terms = list(
-            dict.fromkeys(
-                [*terms, *expanded_terms, *group_pairs, *group_fts_terms]
-            )
+            dict.fromkeys([*terms, *expanded_terms, *group_pairs, *group_fts_terms])
         )[:48]
         rows: Dict[int, Dict[str, Any]] = {}
         if mysql_plot:
@@ -10366,8 +9958,7 @@ class ElectronicLibraryService:
                 if fts_terms:
                     candidate_limit = 600 if expanded_groups else 120
                     match_query = " OR ".join(
-                        f'"{term.replace(chr(34), chr(34) * 2)}"'
-                        for term in fts_terms
+                        f'"{term.replace(chr(34), chr(34) * 2)}"' for term in fts_terms
                     )
                     try:
                         for row in conn.execute(
@@ -10418,17 +10009,13 @@ class ElectronicLibraryService:
             item["local_score"] += max(2, 20 - position // 8)
             if motif_overlap:
                 item["local_score"] += 35 * len(motif_overlap)
-            item["motif_tags"] = sorted(
-                set(item["motif_tags"]) | set(tags)
-            )
+            item["motif_tags"] = sorted(set(item["motif_tags"]) | set(tags))
             if len(item["evidence"]) < 2:
                 item["evidence"].append(
                     {
                         "location": row["location"],
                         "motif_tags": tags,
-                        "excerpt": self._evidence_excerpt(
-                            row["content"], terms
-                        ),
+                        "excerpt": self._evidence_excerpt(row["content"], terms),
                     }
                 )
 
@@ -10537,10 +10124,10 @@ class ElectronicLibraryService:
     ) -> bool:
         positions: List[List[int]] = []
         for group in groups:
+            group_positions = [content.find(term) for term in group if term in content]
             group_positions = [
-                content.find(term) for term in group if term in content
+                position for position in group_positions if position >= 0
             ]
-            group_positions = [position for position in group_positions if position >= 0]
             if not group_positions:
                 return False
             positions.append(group_positions)
@@ -10558,8 +10145,8 @@ class ElectronicLibraryService:
         prompt = (
             "把下面的中文网文剧情意图拆成必须同时满足的概念组，并给出正文短语。"
             "只返回 JSON："
-            "{\"groups\":[[\"动作近义词\"],[\"对象近义词\"]],"
-            "\"phrases\":[\"正文短语\"]}。"
+            '{"groups":[["动作近义词"],["对象近义词"]],'
+            '"phrases":["正文短语"]}。'
             "每组最多 4 词，允许 2 字词；phrases 最多 6 个、每个 3～12 字，"
             "用于粗召回。phrases 要覆盖剧情前因、动作、后果的常见正文表达，"
             "不要只机械拼接两组词；例如可写“仙子受伤”“救命之恩”“带回住处”。"
@@ -10595,7 +10182,7 @@ class ElectronicLibraryService:
                 "input_chars": len(prompt),
                 "error": "" if usable else "AI 未返回可用的概念组和短检索词",
             }
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             return {
                 "attempted": True,
                 "completed": False,
@@ -10610,9 +10197,7 @@ class ElectronicLibraryService:
     def _plot_evidence_text(results: List[Dict[str, Any]]) -> str:
         blocks: List[str] = []
         used_chars = 0
-        for index, item in enumerate(
-            results[:PLOT_AI_SUMMARY_MAX_BOOKS], start=1
-        ):
+        for index, item in enumerate(results[:PLOT_AI_SUMMARY_MAX_BOOKS], start=1):
             evidence = (item.get("evidence") or [{}])[0]
             excerpt = str(evidence.get("excerpt") or "")[:220]
             block = (
@@ -10688,8 +10273,7 @@ class ElectronicLibraryService:
                 answer = "AI 已扩展剧情同义词并回查本地索引，仍未找到足够证据。"
             elif ai_used:
                 answer = (
-                    "AI 已调用，但没有返回可用于本地索引的概念组；"
-                    "未发送任何书库正文。"
+                    "AI 已调用，但没有返回可用于本地索引的概念组；未发送任何书库正文。"
                 )
             else:
                 answer = (
@@ -10709,9 +10293,7 @@ class ElectronicLibraryService:
                 "estimated_input_tokens": max(1, ai_input_chars // 2)
                 if ai_input_chars
                 else 0,
-                "max_output_tokens": (
-                    PLOT_AI_EXPANSION_MAX_TOKENS if ai_calls else 0
-                ),
+                "max_output_tokens": (PLOT_AI_EXPANSION_MAX_TOKENS if ai_calls else 0),
             }
 
         evidence_text = self._plot_evidence_text(local["results"])
@@ -10748,10 +10330,8 @@ class ElectronicLibraryService:
             summary_succeeded = True
             ai_succeeded_calls += 1
             ai_used = True
-        except Exception as exc:
-            titles = "、".join(
-                f"《{item['title']}》" for item in local["results"][:6]
-            )
+        except RECOVERABLE_OPERATION_ERRORS as exc:
+            titles = "、".join(f"《{item['title']}》" for item in local["results"][:6])
             answer = (
                 f"本地索引找到了 {len(local['results'])} 本候选：{titles}。"
                 f"AI 归纳暂时不可用（{str(exc)[:120]}），可先查看证据并执行拆书确认。"
@@ -10780,11 +10360,7 @@ class ElectronicLibraryService:
             "estimated_input_tokens": max(1, ai_input_chars // 2),
             "max_output_tokens": (
                 PLOT_AI_SUMMARY_MAX_TOKENS
-                + (
-                    PLOT_AI_EXPANSION_MAX_TOKENS
-                    if ai_calls > 1
-                    else 0
-                )
+                + (PLOT_AI_EXPANSION_MAX_TOKENS if ai_calls > 1 else 0)
             ),
             "asked_at": _now(),
         }
@@ -10808,7 +10384,7 @@ class ElectronicLibraryService:
         try:
             value = json.loads(text)
             return value if isinstance(value, dict) else None
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             pass
         start = text.find("{")
         if start < 0:
@@ -10837,7 +10413,7 @@ class ElectronicLibraryService:
                     try:
                         value = json.loads(text[start : index + 1])
                         return value if isinstance(value, dict) else None
-                    except Exception:
+                    except RECOVERABLE_OPERATION_ERRORS:
                         return None
         return None
 
@@ -10857,14 +10433,18 @@ class ElectronicLibraryService:
                 continue
             try:
                 content = path.read_text(encoding="utf-8", errors="replace")[:180000]
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 continue
             matches = list(heading_pattern.finditer(content))
             for position, match in enumerate(matches):
                 chapter = int(match.group("chapter"))
                 if chapter <= 0:
                     continue
-                end = matches[position + 1].start() if position + 1 < len(matches) else len(content)
+                end = (
+                    matches[position + 1].start()
+                    if position + 1 < len(matches)
+                    else len(content)
+                )
                 block = content[match.start() : min(end, match.start() + 2400)].strip()
                 title = re.sub(
                     r"^\s*(?:#{1,6}\s*|[-*]\s*|\*{1,2})?",
@@ -10932,12 +10512,10 @@ class ElectronicLibraryService:
         detail_items.sort(key=lambda item: item["chapter"])
 
         catalog = "\n".join(
-            f"- 第{item['chapter']}章：{item['title'][:80]}"
-            for item in chapters[:400]
+            f"- 第{item['chapter']}章：{item['title'][:80]}" for item in chapters[:400]
         )
         details = "\n\n".join(
-            f"### 第{item['chapter']}章（{item['source']}）\n"
-            f"{item['content'][:650]}"
+            f"### 第{item['chapter']}章（{item['source']}）\n{item['content'][:650]}"
             for item in detail_items
         )
         evidence = "\n\n".join(
@@ -10987,9 +10565,7 @@ class ElectronicLibraryService:
 
         fallback_chapter = max(1, written_max + 1)
         if target_mode == "specified_chapter":
-            chapter_start = chapter_end = safe_int(
-                target_chapter, fallback_chapter
-            )
+            chapter_start = chapter_end = safe_int(target_chapter, fallback_chapter)
         elif target_mode == "plot_arc" and start_chapter:
             chapter_start = safe_int(start_chapter, fallback_chapter)
             chapter_end = safe_int(end_chapter, chapter_start)
@@ -11000,9 +10576,7 @@ class ElectronicLibraryService:
                 or fallback_chapter,
                 fallback_chapter,
             )
-            chapter_end = safe_int(
-                recommended.get("chapter_end"), chapter_start
-            )
+            chapter_end = safe_int(recommended.get("chapter_end"), chapter_start)
         chapter_start = max(1, chapter_start)
         chapter_end = max(chapter_start, chapter_end)
         chapter_end = min(chapter_end, chapter_start + 11)
@@ -11051,11 +10625,21 @@ class ElectronicLibraryService:
         if not isinstance(technique, dict):
             technique = {}
         return {
-            "judgment": str(raw.get("judgment") or "可作为候选剧情素材，但需彻底换素材重组")[:200],
-            "reason": str(raw.get("reason") or "按当前项目设定迁移母题和功能位，不复刻来源情节。")[:1200],
-            "adaptation_title": str(raw.get("adaptation_title") or f"剧情素材：{question[:30]}")[:120],
-            "material_summary": str(raw.get("material_summary") or requirement or question)[:1800],
-            "emotional_goal": str(raw.get("emotional_goal") or "形成铺垫、转折、兑现与新期待")[:800],
+            "judgment": str(
+                raw.get("judgment") or "可作为候选剧情素材，但需彻底换素材重组"
+            )[:200],
+            "reason": str(
+                raw.get("reason") or "按当前项目设定迁移母题和功能位，不复刻来源情节。"
+            )[:1200],
+            "adaptation_title": str(
+                raw.get("adaptation_title") or f"剧情素材：{question[:30]}"
+            )[:120],
+            "material_summary": str(
+                raw.get("material_summary") or requirement or question
+            )[:1800],
+            "emotional_goal": str(
+                raw.get("emotional_goal") or "形成铺垫、转折、兑现与新期待"
+            )[:800],
             "originality_boundary": str(
                 raw.get("originality_boundary")
                 or "只学习母题、节奏和功能位；禁止复制来源作品的人名、设定、专名、句子及具体桥段。"
@@ -11074,10 +10658,18 @@ class ElectronicLibraryService:
                 )[:120],
             },
             "technique_route": {
-                "hook": str(technique.get("hook") or "用具体信息差或选择压力收尾")[:700],
-                "payoff": str(technique.get("payoff") or "可指认铺垫 → 明确释放 → 角色与局势余波")[:700],
-                "expectation": str(technique.get("expectation") or "新增一笔可等待的期待债")[:700],
-                "rhythm": str(technique.get("rhythm") or "铺垫—加压—转折—兑现—冷却/新钩子")[:700],
+                "hook": str(technique.get("hook") or "用具体信息差或选择压力收尾")[
+                    :700
+                ],
+                "payoff": str(
+                    technique.get("payoff") or "可指认铺垫 → 明确释放 → 角色与局势余波"
+                )[:700],
+                "expectation": str(
+                    technique.get("expectation") or "新增一笔可等待的期待债"
+                )[:700],
+                "rhythm": str(
+                    technique.get("rhythm") or "铺垫—加压—转折—兑现—冷却/新钩子"
+                )[:700],
             },
             "chapter_beats": normalized_beats,
         }
@@ -11094,9 +10686,7 @@ class ElectronicLibraryService:
         )
 
     @staticmethod
-    def _find_project_chapter(
-        project_root: Path, chapter: int
-    ) -> Optional[Path]:
+    def _find_project_chapter(project_root: Path, chapter: int) -> Optional[Path]:
         """只在当前项目正文中定位中文主章节，避开隐藏目录和翻译副本。"""
         chapter_root = project_root / "正文"
         if not chapter_root.exists():
@@ -11114,7 +10704,11 @@ class ElectronicLibraryService:
             match = re.search(r"第0*(\d+)章", path.stem)
             if match and int(match.group(1)) == chapter:
                 matches.append(path)
-        return sorted(matches, key=lambda item: (len(item.parts), str(item)))[0] if matches else None
+        return (
+            sorted(matches, key=lambda item: (len(item.parts), str(item)))[0]
+            if matches
+            else None
+        )
 
     @staticmethod
     def _chapter_content_hash(content: str) -> str:
@@ -11134,19 +10728,23 @@ class ElectronicLibraryService:
         )
 
     @staticmethod
-    def _insert_after_anchor(
-        original: str, anchor: str, insert_text: str
-    ) -> str:
+    def _insert_after_anchor(original: str, anchor: str, insert_text: str) -> str:
         anchor = (anchor or "").strip()
         insert_text = (insert_text or "").strip()
         if not anchor or not insert_text:
             raise ValueError("AI 未返回可验证的插入锚点或新增正文")
-        positions = [match.start() for match in re.finditer(re.escape(anchor), original)]
+        positions = [
+            match.start() for match in re.finditer(re.escape(anchor), original)
+        ]
         if len(positions) != 1:
             raise ValueError("AI 返回的插入锚点无法在原文中唯一定位，请重新生成预览")
         end = positions[0] + len(anchor)
         separator_before = "\n\n"
-        separator_after = "\n\n" if end < len(original) and not original[end:].startswith("\n") else ""
+        separator_after = (
+            "\n\n"
+            if end < len(original) and not original[end:].startswith("\n")
+            else ""
+        )
         return (
             original[:end]
             + separator_before
@@ -11175,13 +10773,19 @@ class ElectronicLibraryService:
             raise ValueError("未知的剧情融入模式")
         if target_mode == "specified_chapter" and not target_chapter:
             raise ValueError("请填写要融入的章节")
-        if target_mode == "plot_arc" and start_chapter and end_chapter and end_chapter < start_chapter:
+        if (
+            target_mode == "plot_arc"
+            and start_chapter
+            and end_chapter
+            and end_chapter < start_chapter
+        ):
             raise ValueError("剧情段结束章节不能早于开始章节")
 
         local = self.search_plot_index(project_root, question, limit=12)
         selected_ids = {int(value) for value in catalog_ids[:3]}
         selected = [
-            item for item in local.get("results", [])
+            item
+            for item in local.get("results", [])
             if not selected_ids or int(item["catalog_id"]) in selected_ids
         ][:3]
         if not selected:
@@ -11207,25 +10811,25 @@ class ElectronicLibraryService:
         prompt = f"""你正在执行 oh-story / story-long-write 的“剧情素材重组与章节定位”步骤。
 
 用户问题：{question}
-用户额外需求：{requirement or '未补充，由你按项目基调判断'}
+用户额外需求：{requirement or "未补充，由你按项目基调判断"}
 目标模式：{target_mode}
 目标约束：{target_instruction}
 
 当前项目：
-- 书名：{context['profile'].get('title')}
-- 题材：{context['profile'].get('genre')}
-- 子风格：{context['profile'].get('substyle')}
-- 基调：{'、'.join(context['profile'].get('tone_tags') or [])}
-- 已完成正文最大章节：{context['written_max']}
+- 书名：{context["profile"].get("title")}
+- 题材：{context["profile"].get("genre")}
+- 子风格：{context["profile"].get("substyle")}
+- 基调：{"、".join(context["profile"].get("tone_tags") or [])}
+- 已完成正文最大章节：{context["written_max"]}
 
 章节目录：
-{context['chapter_catalog'] or '暂无可解析章节目录'}
+{context["chapter_catalog"] or "暂无可解析章节目录"}
 
 本地筛选后的相关细纲：
-{context['chapter_details'] or '暂无详细细纲'}
+{context["chapter_details"] or "暂无详细细纲"}
 
 电子书库的有限证据：
-{context['evidence']}
+{context["evidence"]}
 
 任务：
 1. 只抽象母题、冲突功能、节奏、情绪兑现、钩子与期待债；禁止复制来源作品的人名、设定、专名、句子及具体桥段。
@@ -11277,7 +10881,7 @@ class ElectronicLibraryService:
             ai_used = raw_plan is not None
             if raw_plan is None:
                 ai_error = "AI 返回格式无法解析，已生成保守兜底方案"
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             ai_error = f"AI 暂不可用，已生成保守兜底方案：{str(exc)[:160]}"
 
         normalized = self._normalize_plot_plan(
@@ -11325,7 +10929,9 @@ class ElectronicLibraryService:
             ),
             "created_at": created_at,
         }
-        _atomic_write_json(self._plot_adoption_dir(project_root) / f"{plan_id}.json", payload)
+        _atomic_write_json(
+            self._plot_adoption_dir(project_root) / f"{plan_id}.json", payload
+        )
         return payload
 
     async def preview_plot_adaptation(
@@ -11390,13 +10996,13 @@ class ElectronicLibraryService:
             )
             prompt = f"""你正在执行 story-long-write 的“剧情素材融入已有正文”步骤。
 
-项目：{plan.get('adaptation_title')}
-用户需求：{plan.get('requirement') or plan.get('question')}
-重组方案：{plan.get('material_summary')}
-情绪目标：{plan.get('emotional_goal')}
-原创边界：{plan.get('originality_boundary')}
+项目：{plan.get("adaptation_title")}
+用户需求：{plan.get("requirement") or plan.get("question")}
+重组方案：{plan.get("material_summary")}
+情绪目标：{plan.get("emotional_goal")}
+原创边界：{plan.get("originality_boundary")}
 本章功能节拍：{json.dumps(beat, ensure_ascii=False)}
-节奏/兑现/期待/钩子：{json.dumps(plan.get('technique_route') or {}, ensure_ascii=False)}
+节奏/兑现/期待/钩子：{json.dumps(plan.get("technique_route") or {}, ensure_ascii=False)}
 
 硬规则：
 1. 只能学习抽象母题、冲突功能和节奏，禁止复制来源作品的人名、设定、专名、句子和具体桥段。
@@ -11454,7 +11060,7 @@ class ElectronicLibraryService:
                         "diff": self._chapter_diff(chapter, original, revised),
                     }
                 )
-            except Exception as exc:
+            except RECOVERABLE_OPERATION_ERRORS as exc:
                 previews.append(
                     {
                         "chapter": chapter,
@@ -11469,9 +11075,7 @@ class ElectronicLibraryService:
             "apply_mode": apply_mode,
             "status": "ready" if ready_count else "binding_only",
             "ready_count": ready_count,
-            "unwritten_count": sum(
-                item["status"] == "unwritten" for item in previews
-            ),
+            "unwritten_count": sum(item["status"] == "unwritten" for item in previews),
             "chapters": previews,
             "created_at": _now(),
         }
@@ -11502,9 +11106,7 @@ class ElectronicLibraryService:
         project_root = project_root.expanduser().resolve()
         if not re.fullmatch(r"[a-f0-9]{12}", plan_id):
             raise KeyError("剧情融入方案不存在")
-        preview = _read_json(
-            self._plot_preview_path(project_root, plan_id), {}
-        )
+        preview = _read_json(self._plot_preview_path(project_root, plan_id), {})
         if not preview:
             raise ValueError("请先生成正文差异预览")
         ready = [
@@ -11531,7 +11133,7 @@ class ElectronicLibraryService:
                 raise ValueError(f"第{item.get('chapter')}章预览正文为空")
             resolved.append((item, chapter_path, current))
 
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         backup_root = (
             project_root
             / ".webnovel"
@@ -11549,9 +11151,7 @@ class ElectronicLibraryService:
                 temp_path = chapter_path.with_suffix(
                     chapter_path.suffix + f".{plan_id}.tmp"
                 )
-                temp_path.write_text(
-                    str(item["revised_content"]), encoding="utf-8"
-                )
+                temp_path.write_text(str(item["revised_content"]), encoding="utf-8")
                 temp_path.replace(chapter_path)
                 written.append(
                     {
@@ -11560,11 +11160,9 @@ class ElectronicLibraryService:
                         "backup_path": str(backup_path.relative_to(project_root)),
                     }
                 )
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             for item, chapter_path, current in resolved:
-                if any(
-                    entry["chapter"] == item.get("chapter") for entry in written
-                ):
+                if any(entry["chapter"] == item.get("chapter") for entry in written):
                     chapter_path.write_text(current, encoding="utf-8")
             raise
 
@@ -11620,32 +11218,32 @@ class ElectronicLibraryService:
         )
         technique = payload.get("technique_route") or {}
         material_path.write_text(
-            f"""# {payload.get('adaptation_title')}
+            f"""# {payload.get("adaptation_title")}
 
 > 状态：已绑定到第{start}～{end}章的 oh-story 章节生成链路
 > 技能路由：story-long-write / 剧情素材重组与章节定位
 
 ## 用户需求
 
-{payload.get('requirement') or payload.get('question')}
+{payload.get("requirement") or payload.get("question")}
 
 ## AI 辅助判断
 
-{payload.get('judgment')}
+{payload.get("judgment")}
 
-{payload.get('reason')}
+{payload.get("reason")}
 
 ## 重组后的剧情方案
 
-{payload.get('material_summary')}
+{payload.get("material_summary")}
 
 ## 情绪与技法
 
-- 情绪目标：{payload.get('emotional_goal')}
-- 节奏：{technique.get('rhythm')}
-- 爽感/情绪兑现：{technique.get('payoff')}
-- 期待债：{technique.get('expectation')}
-- 钩子：{technique.get('hook')}
+- 情绪目标：{payload.get("emotional_goal")}
+- 节奏：{technique.get("rhythm")}
+- 爽感/情绪兑现：{technique.get("payoff")}
+- 期待债：{technique.get("expectation")}
+- 钩子：{technique.get("hook")}
 
 ## 章节功能节拍
 
@@ -11653,7 +11251,7 @@ class ElectronicLibraryService:
 
 ## 原创边界
 
-{payload.get('originality_boundary')}
+{payload.get("originality_boundary")}
 
 ## 证据来源（仅供追溯，不得复制）
 
@@ -11697,8 +11295,7 @@ class ElectronicLibraryService:
         else:
             with self._catalog_connection() as conn:
                 columns = {
-                    str(row["name"])
-                    for row in conn.execute("PRAGMA table_info(books)")
+                    str(row["name"]) for row in conn.execute("PRAGMA table_info(books)")
                 }
                 book_status_select = (
                     "book_status"
@@ -11713,9 +11310,7 @@ class ElectronicLibraryService:
                     )
                 )
                 detail_url_select = (
-                    "detail_url"
-                    if "detail_url" in columns
-                    else "'' AS detail_url"
+                    "detail_url" if "detail_url" in columns else "'' AS detail_url"
                 )
                 row = conn.execute(
                     f"""
@@ -11737,17 +11332,15 @@ class ElectronicLibraryService:
             catalog_item.get("book_status"),
             default=(
                 SERIALIZATION_STATUS_ONGOING
-                if str(catalog_item.get("source_id") or "").lower().startswith(
-                    ("fanqie-", "xbiquge-", "shubaow-", "linovelib-")
-                )
+                if str(catalog_item.get("source_id") or "")
+                .lower()
+                .startswith(("fanqie-", "xbiquge-", "shubaow-", "linovelib-"))
                 else SERIALIZATION_STATUS_COMPLETED
             ),
         )
         item = dict(catalog_item)
         if using_mysql:
-            indexed = self.mysql_catalog.metadata_for_ids([book_id]).get(
-                int(book_id)
-            )
+            indexed = self.mysql_catalog.metadata_for_ids([book_id]).get(int(book_id))
             if indexed:
                 indexed_data = dict(indexed)
                 for key in (
@@ -11880,403 +11473,14 @@ class ElectronicLibraryService:
         return content.rstrip()
 
     @classmethod
-    def _reader_heading_candidates(
-        cls,
-        source_path: Path,
-    ) -> tuple[List[Dict[str, Any]], str, List[int]]:
-        """识别正文真实章节行，并避免把正文内重复标题当成新章节。
-
-        txt80 历史文件至少存在两类目录格式：
-        1. ``第一章 标题`` / ``第1章 标题``；
-        2. ``001 标题``，部分文件会在后段额外插入一份 ``第738章`` 标题。
-
-        旧实现只识别第一类，而且允许任意缩进，导致数字目录整段漏失、正文
-        内四空格重复标题又被二次切章。这里先分别收集两类候选，再用连续性
-        判断主目录格式；可靠的数字序列优先覆盖源站后加的零散标准标题。
-        """
-
-        named: List[Dict[str, Any]] = []
-        numeric_by_style: Dict[str, List[Dict[str, Any]]] = {
-            "numeric": [],
-            "bracket_number": [],
-            "body_number": [],
-            "suffix_number": [],
-        }
-        decorated_unnumbered: List[Dict[str, Any]] = []
-        with source_path.open("rb") as handle:
-            while True:
-                offset = handle.tell()
-                raw_line = handle.readline()
-                if not raw_line:
-                    break
-                decoded = raw_line.decode("utf-8", errors="replace").lstrip("\ufeff")
-                line = decoded.rstrip("\r\n")
-                stripped = line.strip()
-                if not stripped or len(stripped) > 220:
-                    continue
-
-                # 站点整理文本常把章节名在正文开头再缩进复述一遍。结构标题
-                # 通常顶格或至多两个空格，四空格以上的行按正文处理。
-                leading_spaces = len(line) - len(line.lstrip(" \t"))
-                if leading_spaces > 2:
-                    continue
-
-                match = READER_HEADING_LINE.fullmatch(stripped)
-                if match:
-                    title_prefix = stripped[match.end("label") :]
-                    if (
-                        match.group("unit") == "节"
-                        and title_prefix
-                        and not (
-                            title_prefix[0].isspace()
-                            or title_prefix[0] in ":：、，,；;。—-·."
-                        )
-                    ):
-                        # ``第一节课她就……`` is normal prose, not a
-                        # section heading.  Chapter/回 forms without a
-                        # separator remain supported for legacy TXT files.
-                        continue
-                    named.append(
-                        {
-                            "offset": offset,
-                            "label": re.sub(r"\s+", "", match.group("label")),
-                            "title": cls._clean_reader_title(match.group("title")),
-                        }
-                    )
-                    continue
-
-                match = READER_SPECIAL_HEADING_LINE.fullmatch(stripped)
-                if match:
-                    named.append(
-                        {
-                            "offset": offset,
-                            "label": re.sub(r"\s+", "", match.group("label")),
-                            "title": cls._clean_reader_title(match.group("title")),
-                            "special": True,
-                        }
-                    )
-                    continue
-
-                match = READER_BODY_NUMBER_HEADING_LINE.fullmatch(stripped)
-                if match:
-                    chapter_number = int(match.group("number"))
-                    prefix = cls._clean_reader_title(match.group("prefix"))
-                    extra_title = cls._clean_reader_title(match.group("title"))
-                    numeric_by_style["body_number"].append(
-                        {
-                            "offset": offset,
-                            "number": chapter_number,
-                            "label": f"第{chapter_number}章",
-                            "title": extra_title or f"{prefix}{chapter_number}",
-                            "high_confidence": True,
-                        }
-                    )
-                    continue
-
-                match = READER_BRACKET_NUMERIC_HEADING_LINE.fullmatch(stripped)
-                if match:
-                    chapter_number = int(match.group("number"))
-                    numeric_by_style["bracket_number"].append(
-                        {
-                            "offset": offset,
-                            "number": chapter_number,
-                            "label": f"第{chapter_number}章",
-                            "title": cls._clean_reader_title(
-                                match.group("title")
-                            ),
-                            "high_confidence": True,
-                        }
-                    )
-                    continue
-
-                match = READER_NUMERIC_HEADING_LINE.fullmatch(stripped)
-                if match:
-                    chapter_number = int(match.group("number"))
-                    title = cls._clean_reader_title(match.group("title"))
-                    structural_marker = bool(
-                        re.search(r"(?:章|回|节|[☆★◆◇●○◎※▶▷])", stripped)
-                    )
-                    numeric_by_style["numeric"].append(
-                        {
-                            "offset": offset,
-                            "number": chapter_number,
-                            "label": f"第{chapter_number}章",
-                            "title": title,
-                            "high_confidence": bool(
-                                structural_marker or title
-                            ),
-                        }
-                    )
-                    continue
-
-                match = READER_SUFFIX_NUMBER_HEADING_LINE.fullmatch(stripped)
-                if match:
-                    number_text = (
-                        match.group("bracket_number")
-                        or match.group("number")
-                    )
-                    chapter_number = int(number_text)
-                    base_title = cls._clean_reader_title(match.group("title"))
-                    if base_title and not base_title.isdigit():
-                        display_title = (
-                            f"{base_title}【{chapter_number}】"
-                            if match.group("bracket_number")
-                            else f"{base_title}{chapter_number}"
-                        )
-                        numeric_by_style["suffix_number"].append(
-                            {
-                                "offset": offset,
-                                "number": chapter_number,
-                                "label": f"第{chapter_number}章",
-                                "title": display_title,
-                                "base_title": base_title,
-                                "high_confidence": bool(
-                                    match.group("bracket_number")
-                                ),
-                            }
-                        )
-                    continue
-
-                match = READER_DECORATED_HEADING_LINE.fullmatch(stripped)
-                if match:
-                    title = cls._clean_reader_title(match.group("title"))
-                    if title:
-                        decorated_unnumbered.append(
-                            {
-                                "offset": offset,
-                                "title": title,
-                            }
-                        )
-
-        deduped_named: List[Dict[str, Any]] = []
-        for item in named:
-            previous = deduped_named[-1] if deduped_named else None
-            if (
-                previous
-                and previous["label"] == item["label"]
-                and previous["title"] == item["title"]
-                and int(item["offset"]) - int(previous["offset"]) <= 4096
-            ):
-                continue
-            deduped_named.append(item)
-
-        def candidate_runs(
-            candidates: List[Dict[str, Any]],
-        ) -> List[List[Dict[str, Any]]]:
-            """Return plausible monotonic chapter runs for one source style."""
-
-            runs: List[List[Dict[str, Any]]] = []
-            for start_index, first in enumerate(candidates):
-                if int(first["number"]) > 5:
-                    continue
-                run = [first]
-                previous_number = int(first["number"])
-                tail = candidates[start_index + 1 :]
-                for index, item in enumerate(tail):
-                    number = int(item["number"])
-                    if number <= previous_number:
-                        # A reset normally means a duplicated table of
-                        # contents or another volume.  Score runs separately
-                        # instead of silently keeping a dense TOC.
-                        if number <= 5 and len(run) >= 2:
-                            break
-                        continue
-                    if number - previous_number > 50:
-                        continue
-                    if number - previous_number > 1:
-                        # 更新公告偶尔被误标成后续章节号，例如第817章后先出现
-                        # “828.今天更新晚一点”，随后才是真正的第818章。
-                        has_closer_candidate = any(
-                            previous_number
-                            < int(candidate["number"])
-                            < number
-                            for candidate in tail[index + 1 : index + 65]
-                        )
-                        if has_closer_candidate:
-                            continue
-                    run.append(item)
-                    previous_number = number
-                runs.append(run)
-            return runs
-
-        def eligible_run(
-            run: List[Dict[str, Any]],
-        ) -> tuple[bool, float, int]:
-            if not run:
-                return False, 0.0, 0
-            numbers = [int(item["number"]) for item in run]
-            adjacent_steps = sum(
-                1
-                for previous, current in zip(numbers, numbers[1:])
-                if current - previous == 1
-            )
-            continuity = adjacent_steps / max(len(numbers) - 1, 1)
-            span = int(run[-1]["offset"]) - int(run[0]["offset"])
-            if len(run) >= 8:
-                return continuity >= 0.55, continuity, span
-            if len(run) >= 3:
-                return (
-                    numbers[0] <= 3
-                    and continuity >= 0.8
-                    and span >= 512
-                ), continuity, span
-            if len(run) == 2:
-                return (
-                    numbers == [1, 2]
-                    and span >= 512
-                ), continuity, span
-            stat_size = source_path.stat().st_size
-            return (
-                numbers[0] == 1
-                and bool(run[0].get("high_confidence"))
-                and int(run[0]["offset"]) <= 64 * 1024
-                and stat_size - int(run[0]["offset"]) >= 512
-            ), continuity, span
-
-        numeric_sequence: List[Dict[str, Any]] = []
-        numeric_style = "numeric"
-        numeric_score: tuple[int, float, int] = (0, 0.0, 0)
-        # Some legacy romance exports use local part numbers in the title,
-        # e.g. ``一夜风流1`` / ``一夜风流2`` followed by another title that
-        # restarts at 1.  Qualify each repeated base title independently,
-        # then combine those structural groups in file order.
-        suffix_groups: Dict[str, List[Dict[str, Any]]] = {}
-        for item in numeric_by_style["suffix_number"]:
-            suffix_groups.setdefault(str(item["base_title"]), []).append(item)
-        qualified_suffixes: List[Dict[str, Any]] = []
-        for items in suffix_groups.values():
-            runs = candidate_runs(items)
-            best_run = max(runs, key=len, default=[])
-            eligible, _continuity, _span = eligible_run(best_run)
-            if eligible or (
-                len(best_run) >= 2
-                and [int(item["number"]) for item in best_run[:2]] == [1, 2]
-            ):
-                qualified_suffixes.extend(best_run)
-        qualified_suffixes.sort(key=lambda item: int(item["offset"]))
-        if len(qualified_suffixes) >= 2:
-            numeric_sequence = [
-                {
-                    **item,
-                    "number": index,
-                    "label": f"第{index}章",
-                }
-                for index, item in enumerate(qualified_suffixes, start=1)
-            ]
-            numeric_style = "suffix_number"
-            numeric_score = (
-                len(numeric_sequence),
-                1.0,
-                int(numeric_sequence[-1]["offset"])
-                - int(numeric_sequence[0]["offset"]),
-            )
-
-        for style, candidates in numeric_by_style.items():
-            for run in candidate_runs(candidates):
-                eligible, continuity, span = eligible_run(run)
-                if not eligible:
-                    continue
-                score = (len(run), continuity, span)
-                if score > numeric_score:
-                    numeric_sequence = run
-                    numeric_style = style
-                    numeric_score = score
-
-        # Some exports use a decoration as the only chapter marker, for
-        # example ``☆、时医生``.  Accept it only when multiple markers span
-        # meaningful body content; this keeps ordinary bullet lists out.
-        if len(decorated_unnumbered) >= 2:
-            decorated_span = (
-                int(decorated_unnumbered[-1]["offset"])
-                - int(decorated_unnumbered[0]["offset"])
-            )
-            unique_titles = {
-                str(item["title"]) for item in decorated_unnumbered
-            }
-            minimum_span = 512 if len(decorated_unnumbered) == 2 else 1024
-            if (
-                decorated_span >= minimum_span
-                and len(unique_titles) >= min(len(decorated_unnumbered), 3)
-                and len(decorated_unnumbered) > len(numeric_sequence)
-            ):
-                numeric_sequence = [
-                    {
-                        **item,
-                        "number": index,
-                        "label": f"第{index}章",
-                    }
-                    for index, item in enumerate(
-                        decorated_unnumbered,
-                        start=1,
-                    )
-                ]
-                numeric_style = "decorated"
-                numeric_score = (
-                    len(numeric_sequence),
-                    1.0,
-                    decorated_span,
-                )
-
-        # Standard ``第X章`` headings are stronger evidence than isolated
-        # numeric body lines.  Long Fanqie exports can contain hundreds of
-        # standalone numbers (stats, dates, coordinates); when the named
-        # sequence overwhelmingly dominates, do not let those false numeric
-        # candidates replace the real chapter catalog.
-        if (
-            len(deduped_named) >= 8
-            and len(deduped_named) >= max(len(numeric_sequence) * 2, 8)
-        ):
-            return (
-                deduped_named,
-                "named",
-                [int(item["offset"]) for item in deduped_named],
-            )
-
-        if numeric_sequence:
-            numeric_numbers = {
-                int(item["number"]) for item in numeric_sequence
-            }
-            first_number = int(numeric_sequence[0]["number"])
-            last_number = int(numeric_sequence[-1]["number"])
-            merged = list(numeric_sequence)
-            for item in deduped_named:
-                if item.get("special"):
-                    merged.append(item)
-                    continue
-                chapter_number = _reader_label_number(item["label"])
-                if chapter_number is None:
-                    continue
-                if (
-                    chapter_number in numeric_numbers
-                    or chapter_number < first_number
-                    or chapter_number > last_number + 50
-                ):
-                    continue
-                merged.append({**item, "number": chapter_number})
-                numeric_numbers.add(chapter_number)
-            merged.sort(key=lambda item: int(item["offset"]))
-            boundaries = sorted(
-                {
-                    int(item["offset"])
-                    for item in [*merged, *deduped_named]
-                }
-            )
-            return merged, numeric_style, boundaries
-
-        return (
-            deduped_named,
-            "named",
-            [int(item["offset"]) for item in deduped_named],
-        )
-
     def _build_reader_index(
         self,
         book_id: int,
         source_path: Path,
     ) -> Dict[str, Any]:
         stat = source_path.stat()
-        headings, heading_style, boundary_offsets = (
-            self._reader_heading_candidates(source_path)
+        headings, heading_style, boundary_offsets = self._reader_heading_candidates(
+            source_path
         )
 
         sections: List[Dict[str, Any]] = []
@@ -12600,9 +11804,9 @@ class ElectronicLibraryService:
             raise KeyError("阅读章节不存在")
         with source_path.open("rb") as handle:
             handle.seek(int(chapter["start"]))
-            content = handle.read(
-                int(chapter["end"]) - int(chapter["start"])
-            ).decode("utf-8", errors="replace")
+            content = handle.read(int(chapter["end"]) - int(chapter["start"])).decode(
+                "utf-8", errors="replace"
+            )
         content = self._clean_reader_section_content(content)
         return {
             "id": int(chapter["id"]),
@@ -12635,7 +11839,7 @@ class ElectronicLibraryService:
             project = find_project_by_path(project_root) or {}
             project_id = str(project.get("id") or "")
             project_name = str(project.get("name") or project_name)
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             state = _read_json(project_root / ".webnovel" / "state.json", {})
             info = state.get("project_info") if isinstance(state, dict) else {}
             if isinstance(info, dict):
@@ -12659,9 +11863,7 @@ class ElectronicLibraryService:
         return {
             "schema_version": 1,
             "updated_at": str(payload.get("updated_at") or ""),
-            "links": [
-                item for item in links if isinstance(item, dict)
-            ],
+            "links": [item for item in links if isinstance(item, dict)],
         }
 
     def _register_project_deconstruction_link(
@@ -12676,9 +11878,7 @@ class ElectronicLibraryService:
     ) -> Dict[str, Any]:
         """Persist one project→global-book association and its book-level link."""
         project_root = project_root.expanduser().resolve()
-        if not project_root.is_dir() or not (
-            project_root / ".webnovel"
-        ).is_dir():
+        if not project_root.is_dir() or not (project_root / ".webnovel").is_dir():
             raise ValueError("当前路径不是有效的小说项目")
 
         output_dir = output_dir.expanduser().resolve()
@@ -12689,9 +11889,7 @@ class ElectronicLibraryService:
 
         project_reference_root = project_root / "拆文库"
         if project_reference_root.is_symlink():
-            raise ValueError(
-                "项目拆文库不能整目录软链到全局库，必须使用书级软链接"
-            )
+            raise ValueError("项目拆文库不能整目录软链到全局库，必须使用书级软链接")
         project_reference_root.mkdir(parents=True, exist_ok=True)
         if not _is_within(project_reference_root, project_root):
             raise ValueError("项目拆文库越过当前小说项目边界")
@@ -12706,17 +11904,13 @@ class ElectronicLibraryService:
                 link_path.unlink()
                 link_path.symlink_to(output_dir, target_is_directory=True)
         elif link_path.exists():
-            raise ValueError(
-                f"项目拆文目录存在同名实体，拒绝覆盖：{link_path.name}"
-            )
+            raise ValueError(f"项目拆文目录存在同名实体，拒绝覆盖：{link_path.name}")
         else:
             try:
                 link_path.symlink_to(output_dir, target_is_directory=True)
             except FileExistsError:
                 if not link_path.is_symlink():
-                    raise ValueError(
-                        f"项目拆文链接发生并发冲突：{link_path.name}"
-                    )
+                    raise ValueError(f"项目拆文链接发生并发冲突：{link_path.name}")
                 try:
                     same = os.path.samefile(link_path, output_dir)
                 except OSError:
@@ -12748,9 +11942,7 @@ class ElectronicLibraryService:
                 )
                 task_ids = [
                     str(value)
-                    for value in (
-                        (existing or {}).get("task_ids") or []
-                    )
+                    for value in ((existing or {}).get("task_ids") or [])
                     if str(value).strip()
                 ]
                 if task_id and task_id not in task_ids:
@@ -12774,8 +11966,7 @@ class ElectronicLibraryService:
                     "last_mode": str(mode or ""),
                     "last_association_reason": association_reason,
                     "first_linked_at": str(
-                        (existing or {}).get("first_linked_at")
-                        or current_time
+                        (existing or {}).get("first_linked_at") or current_time
                     ),
                     "last_linked_at": current_time,
                     "link_status": "linked",
@@ -12809,9 +12000,7 @@ class ElectronicLibraryService:
         include_paths: bool = True,
     ) -> Dict[str, Any]:
         selected_root = (
-            str(project_root.expanduser().resolve())
-            if project_root is not None
-            else ""
+            str(project_root.expanduser().resolve()) if project_root is not None else ""
         )
         registry = self._read_project_deconstruction_links()
         items: List[Dict[str, Any]] = []
@@ -12838,11 +12027,7 @@ class ElectronicLibraryService:
         return {
             "schema_version": 1,
             "total": len(items),
-            "project_root": (
-                selected_root or None
-                if include_paths
-                else None
-            ),
+            "project_root": (selected_root or None if include_paths else None),
             "items": items,
             "updated_at": registry.get("updated_at") or "",
         }
@@ -12853,17 +12038,15 @@ class ElectronicLibraryService:
         already_linked = 0
         skipped = 0
         errors: List[Dict[str, str]] = []
-        for task in reversed(self._list_managed_tasks(
-            self.global_deconstruction_root
-        )):
+        for task in reversed(self._list_managed_tasks(self.global_deconstruction_root)):
             task_id = str(task.get("id") or "")
             try:
-                project_root = Path(
-                    str(task.get("project_root") or "")
-                ).expanduser().resolve()
-                output_dir = Path(
-                    str(task.get("output_dir") or "")
-                ).expanduser().resolve()
+                project_root = (
+                    Path(str(task.get("project_root") or "")).expanduser().resolve()
+                )
+                output_dir = (
+                    Path(str(task.get("output_dir") or "")).expanduser().resolve()
+                )
                 if (
                     not task_id
                     or not project_root.is_dir()
@@ -12878,8 +12061,7 @@ class ElectronicLibraryService:
                     continue
                 link_path = project_root / "拆文库" / output_dir.name
                 was_linked = bool(
-                    link_path.is_symlink()
-                    and link_path.resolve() == output_dir
+                    link_path.is_symlink() and link_path.resolve() == output_dir
                 )
                 self._register_project_deconstruction_link(
                     project_root,
@@ -12887,9 +12069,7 @@ class ElectronicLibraryService:
                     task,
                     task_id=task_id,
                     mode=str(
-                        task.get("entry_mode")
-                        or task.get("requested_mode")
-                        or ""
+                        task.get("entry_mode") or task.get("requested_mode") or ""
                     ),
                     association_reason="historical_task_backfill",
                 )
@@ -12986,9 +12166,9 @@ class ElectronicLibraryService:
                 tokens.append(
                     f"{relative}:{self._cache_stat_token(output_dir / relative)}"
                 )
-            signatures[str(output_dir.expanduser().resolve())] = (
-                hashlib.sha256("\n".join(tokens).encode("utf-8")).hexdigest()
-            )
+            signatures[str(output_dir.expanduser().resolve())] = hashlib.sha256(
+                "\n".join(tokens).encode("utf-8")
+            ).hexdigest()
         return signatures
 
     def _deconstruction_cache_signature(
@@ -13002,9 +12182,7 @@ class ElectronicLibraryService:
         only stats the small set of files that signal task/progress changes.
         """
 
-        task_root = self._task_dir(
-            project_root or self.global_deconstruction_root
-        )
+        task_root = self._task_dir(project_root or self.global_deconstruction_root)
         tokens = [
             f"project:{project_root.expanduser().resolve() if project_root else ''}",
             self._cache_stat_token(self.project_deconstruction_links_path),
@@ -13077,9 +12255,7 @@ class ElectronicLibraryService:
         if cached:
             return copy.deepcopy(cached)
         cached = _read_json(self._deconstruction_cache_path(project_root), {})
-        if not isinstance(cached, dict) or not isinstance(
-            cached.get("result"), dict
-        ):
+        if not isinstance(cached, dict) or not isinstance(cached.get("result"), dict):
             return {}
         with self._deconstruction_cache_lock:
             self._deconstruction_status_cache[key] = copy.deepcopy(cached)
@@ -13098,7 +12274,7 @@ class ElectronicLibraryService:
         def refresh() -> None:
             try:
                 self.list_global_deconstructions(project_root)
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 # The stale snapshot remains authoritative until a later poll
                 # successfully refreshes it; never fail the dashboard thread.
                 pass
@@ -13140,20 +12316,14 @@ class ElectronicLibraryService:
         )
         signature_changed = cached.get("signature") != signature
         if signature_changed:
-            cached_artifact_signatures = (
-                cached.get("artifact_signatures") or {}
-            )
-            current_artifact_signatures = (
-                self._deconstruction_artifact_signatures()
-            )
-            same_artifact_set = (
-                set(cached_artifact_signatures)
-                == set(current_artifact_signatures)
+            cached_artifact_signatures = cached.get("artifact_signatures") or {}
+            current_artifact_signatures = self._deconstruction_artifact_signatures()
+            same_artifact_set = set(cached_artifact_signatures) == set(
+                current_artifact_signatures
             )
             existing_artifact_changed = bool(
                 same_artifact_set
-                and cached_artifact_signatures
-                != current_artifact_signatures
+                and cached_artifact_signatures != current_artifact_signatures
             )
             if existing_artifact_changed:
                 self._schedule_deconstruction_cache_refresh(project_root)
@@ -13187,16 +12357,9 @@ class ElectronicLibraryService:
             task_status in {"paused", "error"}
             and task.get("pause_reason") == "artifact_validation_failed"
         )
-        if not (
-            task_status == "completed"
-            or validation_paused
-        ):
+        if not (task_status == "completed" or validation_paused):
             return projected
-        entry_mode = str(
-            task.get("entry_mode")
-            or task.get("requested_mode")
-            or ""
-        )
+        entry_mode = str(task.get("entry_mode") or task.get("requested_mode") or "")
         if entry_mode and entry_mode != "full":
             return projected
         output_raw = str(task.get("output_dir") or "").strip()
@@ -13246,14 +12409,10 @@ class ElectronicLibraryService:
             projected["status"] = "paused"
             projected["can_resume"] = True
             projected["pause_reason"] = "artifact_validation_failed"
-            projected["current_stage"] = (
-                task.get("current_stage")
-                or projected.get("current_stage")
+            projected["current_stage"] = task.get("current_stage") or projected.get(
+                "current_stage"
             )
-            projected["message"] = (
-                task.get("message")
-                or projected.get("message")
-            )
+            projected["message"] = task.get("message") or projected.get("message")
         return projected
 
     def _reconcile_stalled_managed_task(
@@ -13288,20 +12447,14 @@ class ElectronicLibraryService:
                 {
                     "status": "running",
                     "can_resume": False,
-                    "message": (
-                        "OpenClaw 主会话正在等待同模型子会话完成并回传"
-                    ),
+                    "message": ("OpenClaw 主会话正在等待同模型子会话完成并回传"),
                     "pid": None,
                     "codex_pid": None,
                     "openclaw_lineage": {
                         "active": True,
                         "root_status": lineage.get("root_status") or "",
-                        "session_count": len(
-                            lineage.get("lineage_keys") or []
-                        ),
-                        "active_count": len(
-                            lineage.get("active_keys") or []
-                        ),
+                        "session_count": len(lineage.get("lineage_keys") or []),
+                        "active_count": len(lineage.get("active_keys") or []),
                         "checked_at": _now(),
                     },
                     "updated_at": _now(),
@@ -13310,17 +12463,14 @@ class ElectronicLibraryService:
             if persist:
                 task_id = str(reconciled.get("id") or "")
                 if re.fullmatch(r"[a-f0-9]{12}", task_id):
-                    task_path = (
-                        self._task_dir(project_root) / f"{task_id}.json"
-                    )
+                    task_path = self._task_dir(project_root) / f"{task_id}.json"
                     # Status polling can be concurrent.  Serialize the
                     # supervisor launch and re-read the PID under the lock so
                     # one live Gateway lineage gets exactly one local watcher.
                     with _task_reconcile_lock:
                         latest = _read_json(task_path, reconciled)
-                        if (
-                            _pid_is_alive(latest.get("pid"))
-                            or _pid_is_alive(latest.get("codex_pid"))
+                        if _pid_is_alive(latest.get("pid")) or _pid_is_alive(
+                            latest.get("codex_pid")
                         ):
                             return latest
                         _atomic_write_json(task_path, reconciled)
@@ -13374,9 +12524,8 @@ class ElectronicLibraryService:
         if not output_value:
             return task
         output_dir = Path(output_value).expanduser().resolve()
-        if (
-            not output_dir.is_dir()
-            or not _is_within(output_dir, self.global_deconstruction_root)
+        if not output_dir.is_dir() or not _is_within(
+            output_dir, self.global_deconstruction_root
         ):
             return task
         preferred_pipeline = str(task.get("resolved_pipeline") or "")
@@ -13391,10 +12540,7 @@ class ElectronicLibraryService:
             )
         except (OSError, UnicodeError):
             return task
-        if (
-            checkpoint.get("status") != "paused"
-            or not checkpoint.get("can_resume")
-        ):
+        if checkpoint.get("status") != "paused" or not checkpoint.get("can_resume"):
             return task
 
         if automatic_full_recovery and persist:
@@ -13403,9 +12549,8 @@ class ElectronicLibraryService:
                 task_path = self._task_dir(project_root) / f"{task_id}.json"
                 with _task_reconcile_lock:
                     latest = _read_json(task_path, task)
-                    if (
-                        _pid_is_alive(latest.get("pid"))
-                        or _pid_is_alive(latest.get("codex_pid"))
+                    if _pid_is_alive(latest.get("pid")) or _pid_is_alive(
+                        latest.get("codex_pid")
                     ):
                         return latest
                     if not _automatic_full_pipeline_needs_recovery(latest):
@@ -13420,10 +12565,7 @@ class ElectronicLibraryService:
                             "status": "queued",
                             "can_resume": False,
                             "automatic_full_pipeline": True,
-                            "resume_count": int(
-                                recovered.get("resume_count") or 0
-                            )
-                            + 1,
+                            "resume_count": int(recovered.get("resume_count") or 0) + 1,
                             "automatic_recovery_count": int(
                                 recovered.get("automatic_recovery_count") or 0
                             )
@@ -13469,8 +12611,7 @@ class ElectronicLibraryService:
                 "message": checkpoint.get("message")
                 or "原执行进程已退出，已保留现有产物与会话断点",
                 "can_resume": True,
-                "pause_reason": checkpoint.get("pause_reason")
-                or "stalled_checkpoint",
+                "pause_reason": checkpoint.get("pause_reason") or "stalled_checkpoint",
                 "resume_strategy": (
                     "same_session" if same_session else "adopt_checkpoint"
                 ),
@@ -13478,8 +12619,7 @@ class ElectronicLibraryService:
                 "total_chapters": checkpoint.get("total_chapters", 0),
                 "pipeline_stages": checkpoint.get("pipeline_stages") or [],
                 "progress_path": checkpoint.get("progress_path") or "",
-                "progress_source": checkpoint.get("progress_source")
-                or "artifacts",
+                "progress_source": checkpoint.get("progress_source") or "artifacts",
                 "pid": None,
                 "codex_pid": None,
                 "updated_at": _now(),
@@ -13524,848 +12664,6 @@ class ElectronicLibraryService:
                     progress += weight * 0.25
         return min(99, max(0, round(progress)))
 
-    def _deconstruction_artifact_item(
-        self,
-        output_dir: Path,
-        preferred_pipeline: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        progress_path = output_dir / "_progress.md"
-        short_meta_path = output_dir / "_meta.json"
-        progress_text = ""
-        if progress_path.is_file():
-            progress_text = progress_path.read_text(
-                encoding="utf-8", errors="replace"
-            )
-        name = output_dir.name
-        source_id = ""
-        title = name
-        if "__" in name:
-            title, source_id = name.rsplit("__", 1)
-        heading = re.search(r"^#\s*拆解进度[：:]\s*(.+?)\s*$", progress_text, re.M)
-        if heading:
-            title = heading.group(1).strip()
-
-        short_meta = read_short_meta(output_dir)
-        use_short_meta = bool(short_meta)
-        if short_meta and preferred_pipeline == "long":
-            use_short_meta = False
-        elif short_meta and preferred_pipeline is None and progress_path.is_file():
-            try:
-                use_short_meta = (
-                    short_meta_path.stat().st_mtime
-                    >= progress_path.stat().st_mtime
-                )
-            except OSError:
-                pass
-        if use_short_meta:
-            stages = short_pipeline_stages(short_meta)
-            contract_errors = validate_short_output_contract(output_dir)
-            full_completed = not contract_errors
-            structure_counts = (
-                short_meta.get("structure_counts")
-                if isinstance(short_meta.get("structure_counts"), dict)
-                else {}
-            )
-            structure_beat_count = int(
-                structure_counts.get("beats") or 0
-            )
-            plot_node_count = 0
-            plot_nodes_path = output_dir / "情节节点.md"
-            if plot_nodes_path.is_file():
-                try:
-                    plot_node_count = len(
-                        re.findall(
-                            r"(?m)^N\d+\b",
-                            plot_nodes_path.read_text(
-                                encoding="utf-8",
-                                errors="replace",
-                            ),
-                        )
-                    )
-                except OSError:
-                    plot_node_count = 0
-            completed_stage_count = sum(
-                item.get("status") == "completed" for item in stages
-            )
-            current = next(
-                (item for item in stages if item.get("status") == "running"),
-                None,
-            ) or next(
-                (item for item in stages if item.get("status") == "pending"),
-                None,
-            )
-            tracked_paths = [
-                path
-                for path in (
-                    short_meta_path,
-                    output_dir / "拆文报告.md",
-                    output_dir / "情节节点.md",
-                    output_dir / "写作手法.md",
-                )
-                if path.exists()
-            ]
-            updated_timestamp = max(
-                (path.stat().st_mtime for path in tracked_paths),
-                default=output_dir.stat().st_mtime,
-            )
-            return {
-                "id": f"global-{hashlib.sha1(str(output_dir.resolve()).encode()).hexdigest()[:12]}",
-                "origin": "command_line",
-                "managed_task_id": None,
-                "book_id": None,
-                "catalog_id": None,
-                "source_id": source_id,
-                "title": title,
-                "author": "",
-                "category": "",
-                "output_dir": str(output_dir.resolve()),
-                "requested_mode": "full",
-                "resolved_pipeline": "short",
-                "skill": "story-short-analyze",
-                "status": "completed" if full_completed else "paused",
-                "progress": (
-                    100
-                    if full_completed
-                    else min(95, 12 + completed_stage_count * 16)
-                ),
-                "current_stage": (
-                    "全篇结构拆解已完成"
-                    if full_completed
-                    else (
-                        f"等待继续 Stage {current['stage']} · {current['name']}"
-                        if current
-                        else "短篇产物验收未通过"
-                    )
-                ),
-                "message": (
-                    (
-                        "story-short-analyze Stage 2–6 已覆盖完整原文；"
-                        f"{structure_beat_count} 段主结构不是章节数"
-                    )
-                    if full_completed
-                    else "已有短篇拆书断点，但产物契约尚未全部通过"
-                ),
-                "completion_label": (
-                    "story-short-analyze Stage 2–6 全篇结构拆解已完成"
-                    if full_completed
-                    else ""
-                ),
-                "created_at": datetime.fromtimestamp(
-                    output_dir.stat().st_ctime
-                ).isoformat(timespec="seconds"),
-                "updated_at": datetime.fromtimestamp(
-                    updated_timestamp
-                ).isoformat(timespec="seconds"),
-                "pid": None,
-                "steps": [
-                    {
-                        "id": f"stage-{item['stage']}",
-                        "name": f"Stage {item['stage']} · {item['name']}",
-                        "status": item["status"],
-                    }
-                    for item in stages
-                ],
-                "pipeline_stages": stages,
-                "artifact_level": "full" if full_completed else "in_progress",
-                "has_quick_preview": False,
-                "has_full_report": full_completed,
-                "completed_chapters": 0,
-                "total_chapters": 0,
-                "coverage_scope": "whole_text",
-                "structure_beat_count": structure_beat_count,
-                "plot_node_count": plot_node_count,
-                "progress_path": str(short_meta_path.resolve()),
-                "progress_source": "_meta.json",
-                "global_reuse": full_completed,
-                "can_resume": not full_completed,
-                "pause_reason": (
-                    None if full_completed else "artifact_validation_failed"
-                ),
-                "contract_validation": {
-                    "ok": full_completed,
-                    "errors": contract_errors,
-                    "skill": "story-short-analyze",
-                },
-                "word_count": int(short_meta.get("word_count") or 0),
-            }
-
-        stages = self._progress_stage_rows(progress_text)
-        stage_two = next(
-            (item for item in stages if item.get("stage") == 2), {}
-        )
-        chapter_match = re.search(
-            r"(\d+)\s*/\s*(\d+)", str(stage_two.get("status_text") or "")
-        )
-        completed_chapters = int(chapter_match.group(1)) if chapter_match else 0
-        total_chapters = int(chapter_match.group(2)) if chapter_match else 0
-        chapter_summary_count, boundary_total, _ = long_summary_coverage(
-            output_dir,
-            progress_text,
-        )
-        if not boundary_total:
-            # Compatibility for legacy CLI artifacts created before schema v2
-            # introduced the immutable boundary table. New/background runs
-            # always use exact boundary-to-file matching above.
-            chapter_summary_count = sum(
-                1
-                for path in (output_dir / "章节").glob("第*章_摘要.md")
-                if path.is_file()
-            )
-        completed_chapters = max(completed_chapters, chapter_summary_count)
-        if boundary_total:
-            total_chapters = boundary_total
-        elif not total_chapters:
-            scope_match = re.search(r"Stage 2 只做第\s*1-(\d+)\s*章", progress_text)
-            count_match = re.search(r"^- 章节数[：:]\s*(\d+)", progress_text, re.M)
-            total_chapters = int(
-                (scope_match or count_match).group(1)
-            ) if (scope_match or count_match) else chapter_summary_count
-
-        _, final_state = long_progress_state(progress_text)
-        has_quick_preview = (output_dir / "快速预览.md").is_file()
-        has_full_report = (output_dir / "拆文报告.md").is_file()
-        full_contract_errors = validate_long_output_contract(output_dir, "full")
-        full_completed = not full_contract_errors
-        completion_claimed = final_state in {
-            "completed",
-            "completed_with_errors",
-        }
-        failed_artifact_stages = (
-            long_contract_failed_stages(full_contract_errors)
-            if completion_claimed
-            else set()
-        )
-        if failed_artifact_stages:
-            stages = project_long_contract_failures(
-                stages,
-                full_contract_errors,
-            )
-        tracked_paths = [
-            path
-            for path in (
-                progress_path,
-                output_dir / "快速预览.md",
-                output_dir / "拆文报告.md",
-            )
-            if path.exists()
-        ]
-        updated_timestamp = max(
-            (path.stat().st_mtime for path in tracked_paths),
-            default=output_dir.stat().st_mtime,
-        )
-        has_running_stage = any(item.get("status") == "running" for item in stages)
-        stale_running_stage = bool(
-            has_running_stage
-            and datetime.now().timestamp() - updated_timestamp
-            >= DECONSTRUCTION_STALE_SECONDS
-        )
-        can_resume = False
-        pause_reason: Optional[str] = None
-        if full_completed:
-            status = "completed"
-            current_stage = "完整拆书已完成"
-            message = "全局完整拆书成果可供所有项目复用"
-        elif final_state == "paused_after_stage1":
-            status = "paused"
-            current_stage = "黄金三章已完成"
-            message = "已停靠在黄金三章，可继续完整拆书"
-        elif failed_artifact_stages:
-            status = "paused"
-            can_resume = True
-            pause_reason = "artifact_validation_failed"
-            failed_stage = min(failed_artifact_stages)
-            failed_row = next(
-                (
-                    item
-                    for item in stages
-                    if int(item.get("stage", -1)) == failed_stage
-                ),
-                {},
-            )
-            current_stage = (
-                f"Stage {failed_stage} · "
-                f"{failed_row.get('name') or '产物'}验收未通过"
-            )
-            message = "；".join(full_contract_errors[:3])
-        elif stale_running_stage:
-            status = "paused"
-            can_resume = True
-            pause_reason = "stalled_checkpoint"
-            current = next(
-                (item for item in stages if item.get("status") == "running"),
-                None,
-            )
-            current_stage = (
-                f"已停滞于 Stage {current['stage']} · {current['name']}"
-                if current
-                else "拆书任务已停滞"
-            )
-            message = (
-                f"已有 {completed_chapters}/{total_chapters} 章成果，"
-                "当前无执行进程，可从现有断点接管继续"
-                if total_chapters
-                else "当前无执行进程，可从现有 OH-Story 断点接管继续"
-            )
-        elif has_running_stage:
-            status = "running"
-            current = next(
-                (item for item in stages if item.get("status") == "running"),
-                None,
-            )
-            current_stage = (
-                f"Stage {current['stage']} · {current['name']}"
-                if current
-                else "拆书流程进行中"
-            )
-            message = (
-                f"已完成 {completed_chapters}/{total_chapters} 章"
-                if total_chapters
-                else "命令行 / 外部任务正在持续写入全局拆书库"
-            )
-        elif final_state == "pending":
-            status = "paused"
-            can_resume = True
-            pause_reason = "stalled_checkpoint"
-            current = next(
-                (item for item in stages if item.get("status") == "pending"),
-                None,
-            )
-            current_stage = (
-                f"等待继续 Stage {current['stage']} · {current['name']}"
-                if current
-                else "拆书已暂停，可继续完整拆书"
-            )
-            message = (
-                f"已有 {completed_chapters}/{total_chapters} 章成果，可从现有断点继续"
-                if total_chapters
-                else "已有部分拆书产物，可从现有断点继续"
-            )
-        elif has_quick_preview:
-            status = "paused"
-            can_resume = True
-            pause_reason = "paused_after_stage1"
-            current_stage = "黄金三章已完成"
-            message = "已有黄金三章成果，等待继续完整拆书"
-        else:
-            status = "discovered"
-            current_stage = "已发现拆书目录"
-            message = "等待可识别的 oh-story 拆书产物"
-
-        progress = self._deconstruction_progress(
-            stages,
-            completed_chapters=completed_chapters,
-            total_chapters=total_chapters,
-            full_completed=full_completed,
-        )
-        artifact_level = (
-            "full"
-            if full_completed
-            else ("in_progress" if status == "running" else ("scan" if has_quick_preview else "none"))
-        )
-        return {
-            "id": f"global-{hashlib.sha1(str(output_dir.resolve()).encode()).hexdigest()[:12]}",
-            "origin": "command_line",
-            "managed_task_id": None,
-            "book_id": None,
-            "catalog_id": None,
-            "source_id": source_id,
-            "title": title,
-            "author": "",
-            "category": "",
-            "output_dir": str(output_dir.resolve()),
-            "requested_mode": "full" if status == "running" else artifact_level,
-            "resolved_pipeline": "long",
-            "skill": "story-long-analyze",
-            "status": status,
-            "progress": progress,
-            "current_stage": current_stage,
-            "message": message,
-            "completion_label": (
-                "story-long-analyze Stage 0–6 已验收完成"
-                if full_completed
-                else ""
-            ),
-            "created_at": datetime.fromtimestamp(
-                output_dir.stat().st_ctime
-            ).isoformat(timespec="seconds"),
-            "updated_at": datetime.fromtimestamp(
-                updated_timestamp
-            ).isoformat(timespec="seconds"),
-            "pid": None,
-            "steps": [
-                {
-                    "id": f"stage-{item['stage']}",
-                    "name": f"Stage {item['stage']} · {item['name']}",
-                    "status": item["status"],
-                }
-                for item in stages
-            ],
-            "pipeline_stages": stages,
-            "artifact_level": artifact_level,
-            "has_quick_preview": has_quick_preview,
-            "has_full_report": full_completed,
-            "completed_chapters": completed_chapters,
-            "total_chapters": total_chapters,
-            "progress_path": str(progress_path.resolve()) if progress_path.exists() else "",
-            "progress_source": "_progress.md" if progress_path.exists() else "artifacts",
-            "global_reuse": full_completed or has_quick_preview,
-            "can_resume": can_resume,
-            "pause_reason": pause_reason,
-            "contract_validation": {
-                "ok": full_completed,
-                "errors": full_contract_errors,
-                "skill": "story-long-analyze",
-            },
-            "resume_strategy": (
-                "adopt_checkpoint" if can_resume else None
-            ),
-        }
-
-    def list_global_deconstructions(
-        self, project_root: Optional[Path] = None
-    ) -> Dict[str, Any]:
-        self.global_deconstruction_root.mkdir(parents=True, exist_ok=True)
-        task_project_root = project_root or self.global_deconstruction_root
-        managed_tasks = [
-            self._reconcile_stalled_managed_task(
-                task_project_root,
-                task,
-                persist=True,
-            )
-            for task in self._list_managed_tasks(
-                task_project_root,
-                enrich_artifacts=False,
-            )
-        ]
-        latest_task_by_output: Dict[str, Dict[str, Any]] = {}
-        for task in managed_tasks:
-            output_key = str(
-                Path(task.get("output_dir") or self.global_deconstruction_root)
-                .expanduser()
-                .resolve()
-            )
-            latest_task_by_output.setdefault(output_key, task)
-
-        cached = self._load_deconstruction_cache(project_root)
-        cached_artifact_signatures = cached.get("artifact_signatures") or {}
-        current_artifact_signatures = self._deconstruction_artifact_signatures()
-        cached_artifacts_by_output = {
-            str(item.get("output_dir") or ""): item
-            for item in cached.get("artifact_items") or []
-            if isinstance(item, dict) and item.get("output_dir")
-        }
-        items: List[Dict[str, Any]] = []
-        artifact_items: List[Dict[str, Any]] = []
-        for output_dir in self.global_deconstruction_root.iterdir():
-            if not output_dir.is_dir() or output_dir.name.startswith("."):
-                continue
-            try:
-                output_key = str(output_dir.expanduser().resolve())
-                preferred_pipeline = str(
-                    latest_task_by_output.get(output_key, {}).get(
-                        "resolved_pipeline"
-                    )
-                    or ""
-                )
-                cached_artifact = cached_artifacts_by_output.get(output_key)
-                preferred_matches = bool(
-                    not preferred_pipeline
-                    or not cached_artifact
-                    or cached_artifact.get("resolved_pipeline")
-                    == preferred_pipeline
-                )
-                if (
-                    cached_artifact
-                    and preferred_matches
-                    and cached_artifact_signatures.get(output_key)
-                    == current_artifact_signatures.get(output_key)
-                ):
-                    artifact = copy.deepcopy(cached_artifact)
-                else:
-                    artifact = self._deconstruction_artifact_item(
-                        output_dir,
-                        preferred_pipeline=(
-                            preferred_pipeline
-                            if preferred_pipeline in {"short", "long"}
-                            else None
-                        ),
-                    )
-                artifact_items.append(copy.deepcopy(artifact))
-                items.append(artifact)
-            except (OSError, UnicodeError):
-                continue
-
-        by_output = {
-            str(Path(item["output_dir"]).expanduser().resolve()): item
-            for item in items
-            if item.get("output_dir")
-        }
-        merged_task_outputs: set[str] = set()
-        for task in managed_tasks:
-            output_key = str(
-                Path(task.get("output_dir") or self.global_deconstruction_root)
-                .expanduser()
-                .resolve()
-            )
-            # _list_managed_tasks is newest-first.  Only the latest task owns
-            # the current status projection for one shared artifact directory.
-            if output_key in merged_task_outputs:
-                continue
-            merged_task_outputs.add(output_key)
-            artifact = by_output.get(output_key)
-            if artifact:
-                artifact["origin"] = (
-                    "frontend_and_command_line"
-                    if artifact.get("progress_source") == "_progress.md"
-                    else "frontend"
-                )
-                artifact["managed_task_id"] = task.get("id")
-                artifact["id"] = task.get("id") or artifact["id"]
-                artifact["book_id"] = task.get("book_id")
-                artifact["catalog_id"] = task.get("book_id")
-                for key in (
-                    "author", "category", "source_id", "log_path",
-                    "last_message_path", "runner_requested", "runner_name",
-                    "model_requested", "model_name", "reasoning_requested",
-                    "reasoning_name", "ai_session_id", "can_resume",
-                    "pause_reason", "resume_count", "resumed_at",
-                    "word_count", "analysis_band", "entry_mode",
-                    "execution_mode", "requested_mode",
-                    "resolved_pipeline", "skill",
-                    "resume_strategy",
-                    "openclaw_agent_id", "model_contract",
-                    "automatic_full_pipeline", "ai_session_generation",
-                ):
-                    if key in task:
-                        artifact[key] = task[key]
-                entry_mode = str(
-                    task.get("entry_mode")
-                    or task.get("requested_mode")
-                    or ""
-                )
-                if entry_mode == "scan":
-                    physical_full = bool(artifact.get("has_full_report"))
-                    physical_level = artifact.get("artifact_level")
-                    scan_accepted = bool(
-                        artifact.get("has_quick_preview")
-                        or physical_full
-                        or (
-                            isinstance(task.get("contract_validation"), dict)
-                            and task["contract_validation"].get("ok")
-                        )
-                    )
-                    artifact["physical_has_full_report"] = physical_full
-                    artifact["physical_artifact_level"] = physical_level
-                    artifact["has_full_report"] = False
-                    artifact["has_quick_preview"] = scan_accepted
-                    artifact["artifact_level"] = (
-                        "scan" if scan_accepted else "in_progress"
-                    )
-                    artifact["global_reuse"] = scan_accepted
-                    if (
-                        scan_accepted
-                        and task.get("status")
-                        not in {"queued", "running", "error"}
-                    ):
-                        artifact["status"] = "paused"
-                        artifact["progress"] = 40
-                        artifact["current_stage"] = "黄金三章已完成"
-                        artifact["message"] = (
-                            "本次只授权黄金三章；磁盘上的额外产物"
-                            "不计为完整拆书，需另行启动完整拆书"
-                        )
-                        artifact["can_resume"] = False
-                        artifact["pause_reason"] = "paused_after_stage1"
-                # 完整成果是最终事实，不能被残留的前端 task JSON 回写成“运行中”。
-                if (
-                    artifact.get("status") != "completed"
-                    and task.get("status") in {"queued", "running", "error"}
-                ):
-                    artifact["status"] = task["status"]
-                    artifact["progress"] = max(
-                        int(artifact.get("progress") or 0),
-                        int(task.get("progress") or 0),
-                    )
-                    artifact["current_stage"] = (
-                        task.get("current_stage")
-                        or artifact.get("current_stage")
-                    )
-                    artifact["message"] = task.get("message") or artifact.get("message")
-                elif (
-                    artifact.get("status") != "completed"
-                    and task.get("status") == "paused"
-                ):
-                    artifact["status"] = "paused"
-                    artifact["can_resume"] = bool(task.get("can_resume"))
-                    artifact["pause_reason"] = (
-                        task.get("pause_reason")
-                        or artifact.get("pause_reason")
-                    )
-                    artifact["message"] = (
-                        task.get("message")
-                        or artifact.get("message")
-                    )
-                artifact["updated_at"] = max(
-                    str(artifact.get("updated_at") or ""),
-                    str(task.get("updated_at") or ""),
-                )
-                continue
-            managed = dict(task)
-            task_claimed_completed = task.get("status") == "completed"
-            managed.update(
-                {
-                    "origin": "frontend",
-                    "managed_task_id": task.get("id"),
-                    "catalog_id": task.get("book_id"),
-                    "status": "error" if task_claimed_completed else task.get("status"),
-                    "progress": (
-                        min(int(task.get("progress") or 0), 99)
-                        if task_claimed_completed
-                        else task.get("progress")
-                    ),
-                    "message": (
-                        "任务声称完成，但未发现可验收的完整拆书产物"
-                        if task_claimed_completed
-                        else task.get("message")
-                    ),
-                    "artifact_level": "in_progress",
-                    "has_quick_preview": False,
-                    "has_full_report": False,
-                    "completed_chapters": 0,
-                    "total_chapters": 0,
-                    "progress_source": "task_json",
-                }
-            )
-            items.append(managed)
-
-        requested_source_ids = sorted(
-            {
-                str(item.get("source_id") or "")
-                for item in items
-                if item.get("source_id") not in (None, "")
-            }
-        )
-        requested_titles = sorted(
-            {
-                str(item.get("title") or "")
-                for item in items
-                if str(item.get("title") or "").strip()
-            }
-        )
-        requested_title_keys = sorted(
-            {
-                _normalize_book_identity(title)
-                for title in requested_titles
-                if _normalize_book_identity(title)
-            }
-        )
-        catalog_rows: List[Dict[str, Any]] = []
-        if (
-            self.infrastructure_settings.catalog_backend == "mysql"
-            and self.mysql_catalog is not None
-        ):
-            catalog_rows = [
-                self._materialize_mysql_catalog_row(row)
-                for row in self.mysql_catalog.find_book_identities(
-                    source_ids=requested_source_ids,
-                    titles=requested_titles,
-                )
-            ]
-        elif requested_source_ids or requested_titles:
-            with self._catalog_connection() as conn:
-                catalog_columns = {
-                    str(row["name"])
-                    for row in conn.execute("PRAGMA table_info(books)")
-                }
-                lookup_conditions: List[str] = []
-                lookup_params: List[Any] = []
-                if requested_source_ids:
-                    placeholders = ",".join("?" for _ in requested_source_ids)
-                    lookup_conditions.append(f"source_id IN ({placeholders})")
-                    lookup_params.extend(requested_source_ids)
-                if "title_key" in catalog_columns and requested_title_keys:
-                    placeholders = ",".join("?" for _ in requested_title_keys)
-                    lookup_conditions.append(f"title_key IN ({placeholders})")
-                    lookup_params.extend(requested_title_keys)
-                elif requested_titles:
-                    placeholders = ",".join("?" for _ in requested_titles)
-                    lookup_conditions.append(f"title IN ({placeholders})")
-                    lookup_params.extend(requested_titles)
-                catalog_rows = [
-                    dict(row)
-                    for row in conn.execute(
-                        f"""
-                        SELECT id AS catalog_id,
-                               COALESCE(source_id, id) AS source_id,
-                               title, author, category,
-                               output_path AS source_path,
-                               bytes AS source_bytes
-                        FROM books
-                        WHERE status != 'duplicate'
-                          AND ({" OR ".join(lookup_conditions)})
-                        """,
-                        lookup_params,
-                    )
-                ]
-        by_source_id = {
-            str(item.get("source_id") or ""): item
-            for item in catalog_rows
-            if item.get("source_id") is not None
-        }
-        by_title = {
-            _normalize_book_identity(item.get("title")): item
-            for item in catalog_rows
-            if item.get("title")
-        }
-        for item in items:
-            catalog = (
-                by_source_id.get(str(item.get("source_id") or ""))
-                or by_title.get(_normalize_book_identity(item.get("title")))
-            )
-            if catalog:
-                item["catalog_id"] = int(catalog["catalog_id"])
-                item["book_id"] = int(catalog["catalog_id"])
-                item["source_id"] = str(catalog["source_id"])
-                item["title"] = catalog.get("title") or item.get("title")
-                item["author"] = catalog.get("author") or item.get("author") or ""
-                item["category"] = catalog.get("category") or item.get("category") or ""
-                item["source_path"] = (
-                    catalog.get("source_path") or item.get("source_path") or ""
-                )
-                item["source_bytes"] = int(
-                    catalog.get("source_bytes") or item.get("source_bytes") or 0
-                )
-
-        metric_items = [
-            item for item in items if int(item.get("catalog_id") or 0) > 0
-        ]
-        self._apply_content_metrics(
-            metric_items,
-            include_latest_chapter=False,
-        )
-        for item in metric_items:
-            if str(item.get("resolved_pipeline") or "") != "short":
-                continue
-            source_chapter_count = int(
-                item.get("chapter_count")
-                or item.get("approx_chapter_count")
-                or 0
-            )
-            item["source_chapter_count"] = source_chapter_count
-            if (
-                item.get("coverage_scope") == "whole_text"
-                and item.get("status") == "completed"
-            ):
-                chapter_text = (
-                    f"覆盖 {source_chapter_count} 章完整原文"
-                    if source_chapter_count
-                    else "覆盖完整原文"
-                )
-                node_count = int(item.get("plot_node_count") or 0)
-                node_text = (
-                    f" · {node_count} 个情节节点"
-                    if node_count
-                    else ""
-                )
-                item["coverage_label"] = (
-                    f"全篇结构拆解已完成 · {chapter_text}{node_text}"
-                )
-
-        link_registry = self.list_project_deconstruction_links()
-        links_by_output: Dict[str, List[Dict[str, Any]]] = {}
-        for link in link_registry["items"]:
-            output_key = str(
-                Path(str(link.get("global_output_dir") or ""))
-                .expanduser()
-                .resolve()
-            )
-            links_by_output.setdefault(output_key, []).append(link)
-        current_project_root = (
-            str(project_root.expanduser().resolve())
-            if project_root is not None
-            else ""
-        )
-        for item in items:
-            output_key = str(
-                Path(str(item.get("output_dir") or ""))
-                .expanduser()
-                .resolve()
-            )
-            source_links = links_by_output.get(output_key, [])
-            item["source_projects"] = [
-                {
-                    "project_id": link.get("project_id") or "",
-                    "project_name": link.get("project_name") or "",
-                    "project_directory_name": (
-                        link.get("project_directory_name") or ""
-                    ),
-                    "link_status": link.get("link_status") or "missing",
-                }
-                for link in source_links
-            ]
-            current_link = next(
-                (
-                    link
-                    for link in source_links
-                    if link.get("project_root") == current_project_root
-                ),
-                None,
-            )
-            item["linked_to_current_project"] = bool(current_link)
-            item["current_project_link"] = (
-                {
-                    "association_id": current_link.get("id"),
-                    "link_name": current_link.get("global_book_key"),
-                    "link_status": current_link.get("link_status"),
-                }
-                if current_link
-                else None
-            )
-
-        status_order = {
-            "running": 0,
-            "queued": 1,
-            "paused": 2,
-            "error": 3,
-            "completed": 4,
-            "discovered": 5,
-        }
-        # 同一状态内优先展示最近更新的任务；稳定排序再保证运行中置顶。
-        items.sort(
-            key=lambda item: str(item.get("updated_at") or ""),
-            reverse=True,
-        )
-        items.sort(
-            key=lambda item: status_order.get(str(item.get("status")), 9),
-        )
-        running = sum(
-            item.get("status") in {"queued", "running"} for item in items
-        )
-        completed = sum(item.get("status") == "completed" for item in items)
-        scan_completed = sum(
-            bool(
-                item.get("has_quick_preview")
-                or item.get("has_full_report")
-            )
-            for item in items
-        )
-        result = {
-            "root": str(self.global_deconstruction_root.resolve()),
-            "total": len(items),
-            "running": running,
-            "completed": completed,
-            "scan_completed": scan_completed,
-            "items": items,
-            "updated_at": _now(),
-            "progress_source": "全局拆书库产物 + _progress.md + 前端任务 JSON",
-        }
-        self._store_deconstruction_cache(
-            project_root,
-            result,
-            artifact_items=artifact_items,
-        )
-        return result
-
     def deconstruction_lookup(
         self,
         project_root: Optional[Path] = None,
@@ -14391,14 +12689,12 @@ class ElectronicLibraryService:
             return "unstarted"
         if deconstruction.get("status") in {"queued", "running"}:
             return "running"
-        if (
-            deconstruction.get("status") == "completed"
-            or deconstruction.get("has_full_report")
+        if deconstruction.get("status") == "completed" or deconstruction.get(
+            "has_full_report"
         ):
             return "full"
-        if (
-            deconstruction.get("can_resume")
-            and not deconstruction.get("has_quick_preview")
+        if deconstruction.get("can_resume") and not deconstruction.get(
+            "has_quick_preview"
         ):
             return "error"
         if deconstruction.get("has_quick_preview"):
@@ -14423,15 +12719,11 @@ class ElectronicLibraryService:
             # “黄金三章”是累计里程碑：完整拆书成果也必须计入。
             # 短篇 Stage 2-6 没有长篇专属的 快速预览.md，因此还要
             # 通过已经严格验收的 has_full_report 识别。
-            return bool(
-                item.get("has_quick_preview")
-                or item.get("has_full_report")
-            )
+            return bool(item.get("has_quick_preview") or item.get("has_full_report"))
         if state == "full":
             item = deconstruction or {}
             return bool(
-                item.get("has_full_report")
-                or item.get("status") == "completed"
+                item.get("has_full_report") or item.get("status") == "completed"
             )
         return current_state == state
 
@@ -14457,8 +12749,7 @@ class ElectronicLibraryService:
                 source_path and item.get("download_status") == "done"
             )
             item["available_for_analysis"] = bool(
-                item.get("download_status") == "done"
-                and item["source_exists"]
+                item.get("download_status") == "done" and item["source_exists"]
             )
             item["deconstruction_state"] = self._deconstruction_catalog_state(
                 deconstruction
@@ -14516,9 +12807,7 @@ class ElectronicLibraryService:
             item["genre_tags"] = _read_json_text(
                 feature.get("genre_tags"), item.get("genre_tags") or []
             )
-            item["tone_tags"] = _read_json_text(
-                feature.get("tone_tags"), []
-            )
+            item["tone_tags"] = _read_json_text(feature.get("tone_tags"), [])
 
         for item in items:
             deconstruction = item.get("deconstruction")
@@ -14532,14 +12821,32 @@ class ElectronicLibraryService:
                 {
                     key: deconstruction.get(key)
                     for key in (
-                        "id", "status", "progress", "current_stage", "message",
-                        "artifact_level", "has_quick_preview", "has_full_report",
-                        "completed_chapters", "total_chapters", "updated_at",
-                        "runner_name", "model_name", "reasoning_name",
-                        "ai_session_id", "managed_task_id", "can_resume",
-                        "pause_reason", "resume_count", "word_count",
-                        "analysis_band", "entry_mode", "execution_mode",
-                        "resolved_pipeline", "skill", "resume_strategy",
+                        "id",
+                        "status",
+                        "progress",
+                        "current_stage",
+                        "message",
+                        "artifact_level",
+                        "has_quick_preview",
+                        "has_full_report",
+                        "completed_chapters",
+                        "total_chapters",
+                        "updated_at",
+                        "runner_name",
+                        "model_name",
+                        "reasoning_name",
+                        "ai_session_id",
+                        "managed_task_id",
+                        "can_resume",
+                        "pause_reason",
+                        "resume_count",
+                        "word_count",
+                        "analysis_band",
+                        "entry_mode",
+                        "execution_mode",
+                        "resolved_pipeline",
+                        "skill",
+                        "resume_strategy",
                     )
                 }
                 if deconstruction
@@ -14563,10 +12870,7 @@ class ElectronicLibraryService:
             include_unavailable=True,
             catalog_ids=deconstruction_by_catalog.keys(),
         )
-        active_ids = {
-            int(row["catalog_id"])
-            for row in active_deconstruction_rows
-        }
+        active_ids = {int(row["catalog_id"]) for row in active_deconstruction_rows}
         state_order = {
             "running": 0,
             "scan": 1,
@@ -14623,15 +12927,13 @@ class ElectronicLibraryService:
             catalog_id = int(item["catalog_id"])
             deconstruction = deconstruction_by_catalog.get(catalog_id)
             item["source_exists"] = bool(
-                item.get("source_path")
-                and item.get("download_status") == "done"
+                item.get("source_path") and item.get("download_status") == "done"
             )
             item["available_for_analysis"] = bool(
-                item.get("download_status") == "done"
-                and item["source_exists"]
+                item.get("download_status") == "done" and item["source_exists"]
             )
-            item["deconstruction_state"] = (
-                self._deconstruction_catalog_state(deconstruction)
+            item["deconstruction_state"] = self._deconstruction_catalog_state(
+                deconstruction
             )
             item["cover_url"] = self._cover_for_catalog_item(item)
             item["deconstruction"] = deconstruction
@@ -14670,221 +12972,11 @@ class ElectronicLibraryService:
             "updated_at": _now(),
         }
 
-    def list_deconstruction_catalog(
-        self,
-        project_root: Path,
-        *,
-        state: str = "all",
-        query: str = "",
-        category: str = "",
-        page: int = 1,
-        page_size: int = 24,
-    ) -> Dict[str, Any]:
-        if state not in {
-            "all", "unstarted", "running", "scan", "full", "error"
-        }:
-            raise ValueError("未知拆书状态筛选")
-        page = max(int(page), 1)
-        page_size = min(max(int(page_size), 1), 60)
-        query = query.strip().casefold()
-        category = category.strip()
-        if (
-            self.infrastructure_settings.catalog_backend == "mysql"
-            and self.mysql_catalog is not None
-        ):
-            return self._list_deconstruction_catalog_mysql(
-                project_root,
-                state=state,
-                query=query,
-                category=category,
-                page=page,
-                page_size=page_size,
-            )
-        rows, _ = self._deconstruction_catalog_rows(project_root)
-
-        state_counts = {
-            "all": len(rows),
-            "unstarted": 0,
-            "running": 0,
-            "scan": 0,
-            "full": 0,
-            "error": 0,
-            "readable": 0,
-        }
-        for item in rows:
-            deconstruction = item.get("deconstruction")
-            for count_state in ("unstarted", "running", "scan", "full", "error"):
-                if self._deconstruction_matches_catalog_state(
-                    deconstruction, count_state
-                ):
-                    state_counts[count_state] += 1
-            if item["available_for_analysis"]:
-                state_counts["readable"] += 1
-
-        filtered: List[Dict[str, Any]] = []
-        category_counts: Counter[str] = Counter()
-        for item in rows:
-            if not self._deconstruction_matches_catalog_state(
-                item.get("deconstruction"), state
-            ):
-                continue
-            if query:
-                haystack = " ".join(
-                    str(item.get(key) or "")
-                    for key in ("title", "author", "category")
-                ).casefold()
-                if query not in haystack:
-                    continue
-            category_counts[str(item.get("category") or "未分类")] += 1
-            if category and str(item.get("category") or "未分类") != category:
-                continue
-            filtered.append(item)
-
-        state_order = {
-            "running": 0,
-            "scan": 1,
-            "full": 2,
-            "error": 3,
-            "unstarted": 4,
-        }
-        filtered.sort(
-            key=lambda item: (
-                state_order.get(item["deconstruction_state"], 9),
-                int(item.get("catalog_id") or 0),
-            ),
-            reverse=False,
-        )
-        total = len(filtered)
-        offset = (page - 1) * page_size
-        items = filtered[offset : offset + page_size]
-        self._apply_content_metrics(items, include_latest_chapter=False)
-
-        if items and self.index_path.exists():
-            index_uri = f"{self.index_path.as_uri()}?mode=ro"
-            with sqlite3.connect(index_uri, uri=True, timeout=15) as conn:
-                conn.row_factory = sqlite3.Row
-                placeholders = ",".join("?" for _ in items)
-                catalog_ids = [int(item["catalog_id"]) for item in items]
-                indexed = {
-                    int(row["catalog_id"]): dict(row)
-                    for row in conn.execute(
-                        f"""
-                        SELECT catalog_id, summary, approx_word_count,
-                               approx_chapter_count, genre_tags, tone_tags
-                        FROM library_index
-                        WHERE catalog_id IN ({placeholders})
-                        """,
-                        catalog_ids,
-                    )
-                }
-            for item in items:
-                feature = indexed.get(int(item["catalog_id"]), {})
-                item["summary"] = str(feature.get("summary") or "")
-                item["approx_word_count"] = int(
-                    item.get("word_count")
-                    or feature.get("approx_word_count")
-                    or item.get("approx_word_count")
-                    or 0
-                )
-                item["approx_chapter_count"] = int(
-                    item.get("chapter_count")
-                    or feature.get("approx_chapter_count")
-                    or item.get("approx_chapter_count")
-                    or 0
-                )
-                item["genre_tags"] = _read_json_text(
-                    feature.get("genre_tags"), item.get("genre_tags") or []
-                )
-                item["tone_tags"] = _read_json_text(
-                    feature.get("tone_tags"), []
-                )
-
-        for item in items:
-            deconstruction = item.get("deconstruction")
-            if not int(item.get("approx_chapter_count") or 0) and deconstruction:
-                item["approx_chapter_count"] = int(
-                    deconstruction.get("total_chapters")
-                    or deconstruction.get("completed_chapters")
-                    or 0
-                )
-            if (
-                deconstruction
-                and str(deconstruction.get("resolved_pipeline") or "") == "short"
-            ):
-                source_chapter_count = int(
-                    item.get("chapter_count")
-                    or item.get("approx_chapter_count")
-                    or 0
-                )
-                deconstruction["source_chapter_count"] = source_chapter_count
-                if (
-                    deconstruction.get("coverage_scope") == "whole_text"
-                    and deconstruction.get("status") == "completed"
-                ):
-                    chapter_text = (
-                        f"覆盖 {source_chapter_count} 章完整原文"
-                        if source_chapter_count
-                        else "覆盖完整原文"
-                    )
-                    node_count = int(
-                        deconstruction.get("plot_node_count") or 0
-                    )
-                    node_text = (
-                        f" · {node_count} 个情节节点"
-                        if node_count
-                        else ""
-                    )
-                    deconstruction["coverage_label"] = (
-                        f"全篇结构拆解已完成 · {chapter_text}{node_text}"
-                    )
-            item["deconstruction"] = (
-                {
-                    key: deconstruction.get(key)
-                    for key in (
-                        "id", "status", "progress", "current_stage", "message",
-                        "artifact_level", "has_quick_preview", "has_full_report",
-                        "completed_chapters", "total_chapters", "updated_at",
-                        "runner_name", "model_name", "reasoning_name",
-                        "ai_session_id", "managed_task_id", "can_resume",
-                        "pause_reason", "resume_count", "word_count",
-                        "analysis_band", "entry_mode", "execution_mode",
-                        "resolved_pipeline", "skill", "resume_strategy",
-                        "coverage_scope", "coverage_label",
-                        "source_chapter_count", "structure_beat_count",
-                        "plot_node_count",
-                    )
-                }
-                if deconstruction
-                else None
-            )
-
-        return {
-            "items": items,
-            "total": total,
-            "page": page,
-            "page_size": page_size,
-            "state": state,
-            "query": query,
-            "category": category,
-            "state_counts": state_counts,
-            "categories": [
-                {"name": name, "count": count}
-                for name, count in sorted(
-                    category_counts.items(),
-                    key=lambda pair: (-pair[1], pair[0]),
-                )
-            ],
-            "batches": self.list_deconstruction_batches(project_root),
-            "updated_at": _now(),
-        }
-
     def _deconstruction_batch_dir(self, project_root: Path) -> Path:
         del project_root
         return self.global_batch_root
 
-    def list_deconstruction_batches(
-        self, project_root: Path
-    ) -> List[Dict[str, Any]]:
+    def list_deconstruction_batches(self, project_root: Path) -> List[Dict[str, Any]]:
         batch_dir = self._deconstruction_batch_dir(project_root)
         if not batch_dir.exists():
             return []
@@ -14896,13 +12988,33 @@ class ElectronicLibraryService:
             public_item = {
                 key: item.get(key)
                 for key in (
-                    "id", "mode", "status", "state_filter", "query", "category",
-                    "total", "cursor", "started", "reused", "failed", "finished",
-                    "runner_requested", "runner_name", "model_requested",
-                    "model_name", "reasoning_requested", "reasoning_name",
-                    "session_strategy", "session_total", "session_ids",
-                    "parallel_limit", "current_stage", "message",
-                    "created_at", "updated_at", "pid",
+                    "id",
+                    "mode",
+                    "status",
+                    "state_filter",
+                    "query",
+                    "category",
+                    "total",
+                    "cursor",
+                    "started",
+                    "reused",
+                    "failed",
+                    "finished",
+                    "runner_requested",
+                    "runner_name",
+                    "model_requested",
+                    "model_name",
+                    "reasoning_requested",
+                    "reasoning_name",
+                    "session_strategy",
+                    "session_total",
+                    "session_ids",
+                    "parallel_limit",
+                    "current_stage",
+                    "message",
+                    "created_at",
+                    "updated_at",
+                    "pid",
                 )
             }
             public_item["progress"] = (
@@ -14935,9 +13047,7 @@ class ElectronicLibraryService:
         catalog_ids: Optional[List[int]],
     ) -> List[int]:
         rows, _ = self._deconstruction_catalog_rows(project_root)
-        explicit = {
-            int(value) for value in (catalog_ids or []) if int(value) > 0
-        }
+        explicit = {int(value) for value in (catalog_ids or []) if int(value) > 0}
         query = query.strip().casefold()
         category = category.strip()
         selected: List[int] = []
@@ -14998,9 +13108,7 @@ class ElectronicLibraryService:
             raise ValueError("当前路径不是有效的小说项目")
         if mode not in {"scan", "full"}:
             raise ValueError("批量拆书仅支持黄金三章或完整拆书")
-        runner = resolve_task_runner(
-            runner_id, profile_id, reasoning_effort
-        )
+        runner = resolve_task_runner(runner_id, profile_id, reasoning_effort)
         selected = self._batch_catalog_ids(
             project_root,
             mode=mode,
@@ -15145,9 +13253,7 @@ class ElectronicLibraryService:
             )
             if started.returncode != 0:
                 detail = (started.stderr or started.stdout or "").strip()
-                raise RuntimeError(
-                    f"独立拆书 worker 启动失败：{detail or worker_unit}"
-                )
+                raise RuntimeError(f"独立拆书 worker 启动失败：{detail or worker_unit}")
             shown = subprocess.run(
                 ["systemctl", "show", "--property=MainPID", "--value", worker_unit],
                 cwd=str(APP_ROOT),
@@ -15232,8 +13338,7 @@ class ElectronicLibraryService:
                 if (
                     item.get("catalog_id") == book_id
                     or str(item.get("source_id") or "") == source_id
-                    or _normalize_book_identity(item.get("title"))
-                    == normalized_title
+                    or _normalize_book_identity(item.get("title")) == normalized_title
                 )
             ),
             None,
@@ -15245,9 +13350,7 @@ class ElectronicLibraryService:
                     project_root,
                     Path(existing_global["output_dir"]),
                     book,
-                    task_id=str(
-                        existing_global.get("managed_task_id") or ""
-                    ) or None,
+                    task_id=str(existing_global.get("managed_task_id") or "") or None,
                     mode=mode,
                     association_reason="reused_running_task",
                 )
@@ -15264,9 +13367,7 @@ class ElectronicLibraryService:
                     project_root,
                     Path(existing_global["output_dir"]),
                     book,
-                    task_id=str(
-                        existing_global.get("managed_task_id") or ""
-                    ) or None,
+                    task_id=str(existing_global.get("managed_task_id") or "") or None,
                     mode=mode,
                     association_reason="reused_global_artifact",
                 )
@@ -15320,10 +13421,7 @@ class ElectronicLibraryService:
         )
         has_scan_result = bool(
             has_full_result
-            or (
-                validated_artifact
-                and validated_artifact.get("has_quick_preview")
-            )
+            or (validated_artifact and validated_artifact.get("has_quick_preview"))
         )
         reused = has_full_result or (mode == "scan" and has_scan_result)
         task = {
@@ -15365,9 +13463,17 @@ class ElectronicLibraryService:
             "parallel_limit": parallel_limit,
             "pid": None,
             "steps": [
-                {"id": "validate", "name": "验证只读来源与全局库边界", "status": "pending"},
+                {
+                    "id": "validate",
+                    "name": "验证只读来源与全局库边界",
+                    "status": "pending",
+                },
                 {"id": "copy", "name": "链接电子书库只读原文", "status": "pending"},
-                {"id": "route", "name": "按字数路由 oh-story 技能", "status": "pending"},
+                {
+                    "id": "route",
+                    "name": "按字数路由 oh-story 技能",
+                    "status": "pending",
+                },
                 {"id": "analyze", "name": "执行扫描/拆书阶段", "status": "pending"},
                 {"id": "verify", "name": "校验项目内产物", "status": "pending"},
             ],
@@ -15382,9 +13488,7 @@ class ElectronicLibraryService:
             task,
             task_id=task_id,
             mode=mode,
-            association_reason=(
-                "reused_global_artifact" if reused else "task_created"
-            ),
+            association_reason=("reused_global_artifact" if reused else "task_created"),
         )
         _atomic_write_json(task_path, task)
         if reused:
@@ -15448,15 +13552,13 @@ class ElectronicLibraryService:
             resumed["pid"] = None
             resumed.pop("finished_at", None)
             resumed.pop("ai_session_cleanup_error", None)
-            resumed["project_link"] = (
-                self._register_project_deconstruction_link(
-                    project_root,
-                    Path(str(resumed["output_dir"])),
-                    resumed,
-                    task_id=task_id,
-                    mode=str(resumed.get("requested_mode") or "full"),
-                    association_reason="same_session_resume",
-                )
+            resumed["project_link"] = self._register_project_deconstruction_link(
+                project_root,
+                Path(str(resumed["output_dir"])),
+                resumed,
+                task_id=task_id,
+                mode=str(resumed.get("requested_mode") or "full"),
+                association_reason="same_session_resume",
             )
             for step in resumed.get("steps", []):
                 if step.get("status") == "error":
@@ -15506,7 +13608,7 @@ class ElectronicLibraryService:
 def _read_json_text(value: Any, default: Any) -> Any:
     try:
         return json.loads(value) if isinstance(value, str) else value
-    except Exception:
+    except RECOVERABLE_OPERATION_ERRORS:
         return default
 
 

@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 from project_paths import APP_ROOT  # noqa: E402
-ROOT = (APP_ROOT / "electronic-library" / "txt80" / "封面").resolve()
+ROOT = (APP_ROOT / "electronic-library" / "封面").resolve()
 DB = ROOT / "index.sqlite3"
 METHODS = {
     "local-bottom-band-crop-v1",

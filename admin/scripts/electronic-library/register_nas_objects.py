@@ -23,7 +23,7 @@ from oohstory_library.services.library_database import (  # noqa: E402
 )
 
 
-DEFAULT_LIBRARY_ROOT = APP_ROOT / "electronic-library" / "txt80"
+DEFAULT_LIBRARY_ROOT = APP_ROOT / "electronic-library"
 
 
 def file_sha256(path: Path) -> str:

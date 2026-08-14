@@ -10,6 +10,7 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,12 +34,8 @@ READER_NUMERIC_HEADING_LINE = re.compile(
     r"(?P<title>\S[^\n]{0,119})\s*$"
 )
 READER_INDEX_SCHEMA_VERSION = 5
-READER_LN_ILLUSTRATION_REF = re.compile(
-    r"^\[本地插图：(.+?)\]\s*$", re.MULTILINE
-)
-READER_LN_CHAPTER_FILE = re.compile(
-    r"^(\d+)-(\d+)-(.+)-([0-9a-f]{10})\.txt$"
-)
+READER_LN_ILLUSTRATION_REF = re.compile(r"^\[本地插图：(.+?)\]\s*$", re.MULTILINE)
+READER_LN_CHAPTER_FILE = re.compile(r"^(\d+)-(\d+)-(.+)-([0-9a-f]{10})\.txt$")
 READER_FALLBACK_CHUNK_BYTES = 256 * 1024
 READER_NOISE_LINE = re.compile(
     r"^\s*(?:第?\s*[\(（]\s*\d+\s*/\s*\d+\s*[\)）]\s*页?"
@@ -46,18 +43,17 @@ READER_NOISE_LINE = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTS = (
-    ("快速预览.md", "黄金三章"),
     ("拆文报告.md", "完整拆文报告"),
     ("概要.md", "全书概要"),
     ("文风.md", "文风拆解"),
 )
+GOLDEN_THREE_FILES = tuple(f"章节/第{chapter}章_深度拆解.md" for chapter in range(1, 4))
 SAFE_COVER_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}
 OOHSTORY_DEFAULT_COVER_SHA256 = (
     "d421cee15a266d258979455101443085bbc686504ee802c55686cbfc92d0b09e"
 )
 OOHSTORY_DEFAULT_COVER_URL = (
-    "/api/v1/assets/default-cover?v="
-    f"{OOHSTORY_DEFAULT_COVER_SHA256[:16]}"
+    f"/api/v1/assets/default-cover?v={OOHSTORY_DEFAULT_COVER_SHA256[:16]}"
 )
 PUBLIC_VISITOR_UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
@@ -131,6 +127,7 @@ def _local_catalog_id(public_id: str | int) -> int:
         raise NotFoundError("作品不存在或正文尚未就绪")
     return catalog_id
 
+
 WORD_FILTERS: dict[str, tuple[int | None, int | None]] = {
     "under_100k": (None, 100_000),
     "over_100k": (100_000, None),
@@ -199,10 +196,11 @@ def _clean_summary(value: Any) -> str:
         line = raw.strip()
         if not line:
             continue
-        if (
-            re.fullmatch(r"\[本地(?:分卷封面|插图)：[^\]\r\n]+\]", line)
-            or line in {"分卷封面", "插画", "插图"}
-        ):
+        if re.fullmatch(r"\[本地(?:分卷封面|插图)：[^\]\r\n]+\]", line) or line in {
+            "分卷封面",
+            "插画",
+            "插图",
+        }:
             continue
         if re.search(
             r"(txt80|txt02|八零电子书|用户上传|版权归|本站只提供)",
@@ -359,13 +357,8 @@ class LibraryRepository:
         root = self.settings.books_root.resolve()
         raw = Path(raw_path).expanduser()
         path = raw.resolve()
-        if (
-            not _within(path, root)
-            and self.settings.catalog_source_root is not None
-        ):
-            source_books_root = (
-                self.settings.catalog_source_root / "书籍"
-            ).resolve()
+        if not _within(path, root) and self.settings.catalog_source_root is not None:
+            source_books_root = (self.settings.catalog_source_root / "书籍").resolve()
             lexical_path = Path(os.path.abspath(str(raw)))
             if _within(lexical_path, source_books_root):
                 relative = lexical_path.relative_to(source_books_root)
@@ -386,7 +379,7 @@ class LibraryRepository:
             return result
         with self._ro_connection(self.settings.catalog_path) as conn:
             row = conn.execute(
-                f"""
+                """
                 SELECT COUNT(*) AS total,
                        SUM(CASE WHEN status='done'
                          AND NULLIF(TRIM(COALESCE(output_path,'')), '') IS NOT NULL
@@ -442,16 +435,18 @@ class LibraryRepository:
                 enriched = []
                 for b in books:
                     pid = _encode_public_id(bytes(b["public_id"]))
-                    enriched.append({
-                        "title": b["title"],
-                        "author": b.get("author", ""),
-                        "public_id": pid,
-                        "cover_url": _public_cover_url(
-                            pid,
-                            b.get("cover_object_key"),
-                            b.get("row_version"),
-                        ),
-                    })
+                    enriched.append(
+                        {
+                            "title": b["title"],
+                            "author": b.get("author", ""),
+                            "public_id": pid,
+                            "cover_url": _public_cover_url(
+                                pid,
+                                b.get("cover_object_key"),
+                                b.get("row_version"),
+                            ),
+                        }
+                    )
                 result[cat] = enriched
             return result
         with self._ro_connection(self.settings.catalog_path) as conn:
@@ -479,10 +474,12 @@ class LibraryRepository:
             cat = _clean_text(row["category"], 40)
             if cat not in result:
                 result[cat] = []
-            result[cat].append({
-                "title": _clean_text(row["title"], 200),
-                "public_id": _local_public_id(int(row["catalog_id"])),
-            })
+            result[cat].append(
+                {
+                    "title": _clean_text(row["title"], 200),
+                    "public_id": _local_public_id(int(row["catalog_id"])),
+                }
+            )
         return result
 
     @staticmethod
@@ -587,8 +584,7 @@ class LibraryRepository:
                     ),
                 )
                 from_clause += (
-                    " LEFT JOIN global_index.library_index li"
-                    " ON li.catalog_id=b.id"
+                    " LEFT JOIN global_index.library_index li ON li.catalog_id=b.id"
                 )
             total = int(
                 conn.execute(
@@ -631,8 +627,13 @@ class LibraryRepository:
     def _all_readable_books(self, *, words: str = "") -> list[dict[str, Any]]:
         if self._mysql is not None:
             return self._mysql.list_books(
-                query="", category="", words=words, serialization="",
-                page=1, page_size=5000, sort="recent",
+                query="",
+                category="",
+                words=words,
+                serialization="",
+                page=1,
+                page_size=5000,
+                sort="recent",
             )["items"]
         has_index = self.settings.index_path.is_file()
         word_expression = (
@@ -659,8 +660,7 @@ class LibraryRepository:
                     ),
                 )
                 from_clause += (
-                    " LEFT JOIN global_index.library_index li"
-                    " ON li.catalog_id=b.id"
+                    " LEFT JOIN global_index.library_index li ON li.catalog_id=b.id"
                 )
             where = (
                 "b.status='done'"
@@ -685,24 +685,80 @@ class LibraryRepository:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def random_recommendations(self, count: int = 14, *, words: str = "") -> list[dict[str, Any]]:
+    def random_recommendations(
+        self, count: int = 14, *, words: str = ""
+    ) -> list[dict[str, Any]]:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         all_items = self._all_readable_books(words=words)
         promoted: list[dict[str, Any]] = []
         if self._mysql is not None:
-            promoted = self._mysql.engagement_recommendations(count, words=words)
-        promoted_ids = {int(item["catalog_id"]) for item in promoted}
+            promoted = self._mysql.engagement_recommendations(
+                min(count * 2, 100), words=words,
+            )
+        max_per_cat = max(2, count // 5)
+        cat_counts: dict[str, int] = {}
+
+        def _accept(item: dict[str, Any]) -> bool:
+            cat = str(item.get("category") or "未分类")
+            if cat_counts.get(cat, 0) >= max_per_cat:
+                return False
+            cat_counts[cat] = cat_counts.get(cat, 0) + 1
+            return True
+
+        capped = [item for item in promoted if _accept(item)]
+        picked_ids = {int(item["catalog_id"]) for item in capped}
         available = [
             item for item in all_items
-            if int(item["catalog_id"]) not in promoted_ids
+            if int(item["catalog_id"]) not in picked_ids
         ]
         rng = random.Random(today + words)
-        picked = promoted[:count]
-        missing = max(0, count - len(picked))
-        if missing:
-            picked.extend(rng.sample(available, min(missing, len(available))))
+        rng.shuffle(available)
+        picked = capped[:count]
+        for item in available:
+            if len(picked) >= count:
+                break
+            if _accept(item):
+                picked.append(item)
+        if len(picked) < count:
+            rest_ids = {int(item["catalog_id"]) for item in picked}
+            rest = [
+                item for item in available
+                if int(item["catalog_id"]) not in rest_ids
+            ]
+            picked.extend(rest[: count - len(picked)])
+        rng.shuffle(picked)
         self._enrich_books(picked)
         return picked
+
+    def sitemap_book_ids(self, limit: int = 49_990) -> list[str]:
+        safe_limit = min(max(int(limit), 1), 49_990)
+        if self._mysql is not None:
+            return [
+                _encode_public_id(value)
+                for value in self._mysql.sitemap_book_ids(safe_limit)
+            ]
+        with self._ro_connection(self.settings.catalog_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT id
+                FROM books
+                WHERE status='done'
+                  AND NULLIF(TRIM(COALESCE(output_path,'')), '') IS NOT NULL
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+        return [_local_public_id(int(row["id"])) for row in rows]
+
+    def sitemap_book_entries(self, limit: int = 49_990) -> list[tuple[str, str]]:
+        safe_limit = min(max(int(limit), 1), 49_990)
+        if self._mysql is not None:
+            return [
+                (_encode_public_id(public_id), lastmod)
+                for public_id, lastmod in self._mysql.sitemap_book_entries(safe_limit)
+            ]
+        return [(book_id, "") for book_id in self.sitemap_book_ids(safe_limit)]
 
     def _enrich_books(self, items: list[dict[str, Any]]) -> None:
         if not items:
@@ -739,8 +795,9 @@ class LibraryRepository:
                         ids,
                     )
                 }
-        deconstruction_titles = {
-            self._deconstruction_title(name) for name in self._deconstruction_names()
+        deconstruction_slugs = {
+            self._deconstruction_title(name): name
+            for name in self._deconstruction_names()
         }
         for item in items:
             item.pop("engagement_score", None)
@@ -798,7 +855,8 @@ class LibraryRepository:
                 item.get("row_version"),
             )
             item["cover_is_default"] = not has_real_cover
-            item["has_deconstruction"] = item["title"] in deconstruction_titles
+            item["deconstruction_slug"] = deconstruction_slugs.get(item["title"])
+            item["has_deconstruction"] = bool(item["deconstruction_slug"])
             item["serialization_status"] = (
                 "finished"
                 if item.get("serialization_status") == "finished"
@@ -869,8 +927,10 @@ class LibraryRepository:
             if catalog_ids:
                 placeholders = ",".join("?" for _ in catalog_ids)
                 with self._ro_connection(self.settings.catalog_path) as conn:
-                    items = [dict(row) for row in conn.execute(
-                        f"""
+                    items = [
+                        dict(row)
+                        for row in conn.execute(
+                            f"""
                         SELECT b.id AS catalog_id,COALESCE(b.source_id,b.id) AS source_id,
                                b.title,b.author,COALESCE(b.category,'未分类') AS category,
                                COALESCE(b.bytes,0) AS source_bytes,b.output_path,b.updated_at,
@@ -879,8 +939,9 @@ class LibraryRepository:
                         FROM books b WHERE b.id IN ({placeholders}) AND b.status='done'
                           AND NULLIF(TRIM(COALESCE(b.output_path,'')), '') IS NOT NULL
                         """,
-                        catalog_ids,
-                    )]
+                            catalog_ids,
+                        )
+                    ]
         self._enrich_books(items)
         result: dict[str, dict[str, Any]] = {}
         for item in items:
@@ -896,15 +957,15 @@ class LibraryRepository:
                 "serialization_status": item.get("serialization_status") or "ongoing",
                 "chapter_count": chapter_count,
                 "latest_chapter_id": chapter_count or None,
-                "latest_chapter": f"第 {chapter_count} 章" if chapter_count else "最新章节待同步",
+                "latest_chapter": f"第 {chapter_count} 章"
+                if chapter_count
+                else "最新章节待同步",
             }
         return result
 
     def cover_path_and_version(self, book_id: str) -> tuple[Path, str]:
         if self._mysql is not None:
-            descriptor = self._mysql.cover_descriptor(
-                _decode_public_id(book_id)
-            )
+            descriptor = self._mysql.cover_descriptor(_decode_public_id(book_id))
             if not descriptor:
                 return (
                     self.shared_default_cover_path(),
@@ -914,11 +975,7 @@ class LibraryRepository:
             root = (self.settings.object_root or self.settings.library_root).resolve()
             candidate = root / object_key
             path = candidate.resolve()
-            if (
-                candidate.is_symlink()
-                or not _within(path, root)
-                or not path.is_file()
-            ):
+            if candidate.is_symlink() or not _within(path, root) or not path.is_file():
                 raise UnsafePathError("封面路径无效")
             return (
                 self._validated_cover(path),
@@ -940,11 +997,7 @@ class LibraryRepository:
         root = self.settings.cover_root.resolve()
         candidate = root / str(row["filename"])
         path = candidate.resolve()
-        if (
-            candidate.is_symlink()
-            or not _within(path, root)
-            or not path.is_file()
-        ):
+        if candidate.is_symlink() or not _within(path, root) or not path.is_file():
             raise UnsafePathError("封面路径无效")
         validated = self._validated_cover(path)
         stat = validated.stat()
@@ -992,9 +1045,7 @@ class LibraryRepository:
             raise UnsafePathError("封面文件内容无效")
         return path
 
-    def _source_for_book(
-        self, book_id: str
-    ) -> tuple[dict[str, Any], Path, int, str]:
+    def _source_for_book(self, book_id: str) -> tuple[dict[str, Any], Path, int, str]:
         if self._mysql is not None:
             public_raw = _decode_public_id(book_id)
             row = self._mysql.source_book(public_raw)
@@ -1211,7 +1262,7 @@ class LibraryRepository:
                 "favorite_count": int(row["favorite_count"]),
                 "counted": counted,
             }
-        except Exception:
+        except BaseException:
             connection.rollback()
             raise
         finally:
@@ -1260,7 +1311,11 @@ class LibraryRepository:
                 raw = handle.readline()
                 if not raw:
                     break
-                line = raw.decode("utf-8", errors="replace").lstrip("\ufeff").rstrip("\r\n")
+                line = (
+                    raw.decode("utf-8", errors="replace")
+                    .lstrip("\ufeff")
+                    .rstrip("\r\n")
+                )
                 stripped = line.strip()
                 if not stripped or len(stripped) > 220:
                     continue
@@ -1299,17 +1354,25 @@ class LibraryRepository:
                 continue
             deduped.append(item)
         sequence: list[dict[str, Any]] = []
-        start = next((i for i, item in enumerate(numeric) if int(item["number"]) <= 5), None)
+        start = next(
+            (i for i, item in enumerate(numeric) if int(item["number"]) <= 5), None
+        )
         if start is not None:
             previous_number = 0
             tail = numeric[start:]
             for index, item in enumerate(tail):
                 number = int(item["number"])
-                if number <= previous_number or (previous_number and number - previous_number > 50):
+                if number <= previous_number or (
+                    previous_number and number - previous_number > 50
+                ):
                     continue
-                if previous_number and number - previous_number > 1 and any(
-                    previous_number < int(candidate["number"]) < number
-                    for candidate in tail[index + 1 : index + 65]
+                if (
+                    previous_number
+                    and number - previous_number > 1
+                    and any(
+                        previous_number < int(candidate["number"]) < number
+                        for candidate in tail[index + 1 : index + 65]
+                    )
                 ):
                     continue
                 sequence.append(item)
@@ -1338,8 +1401,7 @@ class LibraryRepository:
                 and not candidate.is_symlink()
                 and re.match(r"\d{3}-", candidate.name)
                 and any(
-                    (candidate / dirname).is_dir()
-                    for dirname in ("章节", "章节目录")
+                    (candidate / dirname).is_dir() for dirname in ("章节", "章节目录")
                 )
                 for candidate in source_parent.iterdir()
             )
@@ -1385,8 +1447,7 @@ class LibraryRepository:
                         vol_title_map[len(vol_title_map)] = text
 
         vol_dirs = sorted(
-            d for d in ln_dir.iterdir()
-            if d.is_dir() and re.match(r"\d{3}-", d.name)
+            d for d in ln_dir.iterdir() if d.is_dir() and re.match(r"\d{3}-", d.name)
         )
 
         for vol_idx, vol_dir in enumerate(vol_dirs):
@@ -1418,8 +1479,7 @@ class LibraryRepository:
 
             vol_chapter_ids: list[int] = []
             chapter_files = sorted(
-                f for f in chapter_dir.iterdir()
-                if f.is_file() and f.suffix == ".txt"
+                f for f in chapter_dir.iterdir() if f.is_file() and f.suffix == ".txt"
             )
 
             for ch_file in chapter_files:
@@ -1445,14 +1505,16 @@ class LibraryRepository:
                 chapter_id += 1
 
             if vol_chapter_ids:
-                volumes.append({
-                    "id": len(volumes) + 1,
-                    "title": vol_title,
-                    "chapter_ids": vol_chapter_ids,
-                    "illustration_count": illust_count,
-                    "cover_path": vol_cover_path,
-                    "illustration_paths": illust_paths,
-                })
+                volumes.append(
+                    {
+                        "id": len(volumes) + 1,
+                        "title": vol_title,
+                        "chapter_ids": vol_chapter_ids,
+                        "illustration_count": illust_count,
+                        "cover_path": vol_cover_path,
+                        "illustration_paths": illust_paths,
+                    }
+                )
 
         payload = {
             "schema_version": READER_INDEX_SCHEMA_VERSION,
@@ -1491,7 +1553,12 @@ class LibraryRepository:
                     )
                 if len(re.sub(r"\s+", "", intro)) >= 80:
                     sections.append(
-                        {"start": 0, "end": first_offset, "label": "序", "title": "作品信息"}
+                        {
+                            "start": 0,
+                            "end": first_offset,
+                            "label": "序",
+                            "title": "作品信息",
+                        }
                     )
             for index, heading in enumerate(headings):
                 next_heading = (
@@ -1500,7 +1567,11 @@ class LibraryRepository:
                     else stat.st_size
                 )
                 next_boundary = next(
-                    (offset for offset in boundaries if int(heading["offset"]) < offset),
+                    (
+                        offset
+                        for offset in boundaries
+                        if int(heading["offset"]) < offset
+                    ),
                     next_heading,
                 )
                 sections.append(
@@ -1581,14 +1652,10 @@ class LibraryRepository:
             return {}
         return value if isinstance(value, dict) else {}
 
-    def _valid_reader_index(
-        self, payload: dict[str, Any], source: Path
-    ) -> bool:
+    def _valid_reader_index(self, payload: dict[str, Any], source: Path) -> bool:
         stat = source.stat()
         try:
-            cached_source = self._book_path(
-                str(payload.get("source_path") or "")
-            )
+            cached_source = self._book_path(str(payload.get("source_path") or ""))
         except LibraryError:
             return False
         return bool(
@@ -1625,16 +1692,86 @@ class LibraryRepository:
                 ln_dir = self._find_ln_source_dir(source)
                 if ln_dir is not None:
                     title = _clean_text((book or {}).get("title"), 160) or ""
-                    return self._build_ln_reader_index(
-                        book_id, source, ln_dir, title
-                    )
+                    return self._build_ln_reader_index(book_id, source, ln_dir, title)
             return self._build_reader_index(book_id, source)
+
+    @staticmethod
+    def _sort_chapters_by_number(chapters: list[dict]) -> list[dict]:
+        """Repair dense numeric chapter order without trusting noisy labels.
+
+        Malformed zero labels and duplicate numbers are source-integrity
+        failures. Preserve ambiguous catalogs in source order, but tolerate a
+        tiny one-for-one label substitution in long books. That lets us repair
+        an obviously displaced chapter block while keeping the duplicate pair
+        stable and adjacent instead of letting one bad label disable ordering
+        for thousands of otherwise sequential chapters.
+        """
+        if len(chapters) < 10:
+            return chapters
+        import re
+        number_pattern = re.compile(
+            r'第\s*(\d+)\s*[章节回话篇]|(?:chapter|ch\.?)\s*(\d+)',
+            re.IGNORECASE,
+        )
+        numbered: list[tuple[int, int, dict]] = []
+        for i, ch in enumerate(chapters):
+            m = number_pattern.search(ch.get("label", "")) or number_pattern.search(ch.get("title", ""))
+            if m:
+                number = int(m.group(1) or m.group(2))
+                if number <= 0:
+                    return chapters
+                numbered.append((number, i, ch))
+        if len(numbered) < len(chapters) * 0.6:
+            return chapters
+        numbers = [number for number, _, _ in numbered]
+        span = max(numbers) - min(numbers) + 1
+        if span > len(numbers) * 1.25:
+            return chapters
+        unique_count = len(set(numbers))
+        duplicate_count = len(numbers) - unique_count
+        if duplicate_count:
+            missing_count = span - unique_count
+            allowed_substitutions = max(1, len(numbers) // 1_000)
+            is_large_near_sequence = (
+                len(numbered) >= 1_000
+                and min(numbers) == 1
+                and len(numbers) == span
+                and duplicate_count == missing_count
+                and duplicate_count <= allowed_substitutions
+            )
+            if not is_large_near_sequence:
+                return chapters
+        ordered = sorted(numbered, key=lambda item: item[0])
+        if [item[1] for item in ordered] == [item[1] for item in numbered]:
+            return chapters
+        repaired = list(chapters)
+        slots = [index for _, index, _ in numbered]
+        for slot, (_, _, chapter) in zip(slots, ordered):
+            repaired[slot] = chapter
+        return repaired
 
     def reader_catalog(self, book_id: str) -> dict[str, Any]:
         book, source, catalog_id, public_id = self._source_for_book(book_id)
         index = self._reader_index(catalog_id, source, book)
         if len(index["chapters"]) > self.settings.max_chapter_count:
             raise InputError("章节目录数量超出在线阅读安全范围")
+        chapters = [
+            {
+                "id": int(chapter["id"]),
+                "label": _clean_text(chapter["label"], 40),
+                "title": _clean_text(chapter["title"], 160),
+                "byte_count": int(chapter["byte_count"]),
+                "is_front_matter": (
+                    _clean_text(chapter["label"], 40) == "序"
+                    and _clean_text(chapter["title"], 160) == "作品信息"
+                ),
+            }
+            for chapter in index["chapters"]
+        ]
+        chapters = self._sort_chapters_by_number(chapters)
+        story_chapters = [
+            chapter for chapter in chapters if not chapter["is_front_matter"]
+        ]
         result: dict[str, Any] = {
             "book": {
                 "public_id": public_id,
@@ -1643,16 +1780,12 @@ class LibraryRepository:
                 "category": _clean_text(book.get("category"), 40),
                 "source_bytes": int(book.get("source_bytes") or 0),
             },
-            "chapter_count": int(index["chapter_count"]),
-            "chapters": [
-                {
-                    "id": int(chapter["id"]),
-                    "label": _clean_text(chapter["label"], 40),
-                    "title": _clean_text(chapter["title"], 160),
-                    "byte_count": int(chapter["byte_count"]),
-                }
-                for chapter in index["chapters"]
-            ],
+            "chapter_count": len(story_chapters),
+            "section_count": len(chapters),
+            "first_chapter_id": (
+                int(story_chapters[0]["id"]) if story_chapters else None
+            ),
+            "chapters": chapters,
         }
         if index.get("volumes"):
             result["volumes"] = [
@@ -1667,6 +1800,42 @@ class LibraryRepository:
                 for vol in index["volumes"]
             ]
         return result
+
+    def audiobook_cast_scan_plan(self, book_id: str) -> dict[str, Any]:
+        """Return a stable whole-book revision and ordered chapter plan."""
+        book, source, catalog_id, public_id = self._source_for_book(book_id)
+        index = self._reader_index(catalog_id, source, book)
+        chapters = self._sort_chapters_by_number(list(index["chapters"]))
+        chapter_rows = [
+            {
+                "id": int(chapter["id"]),
+                "byte_count": int(chapter.get("byte_count") or 0),
+                "title": str(chapter.get("title") or ""),
+            }
+            for chapter in chapters
+        ]
+        identity = {
+            "schema_version": int(index.get("schema_version") or 0),
+            "source_bytes": int(index.get("source_bytes") or source.stat().st_size),
+            "source_mtime_ns": int(
+                index.get("source_mtime_ns") or source.stat().st_mtime_ns
+            ),
+            "chapters": chapter_rows,
+        }
+        content_revision = hashlib.sha256(
+            json.dumps(
+                identity,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return {
+            "catalog_id": int(catalog_id),
+            "book_public_id": public_id,
+            "content_revision": content_revision,
+            "chapter_ids": [item["id"] for item in chapter_rows],
+        }
 
     def reader_chapter_count(self, book_id: str) -> int:
         """Return the exact bounded count without building a chapter response."""
@@ -1727,6 +1896,7 @@ class LibraryRepository:
         )
 
         if is_ln:
+
             def _rewrite_illust(m):
                 rel = m.group(1)
                 parts = rel.split("/", 1)
@@ -1734,9 +1904,11 @@ class LibraryRepository:
 
             content = READER_LN_ILLUSTRATION_REF.sub(_rewrite_illust, content)
 
-        chapters = index["chapters"]
+        chapters = self._sort_chapters_by_number(list(index["chapters"]))
         position = next(
-            idx for idx, item in enumerate(chapters) if int(item["id"]) == int(chapter_id)
+            idx
+            for idx, item in enumerate(chapters)
+            if int(item["id"]) == int(chapter_id)
         )
         return {
             "id": int(chapter["id"]),
@@ -1745,7 +1917,9 @@ class LibraryRepository:
             "content": content.rstrip(),
             "word_count": len(re.sub(r"\s+", "", content)),
             "previous_id": int(chapters[position - 1]["id"]) if position > 0 else None,
-            "next_id": int(chapters[position + 1]["id"]) if position + 1 < len(chapters) else None,
+            "next_id": int(chapters[position + 1]["id"])
+            if position + 1 < len(chapters)
+            else None,
             "book": {
                 "public_id": public_id,
                 "title": _clean_text(book.get("title"), 160),
@@ -1793,9 +1967,7 @@ class LibraryRepository:
     def _cover_url_for_public_id(self, book_id: str) -> str:
         if self._mysql is not None:
             try:
-                descriptor = self._mysql.cover_descriptor(
-                    _decode_public_id(book_id)
-                )
+                descriptor = self._mysql.cover_descriptor(_decode_public_id(book_id))
             except (OSError, TypeError, ValueError):
                 descriptor = None
             return _public_cover_url(
@@ -1810,8 +1982,7 @@ class LibraryRepository:
                 self.settings.cover_index_path, immutable=True
             ) as conn:
                 row = conn.execute(
-                    "SELECT filename FROM covers "
-                    "WHERE catalog_id=? AND status='done'",
+                    "SELECT filename FROM covers WHERE catalog_id=? AND status='done'",
                     (catalog_id,),
                 ).fetchone()
             if row:
@@ -1826,11 +1997,16 @@ class LibraryRepository:
         items = []
         for name in self._deconstruction_names():
             root = (self.settings.deconstruction_root / name).resolve()
-            docs = [
-                {"filename": filename, "label": label}
-                for filename, label in DOCUMENTS
-                if self._safe_deconstruction_file(root, filename) is not None
-            ]
+            docs = []
+            if self._golden_three_items(root):
+                docs.append({"filename": "黄金三章", "label": "黄金三章"})
+            docs.extend(
+                [
+                    {"filename": filename, "label": label}
+                    for filename, label in DOCUMENTS
+                    if self._safe_deconstruction_file(root, filename) is not None
+                ]
+            )
             progress_path = self._safe_deconstruction_file(root, "_progress.md")
             progress = self._read_progress(progress_path)
             title = self._deconstruction_title(name)
@@ -1846,10 +2022,40 @@ class LibraryRepository:
                         else None
                     ),
                     "documents": docs,
+                    **self._deconstruction_metadata(root),
                     **progress,
                 }
             )
         return items
+
+    def _golden_three_items(self, root: Path) -> list[dict[str, Any]]:
+        items = []
+        for relative in GOLDEN_THREE_FILES:
+            path = self._safe_deconstruction_file(root, relative)
+            if path is None:
+                return []
+            items.append(
+                {
+                    "filename": path.name,
+                    "label": path.stem,
+                    "type": "file",
+                }
+            )
+        return items
+
+    def _deconstruction_metadata(self, root: Path) -> dict[str, Any]:
+        path = self._safe_deconstruction_file(root, "_submission.json")
+        if path is None:
+            return {"contributor_username": "", "contributed_by_user": False}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return {"contributor_username": "", "contributed_by_user": False}
+        username = _clean_text(payload.get("contributor_username"), 40)
+        return {
+            "contributor_username": username,
+            "contributed_by_user": bool(username),
+        }
 
     @staticmethod
     def _safe_deconstruction_file(root: Path, filename: str) -> Path | None:
@@ -1883,20 +2089,31 @@ class LibraryRepository:
             return {"progress": "", "completed_chapters": 0, "total_chapters": 0}
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             text = handle.read(80_000)
-        stage_two_pairs = [
-            (int(done), int(total))
-            for line in text.splitlines()
-            if re.search(r"^\s*\|\s*2\s*\|", line)
-            for done, total in re.findall(r"(\d+)\s*/\s*(\d+)", line)
-            if int(total) > 0 and int(done) <= int(total)
-        ]
-        all_pairs = [
-            (int(done), int(total))
-            for done, total in re.findall(r"(\d+)\s*/\s*(\d+)", text)
-            if int(total) > 0 and int(done) <= int(total)
-        ]
-        pairs = stage_two_pairs or all_pairs
-        completed, total = pairs[-1] if pairs else (0, 0)
+        stage_two_pairs: list[tuple[int, int]] = []
+        for line in text.splitlines():
+            if not line.lstrip().startswith("|"):
+                continue
+            cells = [part.strip() for part in line.strip().strip("|").split("|")]
+            if not cells or not re.match(
+                r"^(?:stage\s*)?2(?:\s|$|[：:（(])",
+                cells[0],
+                re.IGNORECASE,
+            ):
+                continue
+            for done, total in re.findall(
+                r"(\d+)\s*/\s*(\d+)",
+                " | ".join(cells[1:]),
+            ):
+                completed_value = int(done)
+                total_value = int(total)
+                if total_value > 0 and completed_value <= total_value:
+                    stage_two_pairs.append((completed_value, total_value))
+
+        # Progress is a contract field, not a statistic to guess.  Never fall
+        # back to arbitrary fractions elsewhere in the file: chapter-title
+        # recovery notes (870/1019) and report link checks (15/15) are not
+        # Stage 2 coverage.
+        completed, total = stage_two_pairs[-1] if stage_two_pairs else (0, 0)
         percent = round(completed / total * 100, 1) if total else 0
         return {
             "progress": f"{completed}/{total}" if total else "",
@@ -1915,15 +2132,21 @@ class LibraryRepository:
             item for item in self.list_deconstructions() if item["slug"] == slug
         )
         documents = []
+        golden_items = self._golden_three_items(root)
+        if golden_items:
+            documents.append(
+                {
+                    "filename": "黄金三章",
+                    "label": "黄金三章",
+                    "subdirectory": "章节",
+                    "items": golden_items,
+                }
+            )
         for filename, label in DOCUMENTS:
             path = self._safe_deconstruction_file(root, filename)
             if path is not None:
-                with path.open(
-                    "r", encoding="utf-8", errors="replace"
-                ) as handle:
-                    content = handle.read(
-                        self.settings.max_report_chars
-                    )
+                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                    content = handle.read(self.settings.max_report_chars)
                 documents.append(
                     {
                         "filename": filename,
@@ -1933,8 +2156,7 @@ class LibraryRepository:
                 )
         base["documents"] = documents
         base["has_chapter_summaries"] = (
-            self._safe_deconstruction_file(root, "_章节摘要汇总.md")
-            is not None
+            self._safe_deconstruction_file(root, "_章节摘要汇总.md") is not None
         )
         base["subdirectories"] = self._list_subdirectories(root)
         return base
@@ -1956,15 +2178,20 @@ class LibraryRepository:
             if not _within(subdir.resolve(), resolved_root):
                 continue
             entries = self._scan_subdir(subdir, resolved_root)
+            if subdir_name == "章节":
+                entries = [
+                    entry
+                    for entry in entries
+                    if entry.get("type") == "directory"
+                    or str(entry.get("filename") or "").endswith("_摘要.md")
+                ]
             if entries:
                 result.append({"name": subdir_name, "label": label, "items": entries})
         return result
 
-    def _scan_subdir(
-        self, directory: Path, root: Path
-    ) -> list[dict[str, Any]]:
+    def _scan_subdir(self, directory: Path, root: Path) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
-        for item in sorted(directory.iterdir()):
+        for item in sorted(directory.iterdir(), key=self._deconstruction_sort_key):
             if item.name.startswith(".") or item.name.startswith("_"):
                 continue
             if item.is_symlink():
@@ -1972,25 +2199,38 @@ class LibraryRepository:
             if not _within(item.resolve(), root):
                 continue
             if item.is_file() and item.suffix == ".md":
-                entries.append({
-                    "filename": item.name,
-                    "label": item.stem,
-                    "type": "file",
-                })
+                entries.append(
+                    {
+                        "filename": item.name,
+                        "label": item.stem,
+                        "type": "file",
+                    }
+                )
             elif item.is_dir():
                 children = self._scan_subdir(item, root)
                 if children:
-                    entries.append({
-                        "name": item.name,
-                        "label": item.name,
-                        "type": "directory",
-                        "items": children,
-                    })
+                    entries.append(
+                        {
+                            "name": item.name,
+                            "label": item.name,
+                            "type": "directory",
+                            "items": children,
+                        }
+                    )
         return entries
 
-    def get_deconstruction_file(
-        self, slug: str, subpath: str
-    ) -> dict[str, Any]:
+    @staticmethod
+    def _deconstruction_sort_key(path: Path) -> tuple[Any, ...]:
+        normalized = unicodedata.normalize("NFKC", path.stem)
+        chapter = re.match(r"^第\s*(\d+)\s*章(?:[_\s-]*(摘要|深度拆解))?", normalized)
+        if chapter:
+            kind_order = 0 if chapter.group(2) == "深度拆解" else 1
+            return (0, int(chapter.group(1)), kind_order, normalized.casefold())
+        parts = re.split(r"(\d+)", normalized.casefold())
+        natural = tuple(int(part) if part.isdigit() else part for part in parts)
+        return (1, *natural)
+
+    def get_deconstruction_file(self, slug: str, subpath: str) -> dict[str, Any]:
         if slug not in self._deconstruction_names():
             raise NotFoundError("拆书档案不存在")
         root = (self.settings.deconstruction_root / slug).resolve()

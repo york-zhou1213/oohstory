@@ -18,5 +18,5 @@ Nice=15
 IOSchedulingClass=idle
 CPUQuota=50%
 MemoryMax=1G
-StandardOutput=append:/opt/oohstory-admin/electronic-library/txt80/logs/serialized-update-sync.log
-StandardError=append:/opt/oohstory-admin/electronic-library/txt80/logs/serialized-update-sync.log
+StandardOutput=append:/opt/oohstory-admin/electronic-library/logs/serialized-update-sync.log
+StandardError=append:/opt/oohstory-admin/electronic-library/logs/serialized-update-sync.log

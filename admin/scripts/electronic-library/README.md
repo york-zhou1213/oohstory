@@ -13,11 +13,11 @@
 - 爬虫：`scripts/electronic-library/txt80_crawler.py`
 - 持久目录、任务与阅读指标：MySQL 8
 - 短时调度与下载流：Redis 7
-- 目录清单：`txt80/catalog.csv`
-- 小说文件：`txt80/书籍/<分类>/<书名>__<作者>__<来源ID>.txt`
-- 唯一全局拆书库：`txt80/全局拆书库/<书名>__<来源ID>/`
+- 目录清单：`catalog.csv`
+- 小说文件：`书籍/<分类>/<书名>__<作者>__<来源ID>.txt`
+- 唯一全局拆书库：`全局拆书库/<书名>__<来源ID>/`
 - 全局基调、剧情索引与精确字数/章节指标：MySQL 8
-- 日志：`txt80/logs/`
+- 日志：`logs/`
 
 任务具备分页与单书双层断点续传、失败重试、文件去重、SHA-256
 校验和磁盘安全线。重复执行同一命令只处理未完成项目。
@@ -64,12 +64,12 @@ python3 scripts/electronic-library/rebuild_library_metadata.py --book-id 59998 -
 ```
 
 每本书生成
-`txt80/全局索引/阅读目录/<catalog_id>.json`，记录准确章节顺序、名称、字节
+`全局索引/阅读目录/<catalog_id>.json`，记录准确章节顺序、名称、字节
 区间、逐章字数、全书字数和解析状态；书架准确统计写入 MySQL，避免任何
 SQLite 写锁。
 未识别到可靠章节标题的作品不会伪造章节数，而是保留分片阅读并在报告中标记
 `fallback_index`。默认报告写入
-`txt80/全局索引/library-metadata-rebuild-report.json`。
+`全局索引/library-metadata-rebuild-report.json`。
 
 全量任务使用两个并行服务：书目发现进程运行 `--discover-only`，正文下载
 进程运行 `--skip-discovery --watch`，因此小说会边扫描边进入电子书库。
@@ -89,7 +89,7 @@ SQLite 写锁。
 - Project Gutenberg：公版 TXT 来源。
 
 远程来源都只在用户选择具体作品后下载。下载后由已配置 AI 在现有分类中保守归类，
-统一转成 UTF-8 TXT，再写入 `txt80/书籍/<分类>/` 和本地目录数据库。
+统一转成 UTF-8 TXT，再写入 `书籍/<分类>/` 和本地目录数据库。
 Z-Library EPUB 会按 OPF 书脊顺序抽取正文后转为 TXT。爱下、txt80.cc 与
 Z-Library 适配器均限制请求频率、文件大小和下载跳转主机。
 
@@ -140,7 +140,7 @@ python3 scripts/electronic-library/fanqie_library_bridge.py \
 
 默认下载完整 TXT；也可传 `--format epub`，入库时会按 EPUB 书脊顺序抽取正文并
 统一写成 UTF-8 TXT。下载完成后，作品会由 AI 保守归类到
-`txt80/书籍/<分类>/`，写入全局目录并自动排队刷新基调索引；剧情索引保持手动。
+`书籍/<分类>/`，写入全局目录并自动排队刷新基调索引；剧情索引保持手动。
 指定
 `--start-chapter` 或 `--end-chapter` 的区间下载仅允许配合
 `--download-only` 做验证，不会把残缺作品写入全局书库。

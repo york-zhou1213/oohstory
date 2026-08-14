@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import os
 import json
 import base64
@@ -101,7 +103,7 @@ class AuthorizedShubaowProvider:
             Path(configured_cache).expanduser().resolve()
             if configured_cache
             else APP_ROOT
-            / "electronic-library" / "txt80" / ".download-cache" / "shubaow"
+            / "electronic-library" / ".download-cache" / "shubaow"
         )
 
     def _new_session(self) -> requests.Session:
@@ -530,7 +532,7 @@ class AuthorizedShubaowProvider:
                 if len(content) < 10:
                     raise RuntimeError("正文为空或过短")
                 return index, title, content
-            except Exception as exc:
+            except RECOVERABLE_OPERATION_ERRORS as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 if attempt < 4:
                     time.sleep(min(0.5 * attempt, 1.5))
@@ -603,7 +605,7 @@ class AuthorizedShubaowProvider:
                     chapter_ref = str(chapters[index].get("path") or "")
                     if chapter_ref:
                         manifest[chapter_ref] = cache_path.name
-                except Exception as exc:
+                except RECOVERABLE_OPERATION_ERRORS as exc:
                     errors.append(f"章节 {index + 1}: {type(exc).__name__}: {str(exc)[:160]}")
         write_chapter_manifest(cache_dir, manifest)
         if errors or any(item is None for item in downloaded):

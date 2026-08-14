@@ -65,13 +65,13 @@ def parse_args() -> argparse.Namespace:
         "--library-root",
         type=Path,
         default=DEFAULT_LIBRARY_ROOT,
-        help="电子书库根目录，默认 electronic-library/txt80",
+        help="电子书库根目录，默认 electronic-library",
     )
     parser.add_argument(
         "--runtime-dir",
         type=Path,
         default=DEFAULT_RUNTIME_DIR,
-        help="派生索引目录，默认 electronic-library/txt80/全局索引",
+        help="派生索引目录，默认 electronic-library/全局索引",
     )
     parser.add_argument(
         "--book-id",

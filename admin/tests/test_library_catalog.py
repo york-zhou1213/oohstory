@@ -267,7 +267,7 @@ def test_plot_evidence_is_read_only_bounded_and_decodes_motif_tags(settings):
 
 
 def test_global_deconstruction_and_status_files_are_bounded_and_read_only(settings, tmp_path):
-    root = tmp_path / "electronic-library" / "txt80"
+    root = tmp_path / "electronic-library"
     runtime = root / "全局索引"
     deconstruction = root / "全局拆书库"
     task_root = deconstruction / ".tasks"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import hashlib
 import json
 import os
@@ -10,7 +12,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unicodedata
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlparse, urlunparse
@@ -59,7 +61,7 @@ CREATE INDEX IF NOT EXISTS idx_covers_status ON covers(status, attempts);
 
 
 def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _mysql_runtime() -> MySQLLibraryRuntime | None:
@@ -448,7 +450,7 @@ def sync_remote_cover(
             "cover_url": cover_url,
             "bytes": len(data),
         }
-    except Exception as exc:
+    except RECOVERABLE_OPERATION_ERRORS as exc:
         error = f"{type(exc).__name__}: {str(exc)[:300]}"
         if mysql_runtime is not None:
             mysql_runtime.persist_cover_result(
@@ -668,7 +670,7 @@ def sync_alternate_remote_cover(
                 }[extension]
             ),
         )
-    except Exception:
+    except RECOVERABLE_OPERATION_ERRORS:
         if created:
             target.unlink(missing_ok=True)
         raise
@@ -681,7 +683,7 @@ def sync_alternate_remote_cover(
             original_filename=original_filename,
             replacement_filename=filename,
         )
-    except Exception as exc:
+    except RECOVERABLE_OPERATION_ERRORS as exc:
         cleanup = {
             "status": "cleanup_deferred",
             "marked": False,
@@ -938,10 +940,10 @@ def sync_fanqie_cover(
                     "cover_url": candidate,
                     "bytes": len(data),
                 }
-            except Exception as exc:  # try the next trusted CDN variant
+            except RECOVERABLE_OPERATION_ERRORS as exc:  # try the next trusted CDN variant
                 last_error = f"{type(exc).__name__}: {str(exc)[:240]}"
         raise ValueError(last_error or "番茄封面下载失败")
-    except Exception as exc:
+    except RECOVERABLE_OPERATION_ERRORS as exc:
         error = f"{type(exc).__name__}: {str(exc)[:300]}"
         if mysql_runtime is not None:
             mysql_runtime.persist_cover_result(

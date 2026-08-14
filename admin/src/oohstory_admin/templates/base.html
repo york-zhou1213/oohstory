@@ -23,7 +23,7 @@
     </div>
     <div class="topbar-context" aria-hidden="true">
       <span class="context-dot"></span>
-      <span>{{ {'dashboard':'系统概览','library':'电子书库总览','library_sync':'同步调度','books':'小说目录','operations':'运营管理','pipeline':'管道与服务','audit':'审计日志'}.get(page, '运维工作台') }}</span>
+      <span>{{ {'dashboard':'系统概览','library':'电子书库总览','library_sync':'同步调度','books':'小说目录','operations':'运营管理','maintenance':'站点维护','pipeline':'管道与服务','audit':'审计日志'}.get(page, '运维工作台') }}</span>
     </div>
     <div class="account">
       <button class="icon-button theme-toggle" type="button" data-theme-toggle aria-label="切换明暗主题" title="切换明暗主题"><span aria-hidden="true">◐</span></button>
@@ -49,6 +49,7 @@
         <p class="nav-section-label">运营管理</p>
         <a {% if page == 'operations' %}aria-current="page"{% endif %} href="{{ base_path }}/operations"><span class="nav-icon" aria-hidden="true">◎</span><span><strong>注册与内容运营</strong><small>用户、上下架、分类与上传</small></span></a>
         <p class="nav-section-label">系统治理</p>
+        <a {% if page == 'maintenance' %}aria-current="page"{% endif %} href="{{ base_path }}/maintenance"><span class="nav-icon" aria-hidden="true">◇</span><span><strong>站点维护</strong><small>静态页与访问切换</small></span></a>
         <a {% if page == 'pipeline' %}aria-current="page"{% endif %} href="{{ base_path }}/pipeline"><span class="nav-icon" aria-hidden="true">⌘</span><span><strong>管道与服务</strong><small>脚本与 systemd</small></span></a>
         <a {% if page == 'audit' %}aria-current="page"{% endif %} href="{{ base_path }}/audit"><span class="nav-icon" aria-hidden="true">✓</span><span><strong>审计日志</strong><small>操作追踪与问责</small></span></a>
       </nav>

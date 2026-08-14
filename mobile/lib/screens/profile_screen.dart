@@ -4,6 +4,7 @@ import '../services/api_service.dart';
 import '../services/local_storage_service.dart';
 import '../services/reading_progress.dart';
 import '../services/account_service.dart';
+import '../services/app_update_service.dart';
 import '../theme/app_theme.dart';
 import 'book_detail_screen.dart';
 import 'local_reader_screen.dart';
@@ -15,6 +16,7 @@ import 'account_settings_screen.dart';
 import 'notifications_screen.dart';
 import 'submission_center_screen.dart';
 import '../widgets/reading_identity.dart';
+import '../main.dart' show ttsService;
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -635,6 +637,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
       alignment: Alignment.centerRight,
       child: TextButton.icon(
         onPressed: () async {
+          ttsService.stop();
           await _account.logout();
           if (!mounted) return;
           setState(() {
@@ -1354,7 +1357,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
               theme,
               Icons.info_outline_rounded,
               '关于',
-              subtitle: 'OohStory v1.9.4',
+              subtitle: 'OohStory v${AppUpdateService.currentVersionName}',
               onTap: _showAbout,
             ),
           ],
@@ -1751,7 +1754,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     showAboutDialog(
       context: context,
       applicationName: 'OohStory',
-      applicationVersion: 'v1.3.3',
+      applicationVersion: 'v${AppUpdateService.currentVersionName}',
       applicationIcon: Container(
         width: 48,
         height: 48,

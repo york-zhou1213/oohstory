@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import os
 import re
 import threading
@@ -440,7 +442,7 @@ class AuthorizedTxt80Provider:
                 if len(data) < 128:
                     raise ValueError("txt80.cc 作品内容为空或过短")
                 return bytes(data)
-            except Exception as exc:
+            except RECOVERABLE_OPERATION_ERRORS as exc:
                 errors.append(f"{type(exc).__name__}: {str(exc)[:160]}")
             finally:
                 if response is not None:

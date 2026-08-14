@@ -15,17 +15,32 @@ FORBIDDEN_SUFFIXES = {
     ".aab", ".apk", ".db", ".jks", ".key", ".p12", ".pem", ".pfx",
     ".sqlite", ".sqlite3", ".tar", ".tgz", ".zip",
 }
-FORBIDDEN_NAMES = {".env", ".env.compose", "id_rsa", "id_ed25519"}
+FORBIDDEN_NAMES = {
+    ".env",
+    ".env.compose",
+    "GoogleService-Info.plist",
+    "google-services.json",
+    "id_rsa",
+    "id_ed25519",
+    "key.properties",
+}
 TEXT_RULES = {
     "private-key marker": re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     "AWS access key": re.compile(rb"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
     "GitHub token": re.compile(rb"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b"),
     "Slack token": re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
     "Google API key": re.compile(rb"\bAIza[A-Za-z0-9_-]{30,}\b"),
+    "Google OAuth client identifier": re.compile(
+        rb"\b[0-9]{6,}-[A-Za-z0-9_-]{20,}\.apps\.googleusercontent\.com\b"
+    ),
     "embedded bearer token": re.compile(rb"(?i)authorization\s*[:=]\s*['\"]?bearer\s+[A-Za-z0-9._~+/-]{20,}"),
     "Cloudflare beacon token": re.compile(rb"data-cf-beacon\s*=", re.IGNORECASE),
     "host-specific root path": re.compile(rb"/(?:root|home)/[^/\s]+/"),
     "production library mount": re.compile(rb"/mnt/" + rb"electronic-library"),
+    "private LAN address": re.compile(rb"\b192\.168\.[0-9]{1,3}\.[0-9]{1,3}\b"),
+    "production public URL": re.compile(
+        rb"https?://(?:www\.|m\.)?" + rb"oohstory\.com(?:[/:'\"]|$)"
+    ),
 }
 
 
@@ -54,6 +69,9 @@ def main() -> int:
         if not path.is_file() or is_ignored(path):
             continue
         relative = path.relative_to(ROOT)
+        if path.is_symlink():
+            findings.append((relative.as_posix(), 0, "symbolic link"))
+            continue
         lower_name = path.name.casefold()
         if lower_name in FORBIDDEN_NAMES or path.suffix.casefold() in FORBIDDEN_SUFFIXES:
             findings.append((relative.as_posix(), 0, "private/binary artifact"))

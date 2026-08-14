@@ -91,7 +91,7 @@ class SystemdController:
         argv = [self.systemctl_path, "--no-pager", "show", unit, f"--property={properties}"]
         try:
             completed = self.runner(argv, **self._run_options(3.0))
-        except (subprocess.TimeoutExpired, OSError) as exc:
+        except (subprocess.TimeoutExpired, OSError):
             return {
                 "unit": unit,
                 "label": UNIT_ALLOWLIST[unit],

@@ -63,6 +63,9 @@ class _ReaderScreenState extends State<ReaderScreen>
   bool _ttsPlaying = false;
   bool _ttsContinueOnLoad = false;
   double _readProgress = 0.0;
+  int? _pendingTtsScrollParagraph;
+  bool _ttsScrollRetryScheduled = false;
+  int _ttsScrollRetryAttempts = 0;
   Timer? _readingHeartbeatTimer;
   DateTime _lastInteraction = DateTime.now();
   bool _readerForeground = true;
@@ -285,38 +288,7 @@ class _ReaderScreenState extends State<ReaderScreen>
     return result;
   }
 
-  int _currentVisibleParagraph() {
-    final positions =
-        _positionsListener.itemPositions.value
-            .where(
-              (position) =>
-                  position.itemTrailingEdge > 0 && position.itemLeadingEdge < 1,
-            )
-            .toList()
-          ..sort((a, b) => a.itemLeadingEdge.compareTo(b.itemLeadingEdge));
-    for (final position in positions) {
-      final itemIndex = position.index - 1;
-      if (itemIndex < 0 || itemIndex >= _items.length) continue;
-      final ttsIndex = _items[itemIndex].ttsIndex;
-      if (ttsIndex >= 0) return ttsIndex;
-    }
-    return 0;
-  }
-
   String get _ttsCheckpointKey => 'oohstory_tts_checkpoint_${widget.bookId}';
-
-  Future<int?> _loadTtsCheckpoint() async {
-    try {
-      final preferences = await SharedPreferences.getInstance();
-      final raw = preferences.getString(_ttsCheckpointKey);
-      if (raw == null) return null;
-      final data = jsonDecode(raw) as Map<String, dynamic>;
-      if (data['chapter_id']?.toString() != _currentChapterId) return null;
-      return (data['paragraph_index'] as num?)?.toInt();
-    } catch (_) {
-      return null;
-    }
-  }
 
   Future<void> _saveTtsCheckpoint(int paragraphIndex) async {
     final preferences = await SharedPreferences.getInstance();
@@ -330,16 +302,45 @@ class _ReaderScreenState extends State<ReaderScreen>
     );
   }
 
+  void _scheduleTtsScrollRetry() {
+    if (_ttsScrollRetryScheduled || !mounted) return;
+    _ttsScrollRetryScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _ttsScrollRetryScheduled = false;
+      final pending = _pendingTtsScrollParagraph;
+      if (!mounted || pending == null) return;
+      if (_ttsScrollRetryAttempts >= 8) {
+        _pendingTtsScrollParagraph = null;
+        _ttsScrollRetryAttempts = 0;
+        return;
+      }
+      _ttsScrollRetryAttempts++;
+      _scrollToTtsParagraph(pending);
+    });
+  }
+
   void _scrollToTtsParagraph(int idx) {
-    if (!mounted || _tts.currentChapterId != _currentChapterId) return;
+    if (!mounted || _tts.currentChapterId != _currentChapterId) {
+      _pendingTtsScrollParagraph = null;
+      _ttsScrollRetryAttempts = 0;
+      return;
+    }
     final scrollIdx = _items.indexWhere((item) => item.ttsIndex == idx);
-    if (scrollIdx < 0 || !_scrollCtrl.isAttached) return;
+    if (scrollIdx < 0 || !_scrollCtrl.isAttached) {
+      _pendingTtsScrollParagraph = idx;
+      _scheduleTtsScrollRetry();
+      return;
+    }
+    _pendingTtsScrollParagraph = null;
+    _ttsScrollRetryAttempts = 0;
     unawaited(
-      _scrollCtrl.scrollTo(
-        index: scrollIdx + 1,
-        duration: const Duration(milliseconds: 260),
-        curve: Curves.easeOutCubic,
-      ),
+      _scrollCtrl
+          .scrollTo(
+            index: scrollIdx + 1,
+            duration: const Duration(milliseconds: 260),
+            curve: Curves.easeOutCubic,
+          )
+          .catchError((_) {}),
     );
   }
 
@@ -391,6 +392,7 @@ class _ReaderScreenState extends State<ReaderScreen>
     _tts.bookTitle = widget.book?.title;
     _tts.chapterTitle = _chapter?.displayTitle;
     _tts.authorName = widget.book?.author;
+    _tts.coverArtUrl = _api.mediaCoverArtUrl(widget.bookId);
     _tts.configureChapter(
       bookId: widget.bookId,
       chapterId: _currentChapterId,
@@ -402,24 +404,30 @@ class _ReaderScreenState extends State<ReaderScreen>
         for (final chapter in widget.chapters) chapter.id: chapter.displayTitle,
       },
     );
-    final checkpoint = startParagraph == null
-        ? await _loadTtsCheckpoint()
-        : null;
-    final start = (startParagraph ?? checkpoint ?? _currentVisibleParagraph())
-        .clamp(0, _ttsParagraphs.length - 1)
-        .toInt();
-    _tts.buildPlan(_ttsParagraphs, startParagraph: start);
+    final explicitStart = startParagraph != null;
+    final allowServerResume = false;
+    final requestedStart = explicitStart ? startParagraph : 0;
+    final start = requestedStart.clamp(0, _ttsParagraphs.length - 1).toInt();
+    try {
+      await _tts.buildAuthoritativePlan(
+        startParagraph: start,
+        allowServerResume: allowServerResume,
+      );
+    } catch (error) {
+      _tts.stop();
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('听书服务暂时不可用，请稍后重试')));
+      return;
+    }
     _attachTtsCallbacks();
     unawaited(_tts.play());
     if (mounted) setState(() => _ttsPlaying = true);
   }
 
   void _toggleTts() {
-    if (_tts.active && !_tts.isPlaying) {
-      _attachTtsCallbacks();
-      _tts.resume();
-      setState(() => _ttsPlaying = true);
-    } else if (_tts.active || _ttsPlaying) {
+    if (_tts.active && _ttsPlaying) {
       _ttsContinueOnLoad = false;
       _tts.stop();
       setState(() {
@@ -427,7 +435,15 @@ class _ReaderScreenState extends State<ReaderScreen>
         _ttsHighlight = -1;
       });
     } else {
-      unawaited(_startTts());
+      if (_tts.active) {
+        _ttsContinueOnLoad = false;
+        _tts.stop();
+        setState(() {
+          _ttsPlaying = false;
+          _ttsHighlight = -1;
+        });
+      }
+      unawaited(_startTts(startParagraph: 0));
     }
   }
 
@@ -561,7 +577,16 @@ class _ReaderScreenState extends State<ReaderScreen>
     if (!_ttsPlaying || !_tts.active || _ttsParagraphs.isEmpty) return;
     final paragraph = _tts.currentParagraphIndex;
     _tts.stop();
-    _tts.buildPlan(_ttsParagraphs, startParagraph: paragraph);
+    try {
+      await _tts.buildAuthoritativePlan(startParagraph: paragraph);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _ttsPlaying = false);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('听书设置更新失败，请稍后重试')));
+      return;
+    }
     await _tts.play();
   }
 

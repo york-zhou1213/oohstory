@@ -121,3 +121,10 @@ class LibraryActionClient:
         if not TASK_ID_RE.fullmatch(task_id):
             raise LibraryActionError("拆书任务标识无效")
         return self.run("task_detail", {"task_id": task_id}).data
+
+    def serialized_update_source(self, source_id: str, enabled: bool) -> dict[str, Any]:
+        return self.run(
+            "serialized_update_source",
+            {"source_id": source_id, "enabled": bool(enabled)},
+            timeout_seconds=120,
+        ).data

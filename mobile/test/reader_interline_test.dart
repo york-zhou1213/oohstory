@@ -3,24 +3,27 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('reader TTS starts at the current visible paragraph', () {
+  test('reader TTS separates chapter start from listen-from-here', () {
     final source = File('lib/screens/reader_screen.dart').readAsStringSync();
     final service = File('lib/services/tts_service.dart').readAsStringSync();
 
-    expect(source, contains('int _currentVisibleParagraph()'));
     expect(
       source,
-      contains('startParagraph ?? checkpoint ?? _currentVisibleParagraph()'),
+      contains('final requestedStart = explicitStart ? startParagraph : 0'),
     );
     expect(
       source,
-      contains('_tts.buildPlan(_ttsParagraphs, startParagraph: start);'),
+      isNot(
+        contains('startParagraph ?? checkpoint ?? _currentVisibleParagraph()'),
+      ),
     );
+    expect(source, contains('allowServerResume: allowServerResume'));
+    expect(source, isNot(contains('_tts.buildPlan(_ttsParagraphs')));
     expect(source, contains('_startTts(startParagraph: item.ttsIndex)'));
     expect(source, contains("'从此处听书'"));
-    expect(service, contains('_requestCharacterLimit = 900'));
-    expect(service, contains('static List<String> _splitForRequest'));
-    expect(service, contains('_appendPlan(line, v, i);'));
+    expect(service, contains('Future<void> buildAuthoritativePlan'));
+    expect(service, contains('_api.audiobookContinuousStreamUri'));
+    expect(service, isNot(contains('/api/v1/tts/speak')));
   });
 
   test('reader exposes paragraph comments, bubbles and cumulative likes', () {

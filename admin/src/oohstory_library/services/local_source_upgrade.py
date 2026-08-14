@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import asyncio
 import re
 import uuid
-from pathlib import Path
 from typing import Any, Iterable
 
 from oohstory_library.services.authorized_source_recovery import exact_identity, source_fields
@@ -179,7 +180,7 @@ def exact_candidates(
         provider = providers[source_name]
         try:
             results = provider.search(title, limit=12)
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             errors.append(f"{source_name}: {type(exc).__name__}: {str(exc)[:240]}")
             continue
         for item in results:
@@ -187,7 +188,7 @@ def exact_candidates(
                 continue
             try:
                 candidate = source_fields(service, source_name, item)
-            except Exception as exc:
+            except RECOVERABLE_OPERATION_ERRORS as exc:
                 errors.append(
                     f"{source_name}: {type(exc).__name__}: {str(exc)[:240]}"
                 )
@@ -485,7 +486,7 @@ def retire_recorded_source_covers(
                 result["already_missing"] += 1
             else:
                 result["retained"] += 1
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             result["failed"] += 1
     marked_missing = runtime.mark_clean_covers_deleted_batch(already_missing)
     result["already_missing"] += int(marked_missing)
@@ -576,7 +577,7 @@ async def process_job(
             return
         try:
             await asyncio.to_thread(_ixdzs_progress, service, candidate)
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             # A body-progress probe may fail while the exact-match detail and
             # cover remain usable. Keep the cover and only skip the newer-body
             # decision for this source.
@@ -601,7 +602,7 @@ async def process_job(
         candidate = candidates[0]
         try:
             await asyncio.to_thread(_candidate_detail, service, candidate)
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             detail_errors.append(
                 f"{candidate['source_name']}: "
                 f"{type(exc).__name__}: {str(exc)[:300]}"
@@ -627,7 +628,7 @@ async def process_job(
                 request_bytes=request_bytes,
                 reject_known_watermarks=True,
             )
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             cover_errors.append(
                 f"{candidate['source_name']}: "
                 f"{type(exc).__name__}: {str(exc)[:300]}"
@@ -728,7 +729,7 @@ async def process_job(
                 prepared=prepared_cover,
             )
             cover_replaced = True
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             # The image already passed source, format, malware and watermark
             # validation. Persistence failures are infrastructure failures;
             # probing another website cannot repair them.

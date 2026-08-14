@@ -11,6 +11,8 @@ import 'services/tts_audio_handler.dart';
 import 'services/tts_service.dart';
 import 'services/api_service.dart';
 import 'services/account_service.dart';
+import 'services/app_update_service.dart';
+import 'widgets/app_update_dialog.dart';
 
 late TtsAudioHandler ttsHandler;
 late TtsService ttsService;
@@ -32,7 +34,9 @@ Future<void> main() async {
 }
 
 class OohStoryApp extends StatelessWidget {
-  const OohStoryApp({super.key});
+  final bool checkForUpdates;
+
+  const OohStoryApp({super.key, this.checkForUpdates = true});
 
   @override
   Widget build(BuildContext context) {
@@ -42,13 +46,15 @@ class OohStoryApp extends StatelessWidget {
       theme: AppTheme.light(),
       darkTheme: AppTheme.dark(),
       themeMode: ThemeMode.system,
-      home: const SplashScreen(),
+      home: SplashScreen(checkForUpdates: checkForUpdates),
     );
   }
 }
 
 class SplashScreen extends StatefulWidget {
-  const SplashScreen({super.key});
+  final bool checkForUpdates;
+
+  const SplashScreen({super.key, this.checkForUpdates = true});
 
   @override
   State<SplashScreen> createState() => _SplashScreenState();
@@ -74,7 +80,8 @@ class _SplashScreenState extends State<SplashScreen>
       if (mounted) {
         Navigator.of(context).pushReplacement(
           PageRouteBuilder(
-            pageBuilder: (_, __, ___) => const MainShell(),
+            pageBuilder: (_, __, ___) =>
+                MainShell(checkForUpdates: widget.checkForUpdates),
             transitionsBuilder: (_, animation, __, child) {
               return FadeTransition(opacity: animation, child: child);
             },
@@ -149,14 +156,18 @@ class _SplashScreenState extends State<SplashScreen>
 }
 
 class MainShell extends StatefulWidget {
-  const MainShell({super.key});
+  final bool checkForUpdates;
+
+  const MainShell({super.key, this.checkForUpdates = true});
 
   @override
   State<MainShell> createState() => _MainShellState();
 }
 
-class _MainShellState extends State<MainShell> {
+class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   int _currentIndex = 0;
+  late final AppUpdateService _appUpdateService;
+  bool _checkingUpdate = false;
 
   final _screens = const [
     HomeScreen(),
@@ -164,6 +175,54 @@ class _MainShellState extends State<MainShell> {
     DeconstructionScreen(),
     ProfileScreen(),
   ];
+
+  @override
+  void initState() {
+    super.initState();
+    _appUpdateService = AppUpdateService(ApiService());
+    WidgetsBinding.instance.addObserver(this);
+    if (widget.checkForUpdates) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _checkForUpdates());
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (widget.checkForUpdates && state == AppLifecycleState.resumed) {
+      unawaited(_checkForUpdates());
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  Future<void> _checkForUpdates() async {
+    if (_checkingUpdate || !mounted) return;
+    _checkingUpdate = true;
+    try {
+      final info = await _appUpdateService.checkForUpdate();
+      if (!mounted || info == null) return;
+      await _appUpdateService.markPrompted(info);
+      if (!mounted) return;
+      final action = await showAppUpdateDialog(context, info);
+      if (action != AppUpdateAction.update || !mounted) return;
+      try {
+        await _appUpdateService.openDownload(info);
+      } catch (_) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('无法打开更新下载，请稍后再试')));
+      }
+    } catch (_) {
+      // Update checks must never block normal reading.
+    } finally {
+      _checkingUpdate = false;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {

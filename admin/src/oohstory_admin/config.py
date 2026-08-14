@@ -107,13 +107,13 @@ class Settings:
     login_window_seconds: int = 900
     reader_url: str = "http://127.0.0.1:8091"
     upstream_timeout_seconds: float = 4.0
-    library_root: Path = _PROJECT_ROOT / "electronic-library" / "txt80"
-    library_runtime_dir: Path = _PROJECT_ROOT / "electronic-library" / "txt80" / "全局索引"
-    library_object_root: Path = _PROJECT_ROOT / "electronic-library" / "txt80"
+    library_root: Path = _PROJECT_ROOT / "electronic-library"
+    library_runtime_dir: Path = _PROJECT_ROOT / "electronic-library" / "全局索引"
+    library_object_root: Path = _PROJECT_ROOT / "electronic-library"
     library_mysql_host: str = "127.0.0.1"
     library_mysql_port: int = 3306
     library_mysql_database: str = "oohstory_library"
-    library_mysql_user: str = "oohstory_library_reader"
+    library_mysql_user: str = "oohstory_library"
     library_mysql_password: str = field(default="", repr=False)
     library_redis_host: str = "127.0.0.1"
     library_redis_port: int = 6379
@@ -135,10 +135,9 @@ class Settings:
     systemctl_path: str = "/usr/bin/systemctl"
     use_sudo_helper: bool = False
     systemctl_helper_path: str = "/usr/local/libexec/oohstory-admin-systemctl"
-    script_store_helper_path: str = "/usr/local/libexec/oohstory-admin-script-store"
     library_action_helper_path: str = "/usr/local/libexec/oohstory-admin-library-action"
+    maintenance_helper_path: str = "/usr/local/libexec/oohstory-admin-maintenance"
     library_upload_dir: Path = _PROJECT_ROOT / ".state" / "cover-uploads"
-    managed_script_root: Path = _PROJECT_ROOT
 
     @property
     def auth_configured(self) -> bool:
@@ -192,19 +191,19 @@ class Settings:
             "OOHSTORY_ADMIN_SYSTEMCTL_HELPER_PATH",
             "/usr/local/libexec/oohstory-admin-systemctl",
         )
-        script_helper_path = env.get(
-            "OOHSTORY_ADMIN_SCRIPT_STORE_HELPER_PATH",
-            "/usr/local/libexec/oohstory-admin-script-store",
-        )
         library_action_helper_path = env.get(
             "OOHSTORY_ADMIN_LIBRARY_ACTION_HELPER_PATH",
             "/usr/local/libexec/oohstory-admin-library-action",
         )
+        maintenance_helper_path = env.get(
+            "OOHSTORY_ADMIN_MAINTENANCE_HELPER_PATH",
+            "/usr/local/libexec/oohstory-admin-maintenance",
+        )
         if (
             not Path(systemctl_path).is_absolute()
             or not Path(helper_path).is_absolute()
-            or not Path(script_helper_path).is_absolute()
             or not Path(library_action_helper_path).is_absolute()
+            or not Path(maintenance_helper_path).is_absolute()
         ):
             raise ValueError("helper paths must be absolute")
         return cls(
@@ -233,17 +232,17 @@ class Settings:
             library_root=_path(
                 "OOHSTORY_LIBRARY_ROOT",
                 env.get("OOHSTORY_LIBRARY_ROOT", ""),
-                default=_PROJECT_ROOT / "electronic-library" / "txt80",
+                default=_PROJECT_ROOT / "electronic-library",
             ),
             library_runtime_dir=_path(
                 "OOHSTORY_LIBRARY_RUNTIME_DIR",
                 env.get("OOHSTORY_LIBRARY_RUNTIME_DIR", ""),
-                default=_PROJECT_ROOT / "electronic-library" / "txt80" / "全局索引",
+                default=_PROJECT_ROOT / "electronic-library" / "全局索引",
             ),
             library_object_root=_path(
                 "OOHSTORY_LIBRARY_OBJECT_ROOT",
                 env.get("OOHSTORY_LIBRARY_OBJECT_ROOT", ""),
-                default=_PROJECT_ROOT / "electronic-library" / "txt80",
+                default=_PROJECT_ROOT / "electronic-library",
             ),
             library_mysql_host=env.get("OOHSTORY_LIBRARY_MYSQL_HOST", "127.0.0.1").strip(),
             library_mysql_port=_integer(
@@ -257,7 +256,7 @@ class Settings:
                 "OOHSTORY_LIBRARY_MYSQL_DATABASE", "oohstory_library"
             ).strip(),
             library_mysql_user=env.get(
-                "OOHSTORY_LIBRARY_MYSQL_USER", "oohstory_library_reader"
+                "OOHSTORY_LIBRARY_MYSQL_USER", "oohstory_library"
             ).strip(),
             library_mysql_password=_secret(
                 "OOHSTORY_LIBRARY_MYSQL_PASSWORD",
@@ -351,16 +350,11 @@ class Settings:
             systemctl_path=systemctl_path,
             use_sudo_helper=_boolean(env.get("OOHSTORY_ADMIN_USE_SUDO_HELPER"), False),
             systemctl_helper_path=helper_path,
-            script_store_helper_path=script_helper_path,
             library_action_helper_path=library_action_helper_path,
+            maintenance_helper_path=maintenance_helper_path,
             library_upload_dir=_path(
                 "OOHSTORY_ADMIN_LIBRARY_UPLOAD_DIR",
                 env.get("OOHSTORY_ADMIN_LIBRARY_UPLOAD_DIR", ""),
                 default=_PROJECT_ROOT / ".state" / "cover-uploads",
-            ),
-            managed_script_root=_path(
-                "OOHSTORY_ADMIN_MANAGED_SCRIPT_ROOT",
-                env.get("OOHSTORY_ADMIN_MANAGED_SCRIPT_ROOT", ""),
-                default=_PROJECT_ROOT,
             ),
         )

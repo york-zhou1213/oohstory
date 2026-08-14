@@ -26,7 +26,7 @@ import sys
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 from project_paths import APP_ROOT  # noqa: E402
-LIBRARY_ROOT = APP_ROOT / "electronic-library" / "txt80"
+LIBRARY_ROOT = APP_ROOT / "electronic-library"
 COVER_ROOT = (LIBRARY_ROOT / "封面").resolve()
 INDEX_PATH = Path(
     os.getenv(
@@ -95,12 +95,14 @@ def openclaw_environment() -> dict[str, str]:
     current_node = shutil.which("node")
     if current_node:
         candidate_bins.append(Path(current_node).resolve().parent)
-    candidate_bins.extend(
-        sorted(
-            (Path.home() / ".nvm" / "versions" / "node").glob("v*/bin"),
-            reverse=True,
+    for home in (Path("/root"), Path.home()):
+        candidate_bins.extend(
+            sorted(
+                (home / ".nvm" / "versions" / "node").glob("v*/bin"),
+                reverse=True,
+            )
         )
-    )
+    candidate_bins.append(Path("/opt/linuxbrew/bin"))
 
     checked: set[Path] = set()
     for bin_dir in candidate_bins:

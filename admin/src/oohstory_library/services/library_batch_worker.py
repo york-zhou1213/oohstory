@@ -7,11 +7,13 @@
 
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import argparse
 import json
 import sys
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict
 
@@ -22,7 +24,7 @@ from oohstory_library.services.library_task_runners import max_parallel_tasks
 
 
 def now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def read_json(path: Path) -> Dict[str, Any]:
@@ -166,7 +168,7 @@ def run(batch_file: Path) -> int:
                 continue
             batch["failed"] = int(batch.get("failed") or 0) + 1
             batch["message"] = f"作品 {book_id} 入队失败：{exc}"
-        except Exception as exc:  # pragma: no cover - worker safety boundary
+        except RECOVERABLE_OPERATION_ERRORS as exc:  # pragma: no cover - worker safety boundary
             batch["failed"] = int(batch.get("failed") or 0) + 1
             batch["message"] = f"作品 {book_id} 入队异常：{exc}"
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source_root=${OOHSTORY_DECONSTRUCTION_SOURCE:-/srv/oohstory/library/全局拆书库}
-target_root=${OOHSTORY_DECONSTRUCTION_PUBLIC_ROOT:-/srv/oohstory-deconstructions}
+source_root=/srv/oohstory/library/全局拆书库
+target_root=/srv/oohstory-deconstructions
 
 if [[ -L "$target_root" ]]; then
   printf 'refusing public mirror symlink: %s -> %s\n' \

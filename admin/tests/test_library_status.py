@@ -64,9 +64,9 @@ class FakeDatabase:
 
 
 def _settings(settings, tmp_path: Path):
-    root = tmp_path / "electronic-library" / "txt80"
+    root = tmp_path / "electronic-library"
     runtime = root / "全局索引"
-    object_root = tmp_path / "electronic-library" / "txt80"
+    object_root = tmp_path / "electronic-library"
     runtime.mkdir(parents=True)
     object_root.mkdir(parents=True, exist_ok=True)
     return replace(
@@ -195,11 +195,13 @@ def test_root_owned_worker_permission_error_still_means_alive(monkeypatch):
     assert _pid_alive(4321) is True
 
 
-def test_open_source_repository_does_not_embed_host_data_link():
+def test_repository_does_not_publish_a_host_data_link():
     project = Path(__file__).resolve().parents[1]
     link = project / "electronic-library"
     assert not link.exists()
-    assert not link.is_symlink()
+    assert "electronic-library" in (project / ".gitignore").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_source_contains_no_webnovel_http_dependency():

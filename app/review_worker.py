@@ -14,7 +14,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +21,7 @@ from .accounts import AccountStore
 from .settings import Settings, load_settings
 from .submission_moderation import inspect_submission_content
 from .submissions import parse_strict_review
+from .upload_worker import inspect_upload_once
 
 
 def _sha256(path: Path) -> str:
@@ -30,6 +30,15 @@ def _sha256(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _submission_name(item: dict[str, Any]) -> str:
+    kind = str(item.get("submission_type") or "")
+    raw = item.get("title") if kind == "novel" else item.get("original_filename")
+    name = str(raw or item.get("resource_title") or "未命名投稿").strip()
+    if kind == "deconstruction" and name.casefold().endswith(".zip"):
+        name = name[:-4].rstrip()
+    return (name or "未命名投稿")[:80]
 
 
 def _text_excerpt(path: Path, limit: int = 60_000) -> str:
@@ -61,8 +70,14 @@ def _review_payload(item: dict[str, Any], settings: Settings) -> dict[str, Any]:
         extracted = stored.parent / "extracted"
         content_root = extracted / str(structure.get("normalized_root") or "")
         for name in (
-            "_meta.json", "_progress.md", "拆文报告.md", "快速预览.md", "概要.md",
-            "情节节点.md", "写作手法.md", "原文/原文.txt",
+            "_meta.json",
+            "_progress.md",
+            "拆文报告.md",
+            "快速预览.md",
+            "概要.md",
+            "情节节点.md",
+            "写作手法.md",
+            "原文/原文.txt",
         ):
             candidate = (content_root / name).resolve()
             if (
@@ -80,7 +95,13 @@ def _review_payload(item: dict[str, Any], settings: Settings) -> dict[str, Any]:
         )
     else:
         for key in (
-            "title", "author", "category", "serialization_status", "summary", "source", "authorization"
+            "title",
+            "author",
+            "category",
+            "serialization_status",
+            "summary",
+            "source",
+            "authorization",
         ):
             payload[key] = item.get(key)
         manuscript = settings.user_upload_root / str(item.get("manuscript_path") or "")
@@ -107,17 +128,22 @@ def _call_ai(settings: Settings, payload: dict[str, Any]) -> dict[str, Any]:
         diagnostic = (result.stderr or "").strip().splitlines()
         if diagnostic:
             print(
-                "AI review bridge: " + " | ".join(line[:300] for line in diagnostic[-10:]),
+                "AI review bridge: "
+                + " | ".join(line[:300] for line in diagnostic[-10:]),
                 file=sys.stderr,
             )
         raise RuntimeError(f"审核进程退出码 {result.returncode}")
     return parse_strict_review(result.stdout.strip())
 
 
-def _copy_payload(item: dict[str, Any], settings: Settings, temp: Path) -> list[dict[str, Any]]:
+def _copy_payload(
+    item: dict[str, Any], settings: Settings, temp: Path
+) -> list[dict[str, Any]]:
     kind = str(item["submission_type"])
     if kind == "deconstruction":
-        sources = [(settings.user_upload_root / str(item["stored_filename"]), "source.zip")]
+        sources = [
+            (settings.user_upload_root / str(item["stored_filename"]), "source.zip")
+        ]
     else:
         manuscript = settings.user_upload_root / str(item["manuscript_path"])
         sources = [
@@ -127,20 +153,27 @@ def _copy_payload(item: dict[str, Any], settings: Settings, temp: Path) -> list[
     files: list[dict[str, Any]] = []
     for source, name in sources:
         source = source.resolve(strict=True)
-        if settings.user_upload_root.resolve() not in source.parents or source.is_symlink():
+        if (
+            settings.user_upload_root.resolve() not in source.parents
+            or source.is_symlink()
+        ):
             raise RuntimeError("投稿沙箱路径无效")
         target = temp / name
         shutil.copyfile(source, target)
         target.chmod(0o640)
-        files.append({
-            "path": name,
-            "bytes": target.stat().st_size,
-            "sha256": _sha256(target),
-        })
+        files.append(
+            {
+                "path": name,
+                "bytes": target.stat().st_size,
+                "sha256": _sha256(target),
+            }
+        )
     return files
 
 
-def _write_handoff(item: dict[str, Any], result: dict[str, Any], settings: Settings) -> str:
+def _write_handoff(
+    item: dict[str, Any], result: dict[str, Any], settings: Settings
+) -> str:
     root = settings.user_submission_handoff_root.resolve()
     root.mkdir(parents=True, exist_ok=True, mode=0o750)
     final = (root / str(item["id"])).resolve()
@@ -155,7 +188,13 @@ def _write_handoff(item: dict[str, Any], result: dict[str, Any], settings: Setti
         metadata = {
             key: item.get(key)
             for key in (
-                "title", "author", "category", "serialization_status", "summary", "source", "authorization",
+                "title",
+                "author",
+                "category",
+                "serialization_status",
+                "summary",
+                "source",
+                "authorization",
                 "structure_profile",
             )
             if item.get(key) is not None
@@ -165,11 +204,16 @@ def _write_handoff(item: dict[str, Any], result: dict[str, Any], settings: Setti
                 structure = json.loads(item.get("structure_report") or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
                 structure = {}
-            metadata.update({
-                "original_filename": item.get("original_filename") or "",
-                "upload_sha256": item.get("sha256") or "",
-                "structure_report": structure,
-            })
+            metadata.update(
+                {
+                    "original_filename": item.get("original_filename") or "",
+                    "upload_sha256": item.get("sha256") or "",
+                    "structure_report": structure,
+                    "contributor_username": str(
+                        item.get("contributor_username") or "读者"
+                    )[:40],
+                }
+            )
         manifest = {
             "schema_version": 1,
             "type": str(item["submission_type"]),
@@ -179,7 +223,9 @@ def _write_handoff(item: dict[str, Any], result: dict[str, Any], settings: Setti
             "review": result,
         }
         ready_tmp = temp / "ready.json.tmp"
-        ready_tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        ready_tmp.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         ready_tmp.chmod(0o640)
         ready_tmp.replace(temp / "ready.json")
         try:
@@ -195,7 +241,10 @@ def _write_handoff(item: dict[str, Any], result: dict[str, Any], settings: Setti
 
 def review_once(settings: Settings | None = None) -> dict[str, Any] | None:
     settings = settings or load_settings()
-    store = AccountStore(settings.user_database_path, session_ttl_seconds=settings.session_ttl_seconds)
+    store = AccountStore(
+        settings.user_database_path, session_ttl_seconds=settings.session_ttl_seconds
+    )
+    inspect_upload_once(settings, store)
     item = store.claim_review()
     if not item:
         return None
@@ -212,7 +261,9 @@ def review_once(settings: Settings | None = None) -> dict[str, Any] | None:
                 "decision": "reject",
                 "reason": str(content_evidence.get("reason") or "内容安全审核未通过"),
                 "missing_files": [],
-                "issues": [str(value) for value in content_evidence.get("issues") or []],
+                "issues": [
+                    str(value) for value in content_evidence.get("issues") or []
+                ],
             }
         elif kind == "novel" and queued_review.get("admin_approved") is True:
             result = {
@@ -223,6 +274,13 @@ def review_once(settings: Settings | None = None) -> dict[str, Any] | None:
             }
         else:
             result = _call_ai(settings, payload)
+        if kind == "deconstruction":
+            contributor = store.comment_authors([str(item["user_id"])]).get(
+                str(item["user_id"]), {}
+            )
+            item["contributor_username"] = str(
+                contributor.get("display_name") or "读者"
+            )
         structure = payload.get("structure") or {}
         if kind == "deconstruction" and not bool(structure.get("valid")):
             missing = [str(value) for value in structure.get("missing_files") or []]
@@ -232,22 +290,41 @@ def review_once(settings: Settings | None = None) -> dict[str, Any] | None:
                 "missing_files": missing,
                 "issues": result.get("issues") or [],
             }
-        handoff = _write_handoff(item, result, settings) if result["decision"] == "approve" else ""
-        completed = store.complete_review(kind, str(item["id"]), result, handoff_manifest=handoff)
+        handoff = (
+            _write_handoff(item, result, settings)
+            if result["decision"] == "approve"
+            else ""
+        )
+        completed = store.complete_review(
+            kind, str(item["id"]), result, handoff_manifest=handoff
+        )
         if completed:
             approved = completed["status"] == "approved"
+            submission_name = _submission_name(item)
             store.create_notification(
                 completed["user_id"],
                 kind="submission_review",
-                title="投稿审核通过" if approved else "投稿审核未通过",
-                message=("投稿已安全交接，等待入库。" if approved else result["reason"]),
+                title=(
+                    f"《{submission_name}》投稿审核通过"
+                    if approved
+                    else f"《{submission_name}》投稿审核未通过"
+                ),
+                message=(
+                    f"《{submission_name}》已安全交接，等待入库。"
+                    if approved
+                    else f"《{submission_name}》：{result['reason']}"
+                ),
                 action_url="#/account/submissions",
                 resource_type=kind,
                 resource_id=str(item["id"]),
                 dedupe_key=f"review:{kind}:{item['id']}:{completed['status']}",
             )
-        return {"id": str(item["id"]), "type": kind, "status": completed["status"] if completed else "stale"}
-    except Exception as exc:
+        return {
+            "id": str(item["id"]),
+            "type": kind,
+            "status": completed["status"] if completed else "stale",
+        }
+    except BaseException as exc:
         store.release_review(kind, str(item["id"]), str(exc))
         raise
 
@@ -269,13 +346,20 @@ def reconcile_results(
             result = json.loads(result_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, json.JSONDecodeError):
             continue
-        if not isinstance(result, dict) or str(result.get("status") or "").casefold() not in {
-            "completed", "rejected", "failed"
-        }:
+        if not isinstance(result, dict) or str(
+            result.get("status") or ""
+        ).casefold() not in {"completed", "rejected", "failed"}:
             continue
         allowed = {
-            "status", "catalog_id", "public_id", "output", "output_slug",
-            "message", "reason", "completed_at",
+            "status",
+            "catalog_id",
+            "public_id",
+            "output",
+            "output_slug",
+            "message",
+            "reason",
+            "completed_at",
+            "source_upgrade",
         }
         if set(result) - allowed or not str(result.get("completed_at") or "").strip():
             continue
@@ -287,11 +371,16 @@ def reconcile_results(
         if not completed:
             continue
         succeeded = completed["status"] == "completed"
+        submission_name = _submission_name(item)
         store.create_notification(
             completed["user_id"],
             kind="submission_ingestion",
-            title="投稿已完成入库" if succeeded else "投稿入库被驳回",
-            message=completed["message"],
+            title=(
+                f"《{submission_name}》投稿已完成入库"
+                if succeeded
+                else f"《{submission_name}》投稿入库被驳回"
+            ),
+            message=f"《{submission_name}》：{completed['message']}",
             action_url="#/account/submissions",
             resource_type=str(item["submission_type"]),
             resource_id=str(item["id"]),
@@ -303,10 +392,14 @@ def reconcile_results(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--once", action="store_true", help="process at most one queued submission")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--once", action="store_true", help="process at most one queued submission"
+    )
+    parser.parse_args()
     settings = load_settings()
-    store = AccountStore(settings.user_database_path, session_ttl_seconds=settings.session_ttl_seconds)
+    store = AccountStore(
+        settings.user_database_path, session_ttl_seconds=settings.session_ttl_seconds
+    )
     reconcile_results(store, settings)
     result = review_once(settings)
     if result:

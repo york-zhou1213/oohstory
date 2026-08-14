@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import json
 import hashlib
 import os
@@ -9,7 +11,7 @@ import re
 import time
 import unicodedata
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from oohstory_library.services.library_database import MySQLConnectionPool, RedisQueueClient
@@ -540,7 +542,7 @@ class LibraryDownloadQueue:
                     priority=int(row["priority"]),
                 )
                 dispatched.append(job_id)
-            except Exception as exc:
+            except RECOVERABLE_OPERATION_ERRORS as exc:
                 failures.append(
                     (job_id, f"{type(exc).__name__}: {str(exc)[:500]}")
                 )
@@ -601,7 +603,7 @@ class LibraryDownloadQueue:
                 lease_expired = (
                     status == "downloading"
                     and row.get("lease_expires_at")
-                    and row["lease_expires_at"] < datetime.utcnow()
+                    and row["lease_expires_at"] < datetime.now(UTC).replace(tzinfo=None)
                 )
                 if status not in {"queued", "pending"} and not lease_expired:
                     return None

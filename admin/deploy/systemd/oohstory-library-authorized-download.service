@@ -18,8 +18,8 @@ MemoryMax=2560M
 TasksMax=256
 OOMPolicy=stop
 TimeoutStartSec=6h
-StandardOutput=append:/opt/oohstory-admin/electronic-library/txt80/logs/authorized-download.log
-StandardError=append:/opt/oohstory-admin/electronic-library/txt80/logs/authorized-download.log
+StandardOutput=append:/opt/oohstory-admin/electronic-library/logs/authorized-download.log
+StandardError=append:/opt/oohstory-admin/electronic-library/logs/authorized-download.log
 
 [Install]
 WantedBy=multi-user.target

@@ -20,6 +20,7 @@ def test_shared_console_navigation_and_real_routes(client):
         "/admin/books/catalog": "书目总量",
         "/admin/books/search": "全局书源搜索",
         "/admin/operations": "运营管理",
+        "/admin/maintenance": "站点维护",
         "/admin/pipeline": "管道与服务",
         "/admin/audit": "审计日志",
     }
@@ -78,7 +79,7 @@ def test_library_parity_controls_are_visible(client):
     assert "书库定时同步" in sync.text
     assert "按站点全力同步正文" in sync.text
     assert 'id="site-full-sync"' in sync.text
-    assert "与 Webnovel Writer 电子书库保持同等五站能力" in sync.text
+    assert "保持完整的站点调度合同" in sync.text
     assert "这里只控制 OOHStory 自有" in sync.text
     assert "站点全力同步" in sync.text
     assert "封面重绘加速器" in sync.text

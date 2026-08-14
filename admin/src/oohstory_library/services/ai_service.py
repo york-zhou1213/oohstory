@@ -1,6 +1,10 @@
 
 """AI 服务模块 - 对接 OpenAI 兼容 API / Codex 登录态"""
 
+from __future__ import annotations
+
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import os
 import re
 import json
@@ -17,9 +21,9 @@ from oohstory_library.services.codex_cli import codex_env, ensure_codex_cli
 
 # 默认 AI API 配置
 DEFAULT_AI_BASE_URL = "https://api.openai.com/v1"
-DEFAULT_AI_API_KEY = ""
+DEFAULT_AI_API_KEY = "your-openai-api-key-here"
 DEFAULT_AI_MODEL = "gemini-3.1-pro-preview"
-PLACEHOLDER_API_KEYS = {"", "your-openai-api-key-here", "******"}
+PLACEHOLDER_API_KEYS = {"", DEFAULT_AI_API_KEY, "your-openai-api-key-here", "******"}
 CODEX_MODEL_OPTIONS = [
     "gpt-5.6-sol",
     "gpt-5.6-terra",
@@ -106,7 +110,8 @@ class AIService:
 
     def check_claude_cli_ready(self) -> dict:
         """检测本地 Claude CLI 是否可用及登录状态"""
-        import shutil, subprocess
+        import shutil
+        import subprocess
         path = shutil.which("claude")
         if not path:
             return {"ready": False, "reason": "未找到 claude 命令，请先安装 Claude Code CLI"}
@@ -119,11 +124,12 @@ class AIService:
             if not version:
                 return {"ready": False, "reason": "claude --version 调用失败"}
             return {"ready": True, "version": version, "path": path}
-        except Exception as e:
+        except RECOVERABLE_OPERATION_ERRORS as e:
             return {"ready": False, "reason": str(e)}
 
     def check_gemini_cli_ready(self) -> dict:
-        import shutil, subprocess
+        import shutil
+        import subprocess
         path = shutil.which("gemini")
         if not path:
             return {"ready": False, "reason": "未找到 gemini 命令，请先安装 Gemini CLI"}
@@ -133,7 +139,7 @@ class AIService:
             if not version:
                 return {"ready": False, "reason": "gemini --version 调用失败"}
             return {"ready": True, "version": version, "path": path, "default_model": "gemini-3.1-pro-preview"}
-        except Exception as e:
+        except RECOVERABLE_OPERATION_ERRORS as e:
             return {"ready": False, "reason": str(e)}
 
     def _build_gemini_cli_cmd(self, user_prompt: str, system_prompt: str, stream: bool) -> List[str]:
@@ -168,7 +174,7 @@ class AIService:
         try:
             data = json.loads(raw)
             return str(data.get("response") or data.get("text") or data.get("content") or raw).strip()
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             return raw
 
     async def _chat_stream_gemini_cli(self, messages: List[Dict], temperature: float, max_tokens: int):
@@ -395,7 +401,7 @@ class AIService:
             result = subprocess.run([ensure_codex_cli(), "login", "status"], capture_output=True, text=True, timeout=10, env=codex_env())
             text = ((result.stdout or "") + (result.stderr or "")).strip().lower()
             return ("not logged in" not in text) and ("logged in" in text)
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             return False
 
     def _normalize_codex_model(self, model_name: str) -> str:
@@ -413,7 +419,7 @@ class AIService:
                 slug = item.get("slug")
                 if slug and item.get("visibility", "list") == "list":
                     models.append(slug)
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             pass
         preferred = [*models, *CODEX_MODEL_OPTIONS]
         seen = set()
@@ -495,7 +501,7 @@ class AIService:
         try:
             status_proc = subprocess.run([ensure_codex_cli(), "login", "status"], capture_output=True, text=True, timeout=10, env=codex_env())
             login_status = ((status_proc.stdout or "") + (status_proc.stderr or "")).strip().lower()
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             login_status = ""
 
         # ChatGPT 登录态只支持本账号暴露在 Codex 模型缓存中的 slug。
@@ -522,7 +528,7 @@ class AIService:
 
         try:
             output_file.unlink(missing_ok=True)
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             pass
 
         cmd = [ensure_codex_cli(), "exec", "-", "--json", "--output-last-message", str(output_file), "--color", "never"]
@@ -575,7 +581,7 @@ class AIService:
                 if text:
                     cleanup_output()
                     return text
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 pass
 
         decoded_stdout = (stdout or b"").decode("utf-8", errors="ignore").strip()
@@ -698,7 +704,7 @@ class AIService:
                             error_text = await response.text()
                             print(f"AI Error {response.status}: {error_text[:200]}")
                             raise Exception(f"AI API returned {response.status}: {error_text[:100]}")
-            except Exception as e:
+            except RECOVERABLE_OPERATION_ERRORS as e:
                 last_error = e
                 print(f"AI Request Failed (attempt {attempt + 1}/{max_retries}): {e}")
                 if attempt < max_retries - 1:
@@ -756,7 +762,7 @@ class AIService:
             msg_preview = json.dumps(messages, ensure_ascii=False)[:500]
             self._debug(f"Request Messages Preview: {msg_preview}...")
             self._debug(f"Total Messages count: {len(messages)}")
-        except:
+        except (TypeError, ValueError):
             pass
 
         max_retries = 3
@@ -792,7 +798,7 @@ class AIService:
                                         return
                             except json.JSONDecodeError as e:
                                 print(f"Failed to parse JSON response: {e}")
-                                yield f"[ERROR] Failed to parse AI response"
+                                yield "[ERROR] Failed to parse AI response"
                                 return
 
                         # SSE 流式处理 - 使用 buffer 累积并按行分割
@@ -858,7 +864,7 @@ class AIService:
 
                         self._debug(f"AI Stream ended, total chunks: {chunk_count}")
                         return
-            except Exception as e:
+            except RECOVERABLE_OPERATION_ERRORS as e:
                 print(f"AI Stream Request Failed (attempt {attempt + 1}/{max_retries}): {e}")
                 if attempt < max_retries - 1:
                     import asyncio
@@ -900,7 +906,7 @@ class AIService:
                         if models:
                             return self._dedupe_models([self.model, *models])
                     print(f"Error fetching Anthropic models: {response.status_code} - {response.text}")
-            except Exception as e:
+            except RECOVERABLE_OPERATION_ERRORS as e:
                 print(f"Error fetching Anthropic models: {e}")
             return self._fallback_models()
 
@@ -928,7 +934,7 @@ class AIService:
                     models = [m.get("id") for m in data["data"] if isinstance(m, dict) and m.get("id")]
                     return self._dedupe_models([self.model, *models]) if models else self._fallback_models()
                 return self._fallback_models()
-        except Exception as e:
+        except RECOVERABLE_OPERATION_ERRORS as e:
             print(f"Error fetching models from {url}: {e}")
             return self._fallback_models()
 
@@ -1061,7 +1067,7 @@ class AIService:
             elif "```" in result:
                 result = result.split("```")[1].split("```")[0]
             return json.loads(result.strip())
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             return {
                 "scores": {"high_point": 0, "consistency": 0, "pacing": 0, "ooc": 0, "continuity": 0},
                 "issues": ["无法解析审查结果"],
@@ -1151,7 +1157,7 @@ def _load_config_from_file() -> Dict[str, str]:
     if CONFIG_FILE.exists():
         try:
             return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception as e:
+        except RECOVERABLE_OPERATION_ERRORS as e:
             print(f"Warning: Failed to load AI config: {e}")
     return {}
 
@@ -1160,7 +1166,7 @@ def _save_config_to_file(config: Dict[str, str]):
     try:
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_FILE.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception as e:
+    except RECOVERABLE_OPERATION_ERRORS as e:
         print(f"Error saving AI config: {e}")
 
 # 全局实例

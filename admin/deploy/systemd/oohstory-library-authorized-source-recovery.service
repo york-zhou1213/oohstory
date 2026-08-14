@@ -19,8 +19,8 @@ Nice=15
 IOSchedulingClass=idle
 CPUQuota=40%
 MemoryMax=768M
-StandardOutput=append:/opt/oohstory-admin/electronic-library/txt80/logs/authorized-source-recovery.log
-StandardError=append:/opt/oohstory-admin/electronic-library/txt80/logs/authorized-source-recovery.log
+StandardOutput=append:/opt/oohstory-admin/electronic-library/logs/authorized-source-recovery.log
+StandardError=append:/opt/oohstory-admin/electronic-library/logs/authorized-source-recovery.log
 
 [Install]
 WantedBy=multi-user.target

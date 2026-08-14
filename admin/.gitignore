@@ -9,3 +9,7 @@ htmlcov/
 *.db-shm
 *.db-wal
 .env
+build/
+dist/
+*.egg-info/
+electronic-library

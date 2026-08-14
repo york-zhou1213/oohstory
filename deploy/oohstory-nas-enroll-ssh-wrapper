@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+readonly EXPECTED_COMMAND="ensure"
+readonly ENSURE_HELPER="/usr/local/sbin/oohstory-nas-ensure-client"
+
+if [ "${SSH_ORIGINAL_COMMAND:-}" != "$EXPECTED_COMMAND" ]; then
+  printf '%s\n' 'oohstory-nas-enroll: command refused' >&2
+  exit 64
+fi
+
+set -- ${SSH_CONNECTION:-}
+if [ "$#" -ne 4 ]; then
+  printf '%s\n' 'oohstory-nas-enroll: missing SSH peer identity' >&2
+  exit 64
+fi
+readonly SSH_PEER_IP="$1"
+
+exec /usr/bin/sudo -n "$ENSURE_HELPER" "$SSH_PEER_IP"

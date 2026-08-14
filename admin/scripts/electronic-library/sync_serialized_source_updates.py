@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scan four authorized recent-update feeds and refresh changed local books."""
+"""Scan authorized recent-update feeds and refresh changed local books."""
 
 from __future__ import annotations
 
@@ -30,13 +30,28 @@ from oohstory_library.services.library_download_queue import LibraryDownloadQueu
 STATE_PATH = (
     APP_ROOT
     / "electronic-library"
-    / "txt80"
     / "全局索引"
     / "serialized-source-updates.json"
 )
-LOCK_PATH = STATE_PATH.with_suffix(".lock")
 COMPLETED_STATUSES = {"已完结", "完结", "completed", "finished"}
 DEFAULT_SOURCE_NAMES = ("xbiquge", "ixdzs", "shubaow", "linovelib")
+FORMAL_SOURCE_DEFAULTS: dict[str, dict[str, int]] = {
+    "xbiquge": {"pages": 20, "limit": 50, "workers": 3},
+    "ixdzs": {"pages": 20, "limit": 50, "workers": 4},
+    "shubaow": {"pages": 5, "limit": 2, "workers": 1},
+    "linovelib": {"pages": 5, "limit": 4, "workers": 1},
+}
+
+
+def state_path_for_sources(source_names: tuple[str, ...]) -> Path:
+    if len(source_names) == 1:
+        source = source_names[0]
+        return STATE_PATH.with_name(f"serialized-source-updates-{source}.json")
+    return STATE_PATH
+
+
+def lock_path_for_sources(source_names: tuple[str, ...]) -> Path:
+    return state_path_for_sources(source_names).with_suffix(".lock")
 
 
 def clean(value: Any) -> str:
@@ -304,19 +319,19 @@ def probe_update_item(provider: Any, item: dict[str, Any]) -> dict[str, Any]:
     return normalized_source_item(probe(item)) if callable(probe) else item
 
 
-def write_state(payload: dict[str, Any]) -> None:
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary = STATE_PATH.with_suffix(".json.tmp")
+def write_state(payload: dict[str, Any], state_path: Path) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = state_path.with_suffix(".json.tmp")
     temporary.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    os.replace(temporary, STATE_PATH)
+    os.replace(temporary, state_path)
 
 
-def seconds_since_last_completion() -> float | None:
+def seconds_since_last_completion(state_path: Path) -> float | None:
     try:
-        payload = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
         completed_at = float(payload.get("completed_at_epoch") or 0)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
@@ -458,10 +473,11 @@ def run(
     apply_direct: bool = False,
     limit_per_source: int = 20,
     source_workers: dict[str, int] | None = None,
+    state_path: Path = STATE_PATH,
 ) -> dict[str, Any]:
     service = ElectronicLibraryService()
     if service.infrastructure_settings.catalog_backend != "mysql":
-        raise RuntimeError("连载更新同步要求 WEBNOVEL_CATALOG_BACKEND=mysql")
+        raise RuntimeError("连载更新同步要求 OOHSTORY_LIBRARY_CATALOG_BACKEND=mysql")
     queue = (
         None
         if apply_direct or dry_run
@@ -477,6 +493,24 @@ def run(
         **(source_workers or {}),
     }
     ai_service = get_ai_service() if apply_direct and not dry_run else None
+    if not dry_run:
+        write_state(
+            {
+                "status": "running",
+                "mode": (
+                    "dry_run" if dry_run else ("direct" if apply_direct else "queue")
+                ),
+                "lane_mode": (
+                    "single_source" if len(source_names) == 1 else "aggregate"
+                ),
+                "pages_per_source": pages,
+                "limit_per_source": int(limit_per_source),
+                "sources_requested": list(source_names),
+                "started_at_epoch": time.time(),
+                "state_path": str(state_path),
+            },
+            state_path,
+        )
     totals = {
         "seen": 0,
         "catalog_added": 0,
@@ -677,16 +711,18 @@ def run(
         "mode": (
             "dry_run" if dry_run else ("direct" if apply_direct else "queue")
         ),
+        "lane_mode": "single_source" if len(source_names) == 1 else "aggregate",
         "pages_per_source": pages,
+        "limit_per_source": int(limit_per_source),
         "sources_requested": list(source_names),
         "totals": totals,
         "sources": sources,
         "ingestion_index": index_refresh,
         "completed_at_epoch": time.time(),
-        "state_path": str(STATE_PATH),
+        "state_path": str(state_path),
     }
     if not dry_run:
-        write_state(result)
+        write_state(result, state_path)
     return result
 
 
@@ -707,6 +743,11 @@ def main() -> int:
         action="store_true",
         help="直接原子刷新本地原书；否则写入兼容下载队列",
     )
+    parser.add_argument(
+        "--formal-defaults",
+        action="store_true",
+        help="按单来源正式追更 lane 的默认页数、并发和刷新上限执行",
+    )
     parser.add_argument("--limit-per-source", type=int, default=20)
     parser.add_argument("--min-interval", type=int, default=0)
     parser.add_argument("--force", action="store_true")
@@ -725,14 +766,23 @@ def main() -> int:
         source_names = parse_source_names(args.sources)
     except ValueError as exc:
         parser.error(str(exc))
-    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with LOCK_PATH.open("a+", encoding="utf-8") as lock:
+    if args.formal_defaults:
+        if len(source_names) != 1:
+            parser.error("--formal-defaults 只能用于单一来源")
+        formal = FORMAL_SOURCE_DEFAULTS[source_names[0]]
+        args.pages = formal["pages"]
+        args.limit_per_source = formal["limit"]
+        setattr(args, f"{source_names[0]}_workers", formal["workers"])
+    state_path = state_path_for_sources(source_names)
+    lock_path = lock_path_for_sources(source_names)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             print(json.dumps({"status": "already_running"}, ensure_ascii=False))
             return 0
-        elapsed = seconds_since_last_completion()
+        elapsed = seconds_since_last_completion(state_path)
         if (
             not args.force
             and int(args.min_interval) > 0
@@ -743,7 +793,7 @@ def main() -> int:
                 "status": "skipped_recent",
                 "seconds_since_last_completion": round(elapsed, 3),
                 "min_interval": int(args.min_interval),
-                "state_path": str(STATE_PATH),
+                "state_path": str(state_path),
             }
         else:
             result = run(
@@ -758,6 +808,7 @@ def main() -> int:
                     "shubaow": int(args.shubaow_workers),
                     "linovelib": int(args.linovelib_workers),
                 },
+                state_path=state_path,
             )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

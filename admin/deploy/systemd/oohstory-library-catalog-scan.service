@@ -12,5 +12,5 @@ ExecStart=/opt/oohstory-admin/.venv/bin/python /opt/oohstory-admin/scripts/elect
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=6
-StandardOutput=append:/opt/oohstory-admin/electronic-library/txt80/logs/catalog-scan.log
-StandardError=append:/opt/oohstory-admin/electronic-library/txt80/logs/catalog-scan.log
+StandardOutput=append:/opt/oohstory-admin/electronic-library/logs/catalog-scan.log
+StandardError=append:/opt/oohstory-admin/electronic-library/logs/catalog-scan.log

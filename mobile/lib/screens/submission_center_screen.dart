@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import '../services/account_service.dart';
 import '../theme/app_theme.dart';
+import '../widgets/account_success_toast.dart';
 
 class SubmissionCenterScreen extends StatefulWidget {
   const SubmissionCenterScreen({super.key});
@@ -53,9 +54,9 @@ class _SubmissionCenterScreenState extends State<SubmissionCenterScreen> {
     super.dispose();
   }
 
-  Future<void> _load() async {
+  Future<void> _load({bool silent = false}) async {
     setState(() {
-      _loading = true;
+      if (!silent) _loading = true;
       _error = null;
     });
     try {
@@ -99,8 +100,12 @@ class _SubmissionCenterScreenState extends State<SubmissionCenterScreen> {
     setState(() => _submitting = true);
     try {
       final result = await _account.uploadSource(path);
-      _message(result['message'] as String? ?? '已提交审核');
-      await _load();
+      if (!mounted) return;
+      showAccountSuccessToast(
+        context,
+        message: result['message'] as String? ?? '上传成功，正在等待审核',
+      );
+      await _load(silent: true);
     } catch (error) {
       _message(error.toString());
     } finally {

@@ -35,6 +35,9 @@ OOHSTORY_PYTHON = Path("/opt/oohstory-admin/.venv/bin/python")
 OOHSTORY_CATALOG_DELETE = Path(
     "/opt/oohstory-admin/scripts/electronic-library/delete_catalog_books.py"
 )
+LIBRARY_ROOT_COORDINATOR = Path(
+    "/usr/local/libexec/electronic-library-root-migration"
+)
 JOB_ID_RE = re.compile(r"^[a-f0-9]{20}$")
 TASK_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 PLAN_ID_RE = re.compile(r"^[a-f0-9]{12}$")
@@ -57,6 +60,7 @@ SITE_FULL_SYNC_GROUPS = {
     "shubaow": "fanqie",
     "linovelib": "fanqie",
 }
+SERIALIZED_UPDATE_SOURCES = {"xbiquge", "ixdzs", "shubaow", "linovelib"}
 SAFE_ENV_RE = re.compile(
     r"^(?:OOHSTORY_LIBRARY_|WEBNOVEL_LIBRARY_|WEBNOVEL_GLOBAL_DECONSTRUCTION_ROOT$|"
     r"LIBRARY_TASK_USE_SYSTEMD$)[A-Z0-9_]*$"
@@ -173,6 +177,52 @@ def optional_positive_int(payload: dict[str, Any], name: str) -> int | None:
     if normalized <= 0 or normalized > 1_000_000:
         raise ValueError(f"{name} 必须是正整数")
     return normalized
+
+
+def library_root_migration(payload: dict[str, Any]) -> dict[str, Any]:
+    action = str(payload.get("action") or "")
+    mapped = {
+        "root_migration_status": "status",
+        "root_migration_preflight": "preflight",
+        "root_migration_start": "start",
+    }.get(action)
+    if not mapped:
+        raise ValueError("未知书库根路径迁移操作")
+    request: dict[str, Any] = {"action": mapped}
+    if mapped == "preflight":
+        request.update(
+            {
+                "source": safe_text(payload, "source", 1024),
+                "destination": safe_text(payload, "destination", 1024),
+            }
+        )
+    elif mapped == "start":
+        request.update(
+            {
+                "plan_token": safe_text(payload, "plan_token", 32),
+                "confirmation": safe_text(payload, "confirmation", 32),
+            }
+        )
+    if not LIBRARY_ROOT_COORDINATOR.is_file():
+        raise RuntimeError("书库根路径迁移协调器未安装")
+    completed = subprocess.run(
+        [str(LIBRARY_ROOT_COORDINATOR), "dispatch"],
+        input=json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=180,
+    )
+    try:
+        response = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(detail[-500:] or "书库迁移协调器响应无效") from exc
+    if completed.returncode != 0 or not response.get("ok"):
+        raise RuntimeError(str(response.get("message") or "书库迁移操作失败")[:500])
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError("书库迁移协调器响应无效")
+    return data
 
 
 def account_connection() -> sqlite3.Connection:
@@ -767,7 +817,8 @@ async def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
                 "delete_catalog_books",
                 "deconstruct", "resume", "deconstruction_batch",
                 "task_runners", "task_detail", "sync_status", "sync_control",
-                "site_full_sync", "cover_redraw_control",
+                "site_full_sync", "serialized_update_source", "cover_redraw_control",
+                "root_migration_status", "root_migration_preflight", "root_migration_start",
                 "index_refresh", "plot_query", "plot_plan", "plot_preview",
                 "plot_apply", "plot_adaptations",
                 "operations_overview", "invite_create", "invite_revoke",
@@ -789,7 +840,8 @@ async def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
         "job_status", "search", "move", "cover", "import",
         "delete_catalog_books",
         "deconstruct", "resume", "deconstruction_batch", "task_detail", "upload_cover",
-        "sync_status", "sync_control", "site_full_sync", "cover_redraw_control", "index_refresh", "plot_query", "plot_plan",
+        "sync_status", "sync_control", "site_full_sync", "serialized_update_source", "cover_redraw_control", "index_refresh", "plot_query", "plot_plan",
+        "root_migration_status", "root_migration_preflight", "root_migration_start",
         "plot_preview", "plot_apply", "plot_adaptations",
         "operations_overview", "invite_create", "invite_revoke",
         "registered_user_status", "registered_user_sessions_revoke",
@@ -799,6 +851,8 @@ async def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
     }
     if action not in allowed_actions:
         raise ValueError("操作不在允许列表中")
+    if action.startswith("root_migration_"):
+        return library_root_migration(payload)
     ensure_roots()
     if action == "operations_overview":
         return operations_overview(payload)
@@ -853,6 +907,12 @@ async def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
             enabled,
             books_per_cycle=books_per_cycle,
         )
+    if action == "serialized_update_source":
+        source_id = safe_text(payload, "source_id", 16)
+        if source_id not in SERIALIZED_UPDATE_SOURCES:
+            raise ValueError("未知连载追更来源")
+        enabled = strict_bool(payload, "enabled")
+        return service.set_serialized_update_source(source_id, enabled)
     if action == "cover_redraw_control":
         target_per_hour = optional_positive_int(payload, "target_per_hour")
         if target_per_hour is None:

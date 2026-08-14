@@ -28,7 +28,6 @@ from oohstory_library.services.library_download_queue import LibraryDownloadQueu
 STATE_PATH = (
     APP_ROOT
     / "electronic-library"
-    / "txt80"
     / "全局索引"
     / "authorized-source-recovery.json"
 )

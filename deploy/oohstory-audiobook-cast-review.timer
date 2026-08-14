@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll OOH Story low-confidence audiobook cast AI review queue
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=10s
+Persistent=true
+Unit=oohstory-audiobook-cast-review.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly NAS_HOST="192.0.2.20"
+readonly NAS_PORT="22"
+readonly NAS_USER="oohstory-nas"
+readonly SSH_KEY="/etc/oohstory-nas-recovery/id_ed25519"
+readonly KNOWN_HOSTS="/etc/oohstory-nas-recovery/known_hosts"
+readonly SSH="${OOHSTORY_NAS_ENROLL_SSH:-/usr/bin/ssh}"
+
+if [[ "$SSH" != /* || ! -x "$SSH" ]]; then
+  printf 'oohstory-nas-enroll: invalid ssh executable\n' >&2
+  exit 64
+fi
+for credential_path in "$SSH_KEY" "$KNOWN_HOSTS"; do
+  if [[ ! -f "$credential_path" || ! -r "$credential_path" ]]; then
+    printf 'oohstory-nas-enroll: missing credential file: %s\n' "$credential_path" >&2
+    exit 66
+  fi
+done
+
+exec "$SSH" \
+  -T \
+  -p "$NAS_PORT" \
+  -i "$SSH_KEY" \
+  -o BatchMode=yes \
+  -o IdentitiesOnly=yes \
+  -o StrictHostKeyChecking=yes \
+  -o "UserKnownHostsFile=$KNOWN_HOSTS" \
+  -o ConnectTimeout=5 \
+  -o ConnectionAttempts=1 \
+  -o ServerAliveInterval=3 \
+  -o ServerAliveCountMax=1 \
+  -o LogLevel=ERROR \
+  "$NAS_USER@$NAS_HOST" ensure

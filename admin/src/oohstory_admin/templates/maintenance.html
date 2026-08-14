@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}站点维护 · OOHStory 运维台{% endblock %}
+{% block content %}
+<div class="page-heading maintenance-heading">
+  <div>
+    <p class="eyebrow">PUBLIC ACCESS CONTROL</p>
+    <h1>站点维护</h1>
+    <p class="muted">无需重启 Reader，一键切换面向读者的全静态维护页面。</p>
+  </div>
+  <span class="status {{ 'warn' if maintenance.enabled else 'ok' }}">
+    {{ '维护页生效中' if maintenance.enabled else '站点正常开放' }}
+  </span>
+</div>
+
+{% if notice %}<div class="alert alert-info" role="status">{{ notice }}</div>{% endif %}
+{% if error %}<div class="alert alert-error" role="alert">{{ error }}</div>{% endif %}
+{% if not maintenance.available %}<div class="alert alert-error" role="alert">维护控制助手不可用：{{ maintenance.error or '状态读取失败' }}</div>{% endif %}
+
+<section class="maintenance-console" aria-labelledby="maintenance-control-title">
+  <div class="maintenance-control-panel">
+    <div class="maintenance-state-mark" aria-hidden="true">
+      <span>O!</span>
+      <i></i>
+    </div>
+    <div class="maintenance-control-copy">
+      <span class="maintenance-kicker">当前公开状态</span>
+      <h2 id="maintenance-control-title">{{ '读者正在看到维护页面' if maintenance.enabled else '读者正在正常访问 OOHStory' }}</h2>
+      <p>{{ '所有公开页面返回静态维护内容，API 返回 503，健康检查保持可用。' if maintenance.enabled else '阅读、听书、书架和个人中心均按正常链路提供服务。' }}</p>
+      {% if maintenance.changed_at %}<small>最近切换：{{ maintenance.changed_at }}</small>{% endif %}
+    </div>
+    <form method="post" action="{{ base_path }}/maintenance" class="maintenance-switch-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="action" value="{{ 'disable' if maintenance.enabled else 'enable' }}">
+      <button class="button {{ 'button-primary' if maintenance.enabled else 'button-maintenance' }}" type="submit" {% if not maintenance.available %}disabled{% endif %}>
+        {{ '恢复正常访问' if maintenance.enabled else '开启维护页面' }}
+      </button>
+      <small>可逆操作，状态会被写入审计日志。</small>
+    </form>
+  </div>
+
+  <aside class="maintenance-contract" aria-labelledby="maintenance-contract-title">
+    <h2 id="maintenance-contract-title">切换边界</h2>
+    <dl>
+      <div><dt>读者页面</dt><dd>纯 HTML 与 CSS，无外部依赖</dd></div>
+      <div><dt>公开 API</dt><dd>返回 503 和重试提示</dd></div>
+      <div><dt>健康检查</dt><dd>始终保留，便于监控</dd></div>
+      <div><dt>后台管理</dt><dd>不受影响，仍仅本机可访问</dd></div>
+    </dl>
+  </aside>
+</section>
+
+<section class="maintenance-preview" aria-labelledby="maintenance-preview-title">
+  <div class="maintenance-preview-copy">
+    <span>读者视角预览</span>
+    <h2 id="maintenance-preview-title">稍作停驻，故事马上继续</h2>
+    <p>页面延续 OOHStory 的深海军蓝、柔蓝与留白体系，并适配手机、桌面、深色模式和减少动态效果。</p>
+  </div>
+  <div class="maintenance-preview-brand" aria-hidden="true"><strong>O!</strong><small>OOH STORY</small></div>
+</section>
+{% endblock %}

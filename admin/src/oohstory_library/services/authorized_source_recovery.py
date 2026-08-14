@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 from typing import Any
 from urllib.parse import urljoin
 
@@ -163,7 +165,7 @@ def find_exact_fallback_candidates(
         provider = providers[source_name]
         try:
             results = provider.search(title, limit=12)
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             errors.append(f"{source_name}: {type(exc).__name__}: {str(exc)[:220]}")
             continue
         for item in results:
@@ -174,7 +176,7 @@ def find_exact_fallback_candidates(
                 continue
             try:
                 candidate = source_fields(service, source_name, item)
-            except Exception as exc:
+            except RECOVERABLE_OPERATION_ERRORS as exc:
                 errors.append(f"{source_name}: {type(exc).__name__}: {str(exc)[:220]}")
                 continue
             if candidate["source_id"] in excluded:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import os
 import shutil
 import subprocess
@@ -117,7 +119,7 @@ def codex_doctor() -> Dict[str, Any]:
             result['status_text'] = status_text
             lowered = status_text.lower()
             result['logged_in'] = ('not logged in' not in lowered) and ('logged in' in lowered)
-    except Exception as e:
+    except RECOVERABLE_OPERATION_ERRORS as e:
         result['error'] = str(e)
 
     return result

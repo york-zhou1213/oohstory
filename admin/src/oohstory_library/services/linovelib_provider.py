@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import base64
 import hashlib
 import json
@@ -13,7 +15,7 @@ import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, List
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -115,9 +117,8 @@ class LinovelibProvider:
         self._thread_local = threading.local()
         self._illustration_lock = threading.Lock()
         default_volume_root = (
-            Path(__file__).resolve().parents[2]
+            Path(__file__).resolve().parents[3]
             / "electronic-library"
-            / "txt80"
             / "书籍"
             / self.LIBRARY_CATEGORY
         ).resolve()
@@ -1201,7 +1202,7 @@ class LinovelibProvider:
                     )
                     content = f"{content}\n\n{markers}"
                 return index, chapter["title"], content
-            except Exception as exc:
+            except RECOVERABLE_OPERATION_ERRORS as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 if attempt < 4:
                     time.sleep(min(0.5 * attempt, 1.5))
@@ -1256,7 +1257,7 @@ class LinovelibProvider:
                     temporary = cache_path.with_suffix(".txt.tmp")
                     temporary.write_text(content, encoding="utf-8")
                     os.replace(temporary, cache_path)
-                except Exception as exc:
+                except RECOVERABLE_OPERATION_ERRORS as exc:
                     errors.append(
                         f"章节 {index + 1}: {type(exc).__name__}: {str(exc)[:160]}"
                     )

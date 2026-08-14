@@ -59,9 +59,7 @@ class MySQLReadPool:
             read_timeout=10,
             write_timeout=5,
             program_name="oohstory-reader",
-            init_command=(
-                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"
-            ),
+            init_command=("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"),
         )
 
     def _acquire(self) -> pymysql.Connection:
@@ -72,13 +70,13 @@ class MySQLReadPool:
                 self._created += 1
                 try:
                     return self._new_connection()
-                except Exception:
+                except (OSError, pymysql.MySQLError):
                     self._created -= 1
                     raise
             connection = self._available.get(timeout=5)
         try:
             connection.ping(reconnect=True)
-        except Exception:
+        except (OSError, pymysql.MySQLError):
             self._created -= 1
             return self._new_connection()
         return connection
@@ -95,7 +93,7 @@ class MySQLReadPool:
                 # receive this connection from the pool.
                 connection.rollback()
                 self._available.put_nowait(connection)
-            except Exception:
+            except (OSError, pymysql.MySQLError, queue.Full):
                 connection.close()
                 self._created -= 1
 
@@ -106,7 +104,7 @@ class MySQLReadPool:
             try:
                 yield connection
                 connection.commit()
-            except Exception:
+            except BaseException:
                 connection.rollback()
                 raise
 
@@ -120,16 +118,11 @@ class MySQLPublicCatalog:
     def _search_clause(query: str) -> tuple[str, list[Any], str, list[Any]]:
         if not query:
             return "", [], "b.id DESC", []
-        escaped = (
-            query.replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         if len(query) >= 2:
             boolean_query = f'"{query.replace(chr(34), " ")}"'
             return (
-                " AND MATCH(b.title,b.author) "
-                "AGAINST (%s IN BOOLEAN MODE)",
+                " AND MATCH(b.title,b.author) AGAINST (%s IN BOOLEAN MODE)",
                 [boolean_query],
                 "CASE WHEN b.title=%s THEN 0 WHEN b.author=%s THEN 1 "
                 "WHEN b.title LIKE %s ESCAPE '\\\\' THEN 2 ELSE 3 END, "
@@ -138,8 +131,7 @@ class MySQLPublicCatalog:
             )
         pattern = f"%{escaped}%"
         return (
-            " AND (b.title LIKE %s ESCAPE '\\\\' "
-            "OR b.author LIKE %s ESCAPE '\\\\')",
+            " AND (b.title LIKE %s ESCAPE '\\\\' OR b.author LIKE %s ESCAPE '\\\\')",
             [pattern, pattern],
             "CASE WHEN b.title=%s THEN 0 WHEN b.author=%s THEN 1 "
             "WHEN b.title LIKE %s ESCAPE '\\\\' THEN 2 ELSE 3 END, "
@@ -231,13 +223,15 @@ class MySQLPublicCatalog:
                     cat = str(row["category"])
                     if cat not in result:
                         result[cat] = []
-                    result[cat].append({
-                        "title": str(row["title"]),
-                        "author": str(row["author"]),
-                        "public_id": row["public_id"],
-                        "cover_object_key": row.get("cover_object_key"),
-                        "row_version": int(row.get("row_version") or 0),
-                    })
+                    result[cat].append(
+                        {
+                            "title": str(row["title"]),
+                            "author": str(row["author"]),
+                            "public_id": row["public_id"],
+                            "cover_object_key": row.get("cover_object_key"),
+                            "row_version": int(row.get("row_version") or 0),
+                        }
+                    )
                 return result
 
     def list_books(
@@ -297,11 +291,7 @@ class MySQLPublicCatalog:
                 index_name = "idx_books_readable_serialization"
             else:
                 index_name = "idx_books_readable_recent"
-        books_from = (
-            f"books b FORCE INDEX ({index_name})"
-            if index_name
-            else "books b"
-        )
+        books_from = f"books b FORCE INDEX ({index_name})" if index_name else "books b"
         offset = (page - 1) * page_size
         with self.pool.connection() as connection:
             with connection.cursor() as cursor:
@@ -313,19 +303,11 @@ class MySQLPublicCatalog:
                         facet_params.append(category)
                     if serialization:
                         facet_conditions.append("serialization_code=%s")
-                        facet_params.append(
-                            1 if serialization == "finished" else 0
-                        )
+                        facet_params.append(1 if serialization == "finished" else 0)
                     if words:
-                        minimum_bucket, maximum_bucket = WORD_BUCKET_MINIMUMS[
-                            words
-                        ]
-                        facet_conditions.append(
-                            "word_bucket BETWEEN %s AND %s"
-                        )
-                        facet_params.extend(
-                            [minimum_bucket, maximum_bucket]
-                        )
+                        minimum_bucket, maximum_bucket = WORD_BUCKET_MINIMUMS[words]
+                        facet_conditions.append("word_bucket BETWEEN %s AND %s")
+                        facet_params.extend([minimum_bucket, maximum_bucket])
                     cursor.execute(
                         "SELECT COALESCE(SUM(book_count),0) AS total "
                         "FROM public_catalog_facets WHERE "
@@ -335,8 +317,7 @@ class MySQLPublicCatalog:
                     total = int(cursor.fetchone()["total"])
                 else:
                     cursor.execute(
-                        f"SELECT COUNT(*) AS total "
-                        f"FROM {books_from} WHERE {where}",
+                        f"SELECT COUNT(*) AS total FROM {books_from} WHERE {where}",
                         params,
                     )
                     total = int(cursor.fetchone()["total"])
@@ -379,6 +360,25 @@ class MySQLPublicCatalog:
             "page_count": max(math.ceil(total / page_size), 1),
         }
 
+    def sitemap_book_ids(self, limit: int = 49_990) -> list[bytes]:
+        safe_limit = min(max(int(limit), 1), 49_990)
+        with self.pool.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT p.public_id
+                    FROM books b
+                    INNER JOIN book_public_ids p ON p.catalog_id=b.id
+                    WHERE b.is_active=1
+                      AND b.body_available=1
+                      AND b.is_published=1
+                    ORDER BY b.id DESC
+                    LIMIT %s
+                    """,
+                    (safe_limit,),
+                )
+                return [bytes(row["public_id"]) for row in cursor.fetchall()]
+
     def get_book(self, public_id: bytes) -> dict[str, Any] | None:
         with self.pool.connection() as connection:
             with connection.cursor() as cursor:
@@ -402,12 +402,38 @@ class MySQLPublicCatalog:
                         CASE WHEN b.serialization_code=1
                              THEN 'finished' ELSE 'ongoing' END
                             AS serialization_status,
+                        COALESCE(
+                            NULLIF(TRIM(su.source_name), ''),
+                            LOWER(SUBSTRING_INDEX(COALESCE(b.source_id, ''), '-', 1))
+                        ) AS source_name,
+                        CASE
+                            WHEN COALESCE(su.source_url_state, 'active')='deleted'
+                            THEN ''
+                            ELSE COALESCE(
+                                NULLIF(TRIM(su.detail_url), ''),
+                                NULLIF(TRIM(b.detail_url), ''),
+                                ''
+                            )
+                        END AS source_url,
+                        CASE
+                            WHEN COALESCE(su.source_url_state, '')='deleted'
+                            THEN 'deleted'
+                            WHEN NULLIF(TRIM(COALESCE(su.detail_url, b.detail_url, '')), '')
+                                IS NOT NULL
+                            THEN 'active'
+                            ELSE 'missing'
+                        END AS source_url_state,
                         m.summary,
                         m.genre_tags,
                         m.tone_tags
                     FROM books b
                     INNER JOIN book_public_ids p ON p.catalog_id=b.id
                     LEFT JOIN book_metadata m ON m.catalog_id=b.id
+                    LEFT JOIN authorized_source_updates su
+                      ON su.source_id=b.source_id
+                     AND su.source_name=LOWER(
+                         SUBSTRING_INDEX(COALESCE(b.source_id, ''), '-', 1)
+                     )
                     WHERE p.public_id=%s
                       AND b.is_active=1 AND b.body_available=1
                       AND b.is_published=1
@@ -633,7 +659,7 @@ class MySQLPublicCatalog:
                     INNER JOIN books b ON b.id=pm.catalog_id
                     INNER JOIN book_public_ids p ON p.catalog_id=b.id
                     LEFT JOIN book_metadata m ON m.catalog_id=b.id
-                    WHERE {' AND '.join(conditions)}
+                    WHERE {" AND ".join(conditions)}
                     ORDER BY engagement_score DESC,pm.updated_at DESC,b.id DESC
                     LIMIT %s
                     """,
@@ -743,7 +769,8 @@ class MySQLPublicCatalog:
     def rankings(self, limit: int = 10) -> dict[str, list[dict]]:
         def _row(r, value_key: str) -> dict:
             return {
-                "title": r["title"], "author": r["author"],
+                "title": r["title"],
+                "author": r["author"],
                 "category": r["category"],
                 "public_id": bytes(r["public_id"]),
                 "cover_object_key": r.get("cover_object_key"),
@@ -807,7 +834,9 @@ class MySQLPublicCatalog:
                     """,
                     (limit,),
                 )
-                results["monthly_recommends"] = [_row(r, "cnt") for r in cursor.fetchall()]
+                results["monthly_recommends"] = [
+                    _row(r, "cnt") for r in cursor.fetchall()
+                ]
                 cursor.execute(
                     """
                     SELECT b.id, b.title, b.author, b.category,
@@ -822,7 +851,9 @@ class MySQLPublicCatalog:
                     """,
                     (limit,),
                 )
-                results["new_books"] = [_row(r, "effective_word_count") for r in cursor.fetchall()]
+                results["new_books"] = [
+                    _row(r, "effective_word_count") for r in cursor.fetchall()
+                ]
                 cursor.execute(
                     """
                     SELECT pm.catalog_id, b.title, b.author, b.category,
@@ -839,7 +870,9 @@ class MySQLPublicCatalog:
                     """,
                     (limit,),
                 )
-                results["favorites"] = [_row(r, "favorite_count") for r in cursor.fetchall()]
+                results["favorites"] = [
+                    _row(r, "favorite_count") for r in cursor.fetchall()
+                ]
                 cursor.execute(
                     """
                     SELECT b.id, b.title, b.author, b.category,
@@ -857,5 +890,7 @@ class MySQLPublicCatalog:
                     """,
                     (limit,),
                 )
-                results["completed"] = [_row(r, "read_count") for r in cursor.fetchall()]
+                results["completed"] = [
+                    _row(r, "read_count") for r in cursor.fetchall()
+                ]
         return results

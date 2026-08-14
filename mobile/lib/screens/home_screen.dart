@@ -23,6 +23,14 @@ String heroChapterCountLabelFor(Book book) {
   return '${count != null && count > 0 ? count : '?'}章';
 }
 
+double heroCoverWidthFor(double availableWidth) {
+  return (availableWidth * 0.32).clamp(104.0, 136.0).toDouble();
+}
+
+double heroCoverHeightFor(double availableWidth) {
+  return heroCoverWidthFor(availableWidth) * 1.5;
+}
+
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
@@ -994,45 +1002,60 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final coverWidth = constraints.maxWidth < 340 ? 104.0 : 120.0;
+            final coverWidth = heroCoverWidthFor(constraints.maxWidth);
+            final coverHeight = heroCoverHeightFor(constraints.maxWidth);
 
-            return IntrinsicHeight(
+            return SizedBox(
+              height: coverHeight,
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  ClipRRect(
-                    borderRadius: const BorderRadius.only(
-                      topLeft: Radius.circular(12),
-                      bottomLeft: Radius.circular(12),
-                    ),
-                    child: AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 400),
-                      child: Image.network(
-                        coverUrl,
-                        key: ValueKey(book.id),
-                        width: coverWidth,
-                        fit: BoxFit.cover,
-                        errorBuilder: (_, __, ___) => Container(
-                          width: coverWidth,
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              begin: Alignment.topLeft,
-                              end: Alignment.bottomRight,
-                              colors: [
-                                theme.colorScheme.primaryContainer,
-                                theme.colorScheme.tertiaryContainer,
-                              ],
-                            ),
-                          ),
-                          child: Center(
-                            child: Text(
-                              book.title.length > 2
-                                  ? book.title.substring(0, 2)
-                                  : book.title,
-                              style: TextStyle(
-                                fontSize: 16,
-                                fontWeight: FontWeight.w700,
-                                color: theme.colorScheme.onPrimaryContainer,
+                  SizedBox(
+                    width: coverWidth,
+                    height: coverHeight,
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: isDark
+                            ? const Color(0xFF131325)
+                            : const Color(0xFFEAF3FB),
+                      ),
+                      child: ClipRRect(
+                        borderRadius: const BorderRadius.only(
+                          topLeft: Radius.circular(12),
+                          bottomLeft: Radius.circular(12),
+                        ),
+                        child: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 400),
+                          child: Image.network(
+                            coverUrl,
+                            key: ValueKey(book.id),
+                            width: coverWidth,
+                            height: coverHeight,
+                            fit: BoxFit.contain,
+                            errorBuilder: (_, __, ___) => Container(
+                              width: coverWidth,
+                              height: coverHeight,
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  begin: Alignment.topLeft,
+                                  end: Alignment.bottomRight,
+                                  colors: [
+                                    theme.colorScheme.primaryContainer,
+                                    theme.colorScheme.tertiaryContainer,
+                                  ],
+                                ),
+                              ),
+                              child: Center(
+                                child: Text(
+                                  book.title.length > 2
+                                      ? book.title.substring(0, 2)
+                                      : book.title,
+                                  style: TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w700,
+                                    color: theme.colorScheme.onPrimaryContainer,
+                                  ),
+                                ),
                               ),
                             ),
                           ),
@@ -1042,7 +1065,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   Expanded(
                     child: Padding(
-                      padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+                      padding: const EdgeInsets.fromLTRB(20, 10, 12, 8),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [

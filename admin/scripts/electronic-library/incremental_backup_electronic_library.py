@@ -22,7 +22,7 @@ from typing import TextIO
 
 
 CANONICAL_SOURCE = Path(
-    "/opt/oohstory-admin/electronic-library"
+    "/srv/oohstory/library"
 )
 DEFAULT_DEST = Path("/srv/oohstory/library")
 DEFAULT_LOG_DIR = DEFAULT_DEST / "_backup_logs"

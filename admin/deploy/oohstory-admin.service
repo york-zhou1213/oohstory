@@ -14,10 +14,9 @@ Environment=PYTHONUNBUFFERED=1
 Environment=OOHSTORY_ADMIN_DATABASE=/var/lib/oohstory-admin/audit.db
 Environment=OOHSTORY_ADMIN_USE_SUDO_HELPER=1
 Environment=OOHSTORY_ADMIN_SYSTEMCTL_HELPER_PATH=/usr/local/libexec/oohstory-admin-systemctl
-Environment=OOHSTORY_ADMIN_SCRIPT_STORE_HELPER_PATH=/usr/local/libexec/oohstory-admin-script-store
 Environment=OOHSTORY_ADMIN_LIBRARY_ACTION_HELPER_PATH=/usr/local/libexec/oohstory-admin-library-action
+Environment=OOHSTORY_ADMIN_MAINTENANCE_HELPER_PATH=/usr/local/libexec/oohstory-admin-maintenance
 Environment=OOHSTORY_ADMIN_LIBRARY_UPLOAD_DIR=/var/lib/oohstory-admin/cover-uploads
-Environment=OOHSTORY_ADMIN_MANAGED_SCRIPT_ROOT=/opt/oohstory-admin
 ExecStart=/opt/oohstory-admin/.venv/bin/uvicorn oohstory_admin.app:create_app --factory --host 127.0.0.1 --port 8092 --proxy-headers --forwarded-allow-ips=127.0.0.1
 Restart=on-failure
 RestartSec=3
@@ -50,7 +49,7 @@ IPAddressDeny=any
 IPAddressAllow=localhost
 ReadOnlyPaths=/opt/oohstory-admin
 BindReadOnlyPaths=/srv/oohstory/library
-ReadWritePaths=/var/lib/oohstory-admin /opt/oohstory-admin/scripts/electronic-library
+ReadWritePaths=/var/lib/oohstory-admin
 
 [Install]
 WantedBy=multi-user.target

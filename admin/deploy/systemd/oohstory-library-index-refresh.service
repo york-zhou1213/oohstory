@@ -18,5 +18,5 @@ IOWeight=10
 IOReadBandwidthMax=/dev/mapper/ubuntu--vg-ubuntu--lv 8M
 IOWriteBandwidthMax=/dev/mapper/ubuntu--vg-ubuntu--lv 4M
 OOMPolicy=stop
-StandardOutput=append:/opt/oohstory-admin/electronic-library/txt80/logs/index-refresh.log
-StandardError=append:/opt/oohstory-admin/electronic-library/txt80/logs/index-refresh.log
+StandardOutput=append:/opt/oohstory-admin/electronic-library/logs/index-refresh.log
+StandardError=append:/opt/oohstory-admin/electronic-library/logs/index-refresh.log

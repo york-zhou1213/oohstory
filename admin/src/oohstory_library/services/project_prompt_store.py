@@ -7,8 +7,10 @@ project's prompt tree.
 
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -107,7 +109,7 @@ PROMPT_SLOT_MAP = {slot["id"]: slot for slot in PROMPT_SLOTS}
 
 
 def _now_iso() -> str:
-    return datetime.now().isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _project_prompts_dir(project_root: Path) -> Path:
@@ -140,7 +142,7 @@ def _load_meta(project_root: Path) -> Dict[str, Any]:
         return {"version": 1, "genre": "", "substyle": "", "slots": {}}
     try:
         return json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception:
+    except RECOVERABLE_OPERATION_ERRORS:
         return {"version": 1, "genre": "", "substyle": "", "slots": {}}
 
 

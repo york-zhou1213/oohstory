@@ -1,0 +1,45 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+    echo "expected: status, enable, or disable" >&2
+    exit 64
+fi
+
+action=$1
+flag=/var/lib/oohstory-reader/maintenance.enabled
+state_dir=/var/lib/oohstory-reader
+
+if [ -L "$flag" ]; then
+    echo "maintenance marker must not be a symlink" >&2
+    exit 65
+fi
+
+case "$action" in
+    enable)
+        [ -d "$state_dir" ] || { echo "reader state directory is missing" >&2; exit 66; }
+        temporary=$(mktemp "$state_dir/.maintenance.XXXXXX")
+        trap 'rm -f "$temporary"' EXIT HUP INT TERM
+        printf 'enabled\n' >"$temporary"
+        chown naslibrary:users "$temporary"
+        chmod 0640 "$temporary"
+        mv -f "$temporary" "$flag"
+        trap - EXIT HUP INT TERM
+        ;;
+    disable)
+        if [ -e "$flag" ] && [ ! -f "$flag" ]; then
+            echo "maintenance marker is not a regular file" >&2
+            exit 65
+        fi
+        rm -f "$flag"
+        ;;
+    status) ;;
+    *) echo "action is not allowlisted" >&2; exit 64 ;;
+esac
+
+if [ -f "$flag" ]; then
+    changed_at=$(stat -c '%y' "$flag" | cut -d. -f1)
+    printf '{"enabled":true,"changed_at":"%s"}\n' "$changed_at"
+else
+    printf '{"enabled":false,"changed_at":""}\n'
+fi

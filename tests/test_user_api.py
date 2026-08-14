@@ -153,7 +153,9 @@ def test_google_config_exposes_only_public_client_capabilities(tmp_path: Path) -
         "web_client_id": "web.apps.googleusercontent.com",
         "android_enabled": True,
         "ios_enabled": False,
-        "existing_account_link_required": True,
+        "first_login_creates_account": True,
+        "existing_account_link_required": False,
+        "local_password_optional": True,
     }
 
 
@@ -176,20 +178,6 @@ def test_google_redirect_checks_double_submit_csrf_and_issues_web_session(
         getattr(router, "google_redirect_handler"),
         methods=["POST"],
     )
-    account_store = AccountStore(
-        settings.user_database_path,
-        session_ttl_seconds=3600,
-    )
-    code, _item = account_store.create_invite(
-        label="google-redirect",
-        max_uses=1,
-    )
-    registered, _verification = account_store.register(
-        "google-reader@example.com",
-        "Correct-Horse-9-Battery",
-        "Google Reader",
-        code,
-    )
     claims = {
         "iss": "https://accounts.google.com",
         "sub": "google-subject-1",
@@ -197,7 +185,6 @@ def test_google_redirect_checks_double_submit_csrf_and_issues_web_session(
         "email_verified": True,
         "name": "Google Reader",
     }
-    account_store.link_google(registered["id"], claims)
     monkeypatch.setattr(
         user_api.google_id_token,
         "verify_oauth2_token",
@@ -219,7 +206,13 @@ def test_google_redirect_checks_double_submit_csrf_and_issues_web_session(
         assert response.status_code == 303
         assert response.headers["location"] == "/#/account"
         assert "oohstory_session=" in response.headers["set-cookie"]
-        assert browser.get("/api/v1/auth/session").status_code == 200
+        session = browser.get("/api/v1/auth/session")
+        assert session.status_code == 200
+        assert session.json()["user"]["email"] == "google-reader@example.com"
+        assert browser.get("/api/v1/me/profile").json()["login_methods"] == {
+            "google": True,
+            "password": False,
+        }
 
 
 def test_google_redirect_rejects_csrf_mismatch_without_session(tmp_path: Path) -> None:
@@ -254,6 +247,78 @@ def test_google_redirect_rejects_csrf_mismatch_without_session(tmp_path: Path) -
         assert response.status_code == 303
         assert response.headers["location"].startswith("/?google_error=")
         assert settings.session_cookie not in response.headers.get("set-cookie", "")
+
+
+def test_google_first_login_can_optionally_enable_password_in_profile(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        library_root=(tmp_path / "library").resolve(),
+        state_root=(tmp_path / "state").resolve(),
+        allowed_hosts=("testserver",),
+        account_database=(tmp_path / "accounts.sqlite3").resolve(),
+        google_web_client_id="web.apps.googleusercontent.com",
+    )
+    app = FastAPI()
+    app.include_router(create_user_router(settings, Books))
+    claims = {
+        "iss": "https://accounts.google.com",
+        "sub": "google-first-subject",
+        "email": "google-first@example.com",
+        "email_verified": True,
+        "name": "Google First",
+    }
+    monkeypatch.setattr(
+        user_api.google_id_token,
+        "verify_oauth2_token",
+        lambda *_args, **_kwargs: claims,
+    )
+
+    with TestClient(app, base_url="https://testserver") as browser:
+        first = browser.post(
+            "/api/v1/auth/google",
+            json={"id_token": "x" * 200, "client": "web"},
+        )
+        assert first.status_code == 200
+        assert first.json()["user"]["email"] == "google-first@example.com"
+        assert first.json()["user"]["email_verified"] is True
+        assert first.json()["user"]["google_linked"] is True
+        csrf = first.json()["csrf_token"]
+        profile = browser.get("/api/v1/me/profile").json()
+        assert profile["login_methods"] == {"google": True, "password": False}
+        assert browser.post(
+            "/api/v1/auth/login",
+            json={
+                "email": "google-first@example.com",
+                "password": "Google-Local-8-Password",
+                "client": "android",
+            },
+        ).status_code == 401
+
+        enabled = browser.post(
+            "/api/v1/me/password/setup",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "id_token": "x" * 200,
+                "new_password": "Google-Local-8-Password",
+                "client": "web",
+            },
+        )
+        assert enabled.status_code == 200
+        assert enabled.json()["created"] is True
+        assert enabled.json()["login_methods"] == {
+            "google": True,
+            "password": True,
+        }
+        assert browser.post(
+            "/api/v1/auth/login",
+            json={
+                "email": "google-first@example.com",
+                "password": "Google-Local-8-Password",
+                "client": "android",
+            },
+        ).status_code == 200
 
 
 def test_registered_user_can_link_google_then_login_on_mobile(

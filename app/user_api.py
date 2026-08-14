@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from app.error_boundaries import RECOVERABLE_INTEGRATION_ERRORS
+
 import asyncio
 from io import BytesIO
-import json
 import os
 import re
 import secrets
@@ -18,7 +19,16 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.responses import FileResponse, RedirectResponse
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2 import id_token as google_id_token
@@ -36,7 +46,8 @@ from .accounts import (
 from .settings import Settings
 from .email_delivery import send_verification, smtp_configured
 from .upload_security import UploadSecurityError, UploadSecurityScanner
-from .submissions import NovelMetadata, inspect_deconstruction_structure
+from .upload_worker import inspect_upload_once
+from .submissions import NovelMetadata
 from .review_worker import reconcile_results
 from .comment_moderation import chapter_paragraphs, moderate_comment
 
@@ -142,6 +153,20 @@ class PasswordChange(BaseModel):
     new_password: str = Field(min_length=12, max_length=128)
 
 
+class PasswordSetup(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id_token: str = Field(min_length=100, max_length=8192)
+    new_password: str = Field(min_length=12, max_length=128)
+    client: str = "web"
+
+    @field_validator("client")
+    @classmethod
+    def valid_client(cls, value: str) -> str:
+        if value not in ALLOWED_CLIENTS:
+            raise ValueError("客户端类型无效")
+        return value
+
+
 class ReadingHeartbeat(BaseModel):
     model_config = ConfigDict(extra="forbid")
     event_id: UUID4
@@ -189,6 +214,11 @@ class ParagraphCommentCreate(BaseModel):
     content: str = Field(min_length=1, max_length=500)
 
 
+class BookCommentCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    content: str = Field(min_length=1, max_length=500)
+
+
 def create_user_router(
     settings: Settings,
     repository_provider: Callable[[], Any],
@@ -196,6 +226,8 @@ def create_user_router(
     on_public_metrics_changed: Callable[[], None] | None = None,
     store_provider: Callable[[], AccountStore] | None = None,
     category_provider: Callable[[], list[dict[str, Any]]] | None = None,
+    on_logout: Callable[[str, SessionContext, Request], None] | None = None,
+    comment_provider: Callable[[], Any] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v1")
 
@@ -208,6 +240,77 @@ def create_user_router(
 
     def store() -> AccountStore:
         return store_provider() if store_provider is not None else default_store()
+
+    def comments() -> Any | None:
+        return comment_provider() if comment_provider is not None else None
+
+    def required_comments() -> Any:
+        backend = comments()
+        if backend is None:
+            raise HTTPException(status_code=503, detail="评论存储尚未启用")
+        return backend
+
+    def enrich_comments(
+        rows: list[dict[str, Any]], viewer_user_id: str | None
+    ) -> list[dict[str, Any]]:
+        authors = store().comment_authors(
+            [str(row.get("user_id") or "") for row in rows]
+        )
+        result = []
+        for row in rows:
+            user_id = str(row.get("user_id") or "")
+            author = authors.get(user_id)
+            if author is None:
+                continue
+            avatar_version = int(author["avatar_version"])
+            viewer_like_count = int(row.get("viewer_like_count") or 0)
+            item = {key: value for key, value in row.items() if key != "user_id"}
+            item.update(
+                {
+                    "is_own": bool(viewer_user_id and user_id == viewer_user_id),
+                    "thanks_count": int(row.get("like_count") or 0),
+                    "thanked_by_me": viewer_like_count > 0,
+                    "author": {
+                        "display_name": author["display_name"],
+                        "avatar_url": (
+                            f"/api/v1/users/{user_id}/avatar?v={avatar_version}"
+                            if avatar_version > 0
+                            else None
+                        ),
+                        "reading": {
+                            key: author["reading"][key]
+                            for key in ("level", "roman", "name")
+                        },
+                    },
+                }
+            )
+            result.append(item)
+        return result
+
+    def paragraph_comment_response(
+        rows: list[dict[str, Any]], viewer_user_id: str | None
+    ) -> dict[str, Any]:
+        paragraphs: dict[str, dict[str, Any]] = {}
+        for comment in reversed(enrich_comments(rows, viewer_user_id)):
+            key = str(comment.get("paragraph_key") or "")
+            thread = paragraphs.setdefault(
+                key,
+                {
+                    "paragraph_index": int(comment.get("paragraph_index") or 0),
+                    "paragraph_key": key,
+                    "excerpt": str(comment.get("paragraph_excerpt") or ""),
+                    "count": 0,
+                    "total_thanks": 0,
+                    "comments": [],
+                },
+            )
+            thread["comments"].append(comment)
+            thread["count"] += 1
+            thread["total_thanks"] += int(comment.get("like_count") or 0)
+        return {
+            "paragraphs": paragraphs,
+            "comment_count": sum(int(item["count"]) for item in paragraphs.values()),
+        }
 
     def error(exc: AccountError) -> HTTPException:
         return HTTPException(status_code=exc.status_code, detail=exc.detail)
@@ -248,12 +351,16 @@ def create_user_router(
             on_public_metrics_changed()
         return metrics, False
 
-    def paragraph_context(book_id: str, chapter_id: int) -> tuple[dict[str, Any], list[dict[str, object]]]:
+    def paragraph_context(
+        book_id: str, chapter_id: int
+    ) -> tuple[dict[str, Any], list[dict[str, object]]]:
         if not PUBLIC_BOOK_ID.fullmatch(str(book_id)) or int(chapter_id) <= 0:
             raise HTTPException(status_code=404, detail="章节不存在")
         try:
-            chapter = repository_provider().reader_chapter(str(book_id), int(chapter_id))
-        except Exception as exc:
+            chapter = repository_provider().reader_chapter(
+                str(book_id), int(chapter_id)
+            )
+        except RECOVERABLE_INTEGRATION_ERRORS as exc:
             raise HTTPException(status_code=404, detail="章节不存在") from exc
         paragraphs = chapter_paragraphs(str(chapter.get("content") or ""))
         return chapter, paragraphs
@@ -297,11 +404,14 @@ def create_user_router(
         user_id: str, catalog_items: dict[str, dict[str, Any]] | None = None
     ) -> dict[str, Any]:
         state = store().state(user_id)
-        ids = list(dict.fromkeys(
-            str(item.get("book_id") or "")
-            for values in state.values() for item in values
-            if item.get("book_id")
-        ))
+        ids = list(
+            dict.fromkeys(
+                str(item.get("book_id") or "")
+                for values in state.values()
+                for item in values
+                if item.get("book_id")
+            )
+        )
         repository = repository_provider()
         if catalog_items is not None:
             authoritative = catalog_items
@@ -312,14 +422,15 @@ def create_user_router(
             for book_id in ids[:100]:
                 try:
                     book = repository.get_book(book_id)
-                except Exception:
+                except RECOVERABLE_INTEGRATION_ERRORS:
                     continue
                 authoritative[book_id] = {
                     "book_id": book_id,
                     "title": book.get("title") or "",
                     "author": book.get("author") or "",
                     "cover_url": book.get("cover_url") or "",
-                    "serialization_status": book.get("serialization_status") or "ongoing",
+                    "serialization_status": book.get("serialization_status")
+                    or "ongoing",
                     "chapter_count": int(book.get("approx_chapter_count") or 0),
                 }
         for kind, values in state.items():
@@ -336,7 +447,9 @@ def create_user_router(
                     count = max(int(catalog.get("chapter_count") or 0), 0)
                     item["chapter_progress"] = within
                     item["overall_progress"] = (
-                        max(0.0, min((chapter_id - 1 + within) / count, 1.0)) if count else 0.0
+                        max(0.0, min((chapter_id - 1 + within) / count, 1.0))
+                        if count
+                        else 0.0
                     )
                     item["current_chapter"] = f"第 {chapter_id} 章"
         return state
@@ -346,9 +459,7 @@ def create_user_router(
         if not hasattr(repository, "set_favorite_count"):
             return
         for book_id in dict.fromkeys(book_ids):
-            repository.set_favorite_count(
-                book_id, store().favorite_count(book_id)
-            )
+            repository.set_favorite_count(book_id, store().favorite_count(book_id))
         if book_ids and on_public_metrics_changed is not None:
             on_public_metrics_changed()
 
@@ -356,12 +467,11 @@ def create_user_router(
         profile = store().profile(user_id)
         version = int(profile.pop("avatar_version", 0))
         exists = avatar_path(user_id).is_file()
-        profile["avatar_url"] = (
-            f"/api/v1/me/avatar?v={version}" if exists else None
-        )
+        profile["avatar_url"] = f"/api/v1/me/avatar?v={version}" if exists else None
         return {
             "profile": profile,
             "reading": store().reading_summary(user_id),
+            "login_methods": store().login_methods(user_id),
         }
 
     def decode_image_bytes(raw: bytes | bytearray) -> Image.Image:
@@ -372,16 +482,30 @@ def create_user_router(
                 warnings.simplefilter("error", Image.DecompressionBombWarning)
                 probe = Image.open(BytesIO(raw))
                 if str(probe.format or "").upper() not in {"JPEG", "PNG", "WEBP"}:
-                    raise HTTPException(status_code=415, detail="仅支持 JPEG、PNG 或 WebP 图片")
+                    raise HTTPException(
+                        status_code=415, detail="仅支持 JPEG、PNG 或 WebP 图片"
+                    )
                 width, height = probe.size
-                if width < 32 or height < 32 or width * height > settings.max_avatar_pixels:
-                    raise HTTPException(status_code=422, detail="图片尺寸须不小于 32×32 且不超过像素上限")
+                if (
+                    width < 32
+                    or height < 32
+                    or width * height > settings.max_avatar_pixels
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="图片尺寸须不小于 32×32 且不超过像素上限",
+                    )
                 probe.verify()
                 decoded = Image.open(BytesIO(raw))
                 decoded.load()
         except HTTPException:
             raise
-        except (UnidentifiedImageError, OSError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        except (
+            UnidentifiedImageError,
+            OSError,
+            Image.DecompressionBombError,
+            Image.DecompressionBombWarning,
+        ) as exc:
             raise HTTPException(status_code=422, detail="图片无法安全解码") from exc
         decoded = ImageOps.exif_transpose(decoded)
         if decoded.mode not in {"RGB", "RGBA"}:
@@ -395,7 +519,9 @@ def create_user_router(
             while chunk := await file.read(256 * 1024):
                 raw.extend(chunk)
                 if len(raw) > settings.max_avatar_bytes:
-                    raise HTTPException(status_code=413, detail="头像文件不能超过上传大小限制")
+                    raise HTTPException(
+                        status_code=413, detail="头像文件不能超过上传大小限制"
+                    )
         finally:
             await file.close()
         return decode_image_bytes(raw)
@@ -412,7 +538,9 @@ def create_user_router(
                 "web_client_id": settings.google_web_client_id,
                 "android_enabled": bool(settings.google_android_client_id),
                 "ios_enabled": bool(settings.google_ios_client_id),
-                "existing_account_link_required": True,
+                "first_login_creates_account": True,
+                "existing_account_link_required": False,
+                "local_password_optional": True,
             },
             "upload": {
                 "max_bytes": settings.max_upload_bytes,
@@ -422,10 +550,14 @@ def create_user_router(
         }
 
     @router.post("/auth/register", status_code=201)
-    def register(payload: Registration, request: Request, response: Response) -> dict[str, Any]:
+    def register(
+        payload: Registration, request: Request, response: Response
+    ) -> dict[str, Any]:
         try:
             email_key = payload.email.strip().casefold()
-            store().enforce_rate_limit(f"register:{request_ip(request)}:{email_key}", limit=5)
+            store().enforce_rate_limit(
+                f"register:{request_ip(request)}:{email_key}", limit=5
+            )
             user, verification = store().register(
                 payload.email,
                 payload.password,
@@ -438,14 +570,16 @@ def create_user_router(
                 result["verification_sent"] = send_verification(
                     settings, user["email"], verification
                 )
-            except Exception:
+            except RECOVERABLE_INTEGRATION_ERRORS:
                 result["verification_sent"] = False
             return result
         except AccountError as exc:
             raise error(exc) from exc
 
     @router.post("/auth/login")
-    def login(payload: Credentials, request: Request, response: Response) -> dict[str, Any]:
+    def login(
+        payload: Credentials, request: Request, response: Response
+    ) -> dict[str, Any]:
         try:
             store().enforce_rate_limit(
                 f"login:{request_ip(request)}:{payload.email.strip().casefold()}",
@@ -486,16 +620,21 @@ def create_user_router(
                     clock_skew_in_seconds=30,
                 )
                 break
-            except Exception:
+            except RECOVERABLE_INTEGRATION_ERRORS:
                 continue
         if claims is None:
             raise AccountError("Google 登录凭据的接收方无效", 401)
-        if claims.get("iss") not in {"accounts.google.com", "https://accounts.google.com"}:
+        if claims.get("iss") not in {
+            "accounts.google.com",
+            "https://accounts.google.com",
+        }:
             raise AccountError("Google 身份签发方无效", 401)
         return claims
 
     @router.post("/auth/google")
-    def google_login(payload: GoogleCredential, request: Request, response: Response) -> dict[str, Any]:
+    def google_login(
+        payload: GoogleCredential, request: Request, response: Response
+    ) -> dict[str, Any]:
         try:
             claims = google_claims(
                 payload.id_token,
@@ -508,7 +647,7 @@ def create_user_router(
             raise error(exc) from exc
         except HTTPException:
             raise
-        except Exception as exc:
+        except RECOVERABLE_INTEGRATION_ERRORS as exc:
             raise HTTPException(status_code=401, detail="Google 登录凭据无效") from exc
 
     @router.post("/auth/google/link")
@@ -524,7 +663,7 @@ def create_user_router(
             raise error(exc) from exc
         except HTTPException:
             raise
-        except Exception as exc:
+        except RECOVERABLE_INTEGRATION_ERRORS as exc:
             raise HTTPException(status_code=401, detail="Google 登录凭据无效") from exc
 
     @router.post("/auth/google/link/start")
@@ -550,8 +689,12 @@ def create_user_router(
             url=f"/?google_error={quote(detail, safe='')}#/",
             status_code=303,
         )
-        response.delete_cookie(GOOGLE_INVITE_COOKIE, path="/", secure=True, samesite="lax")
-        response.delete_cookie(GOOGLE_LINK_COOKIE, path="/", secure=True, samesite="none")
+        response.delete_cookie(
+            GOOGLE_INVITE_COOKIE, path="/", secure=True, samesite="lax"
+        )
+        response.delete_cookie(
+            GOOGLE_LINK_COOKIE, path="/", secure=True, samesite="none"
+        )
         return response
 
     async def google_redirect(request: Request) -> Response:
@@ -560,9 +703,13 @@ def create_user_router(
         form = await request.form()
         csrf_cookie = request.cookies.get("g_csrf_token", "")
         csrf_body = str(form.get("g_csrf_token", ""))
-        if not csrf_cookie or not csrf_body or not secrets.compare_digest(
-            csrf_cookie,
-            csrf_body,
+        if (
+            not csrf_cookie
+            or not csrf_body
+            or not secrets.compare_digest(
+                csrf_cookie,
+                csrf_body,
+            )
         ):
             return redirect_error("Google 登录安全校验失败，请重新尝试")
         state = str(form.get("state", ""))
@@ -599,7 +746,7 @@ def create_user_router(
             return response
         except AccountError as exc:
             return redirect_error(exc.detail)
-        except Exception:
+        except RECOVERABLE_INTEGRATION_ERRORS:
             return redirect_error("Google 登录凭据无效")
 
     @router.post("/auth/verify-email")
@@ -649,6 +796,14 @@ def create_user_router(
         session = auth(request, mutation=True)
         raw, cookie_auth = raw_session_token(request)
         _ = session
+        if on_logout is not None:
+            try:
+                on_logout(raw, session, request)
+            except RECOVERABLE_INTEGRATION_ERRORS:
+                # Revoking the account session is authoritative. Audiobook
+                # cancellation is best-effort and must never trap a user in a
+                # logged-in state during a temporary MySQL failure.
+                pass
         store().revoke_session(raw)
         if cookie_auth:
             response.delete_cookie(settings.session_cookie, path="/")
@@ -688,11 +843,41 @@ def create_user_router(
             )
             return {
                 "changed": True,
+                "created": False,
                 "revoked_other_sessions": revoked,
+                "login_methods": store().login_methods(session.user_id),
                 "message": "密码已更新，其他设备的登录状态已安全退出",
             }
         except AccountError as exc:
             raise error(exc) from exc
+
+    @router.post("/me/password/setup")
+    def setup_password(payload: PasswordSetup, request: Request) -> dict[str, Any]:
+        session = auth(request, mutation=True)
+        try:
+            store().enforce_rate_limit(
+                f"password-setup:{session.user_id}", limit=6, window=3600
+            )
+            claims = google_claims(payload.id_token, request, payload.client)
+            revoked = store().setup_password(
+                session.user_id,
+                session.session_id,
+                claims,
+                payload.new_password,
+            )
+            return {
+                "changed": True,
+                "created": True,
+                "revoked_other_sessions": revoked,
+                "login_methods": store().login_methods(session.user_id),
+                "message": "邮箱密码登录已启用，其他设备的旧登录状态已安全退出",
+            }
+        except AccountError as exc:
+            raise error(exc) from exc
+        except HTTPException:
+            raise
+        except RECOVERABLE_INTEGRATION_ERRORS as exc:
+            raise HTTPException(status_code=401, detail="Google 登录凭据无效") from exc
 
     @router.get("/me/avatar")
     def get_avatar(request: Request) -> FileResponse:
@@ -731,7 +916,9 @@ def create_user_router(
         )
 
     @router.post("/me/avatar", status_code=201)
-    async def upload_avatar(request: Request, file: UploadFile = File(...)) -> dict[str, Any]:
+    async def upload_avatar(
+        request: Request, file: UploadFile = File(...)
+    ) -> dict[str, Any]:
         session = auth(request, mutation=True)
         image = await decode_avatar(file)
         directory = settings.user_avatar_root / session.user_id
@@ -770,11 +957,13 @@ def create_user_router(
         return store().reading_summary(auth(request).user_id)
 
     @router.post("/me/reading-heartbeat")
-    def reading_heartbeat(payload: ReadingHeartbeat, request: Request) -> dict[str, Any]:
+    def reading_heartbeat(
+        payload: ReadingHeartbeat, request: Request
+    ) -> dict[str, Any]:
         session = auth(request, mutation=True)
         try:
             repository_provider().get_book(payload.book_id)
-        except Exception as exc:
+        except RECOVERABLE_INTEGRATION_ERRORS as exc:
             raise HTTPException(status_code=404, detail="作品不存在") from exc
         return store().accept_reading_heartbeat(
             session.user_id,
@@ -795,7 +984,7 @@ def create_user_router(
         repository = repository_provider()
         try:
             repository.get_book(book_id)
-        except Exception as exc:
+        except RECOVERABLE_INTEGRATION_ERRORS as exc:
             raise HTTPException(status_code=404, detail="作品不存在") from exc
         status = store().recommendation_status(session.user_id, book_id)
         pending_event_ids = store().pending_recommendation_events(
@@ -807,7 +996,7 @@ def create_user_router(
                 _metrics, _still_pending = sync_recommendation_metric(
                     session, book_id, event_id
                 )
-            except Exception:
+            except RECOVERABLE_INTEGRATION_ERRORS:
                 sync_pending = True
                 break
         else:
@@ -832,7 +1021,7 @@ def create_user_router(
         repository = repository_provider()
         try:
             repository.get_book(book_id)
-        except Exception as exc:
+        except RECOVERABLE_INTEGRATION_ERRORS as exc:
             raise HTTPException(status_code=404, detail="作品不存在") from exc
         try:
             receipt = store().donate_recommendation(
@@ -849,11 +1038,11 @@ def create_user_router(
                 )
             else:
                 metrics = repository.public_metrics(book_id)
-        except Exception:
+        except RECOVERABLE_INTEGRATION_ERRORS:
             sync_pending = True
             try:
                 metrics = repository.public_metrics(book_id)
-            except Exception:
+            except RECOVERABLE_INTEGRATION_ERRORS:
                 metrics = {"public_id": book_id, "recommend_count": 0}
 
         new_donation = bool(receipt["new_donation"])
@@ -874,6 +1063,59 @@ def create_user_router(
             "message": message,
         }
 
+    @router.get("/books/{book_id}/comments")
+    def book_comments(
+        book_id: str, request: Request, response: Response
+    ) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["Vary"] = "Cookie, Authorization"
+        viewer = optional_auth(request)
+        backend = required_comments()
+        try:
+            rows = backend.book_comments(book_id, viewer.user_id if viewer else None)
+        except AccountError as exc:
+            raise error(exc) from exc
+        enriched = enrich_comments(rows, viewer.user_id if viewer else None)
+        return {
+            "book_id": book_id,
+            "authenticated": viewer is not None,
+            "comments": enriched,
+            "comment_count": len(enriched),
+        }
+
+    @router.post("/books/{book_id}/comments", status_code=201)
+    def create_book_comment(
+        book_id: str, payload: BookCommentCreate, request: Request
+    ) -> dict[str, Any]:
+        session = auth(request, mutation=True)
+        moderation = moderate_comment(payload.content)
+        if not moderation.allowed:
+            raise HTTPException(status_code=422, detail=moderation.detail)
+        backend = required_comments()
+        try:
+            store().enforce_rate_limit(
+                f"book-comment:{session.user_id}:{request_ip(request)}",
+                limit=8,
+                window=60,
+            )
+            comment_id = backend.create(
+                session.user_id,
+                book_id=book_id,
+                scope="book",
+                content=payload.content,
+            )
+            rows = backend.book_comments(book_id, session.user_id)
+            enriched = enrich_comments(rows, session.user_id)
+            return {
+                "book_id": book_id,
+                "authenticated": True,
+                "comments": enriched,
+                "comment_count": len(enriched),
+                "created_comment_id": comment_id,
+            }
+        except AccountError as exc:
+            raise error(exc) from exc
+
     @router.get("/books/{book_id}/chapters/{chapter_id}/comments")
     def chapter_comments(
         book_id: str, chapter_id: int, request: Request, response: Response
@@ -882,12 +1124,17 @@ def create_user_router(
         response.headers["Vary"] = "Cookie, Authorization"
         _chapter, paragraphs = paragraph_context(book_id, chapter_id)
         viewer = optional_auth(request)
-        result = store().chapter_paragraph_comments(
-            book_id=book_id,
-            chapter_id=chapter_id,
-            paragraph_keys=[str(item["key"]) for item in paragraphs],
-            viewer_user_id=viewer.user_id if viewer else None,
-        )
+        backend = required_comments()
+        try:
+            rows = backend.paragraph_comments(
+                book_id,
+                chapter_id,
+                [str(item["key"]) for item in paragraphs],
+                viewer.user_id if viewer else None,
+            )
+        except AccountError as exc:
+            raise error(exc) from exc
+        result = paragraph_comment_response(rows, viewer.user_id if viewer else None)
         return result | {
             "book_id": book_id,
             "chapter_id": int(chapter_id),
@@ -915,21 +1162,24 @@ def create_user_router(
                 window=60,
             )
             paragraph = paragraphs[payload.paragraph_index]
-            comment_id = store().create_paragraph_comment(
+            backend = required_comments()
+            comment_id = backend.create(
                 session.user_id,
                 book_id=book_id,
+                scope="paragraph",
                 chapter_id=chapter_id,
                 paragraph_index=payload.paragraph_index,
                 paragraph_key=str(paragraph["key"]),
                 paragraph_excerpt=str(paragraph["excerpt"]),
                 content=payload.content,
             )
-            result = store().chapter_paragraph_comments(
-                book_id=book_id,
-                chapter_id=chapter_id,
-                paragraph_keys=[str(item["key"]) for item in paragraphs],
-                viewer_user_id=session.user_id,
+            rows = backend.paragraph_comments(
+                book_id,
+                chapter_id,
+                [str(item["key"]) for item in paragraphs],
+                session.user_id,
             )
+            result = paragraph_comment_response(rows, session.user_id)
             return result | {"created_comment_id": comment_id}
         except AccountError as exc:
             raise error(exc) from exc
@@ -943,9 +1193,7 @@ def create_user_router(
                 limit=40,
                 window=60,
             )
-            return store().adjust_paragraph_comment_like(
-                session.user_id, str(comment_id), delta=1
-            )
+            return required_comments().adjust_like(session.user_id, str(comment_id), 1)
         except AccountError as exc:
             raise error(exc) from exc
 
@@ -958,19 +1206,31 @@ def create_user_router(
                 limit=40,
                 window=60,
             )
-            return store().adjust_paragraph_comment_like(
-                session.user_id, str(comment_id), delta=1
-            )
+            return required_comments().adjust_like(session.user_id, str(comment_id), 1)
         except AccountError as exc:
             raise error(exc) from exc
 
     @router.delete("/paragraph-comments/{comment_id}/thanks")
-    def unthank_paragraph_comment(comment_id: UUID4, request: Request) -> dict[str, Any]:
+    def unthank_paragraph_comment(
+        comment_id: UUID4, request: Request
+    ) -> dict[str, Any]:
         session = auth(request, mutation=True)
         try:
-            return store().adjust_paragraph_comment_like(
-                session.user_id, str(comment_id), delta=-1
+            return required_comments().adjust_like(session.user_id, str(comment_id), -1)
+        except AccountError as exc:
+            raise error(exc) from exc
+
+    @router.post("/comments/{comment_id}/likes")
+    def like_comment(comment_id: UUID4, request: Request) -> dict[str, Any]:
+        session = auth(request, mutation=True)
+        backend = required_comments()
+        try:
+            store().enforce_rate_limit(
+                f"comment-like:{session.user_id}:{request_ip(request)}",
+                limit=40,
+                window=60,
             )
+            return backend.adjust_like(session.user_id, str(comment_id), 1)
         except AccountError as exc:
             raise error(exc) from exc
 
@@ -982,9 +1242,11 @@ def create_user_router(
     def sync_state(payload: StateSync, request: Request) -> dict[str, Any]:
         session = auth(request, mutation=True)
         data = payload.model_dump()
-        requested_ids = list(dict.fromkeys(
-            item["book_id"] for values in data.values() for item in values
-        ))
+        requested_ids = list(
+            dict.fromkeys(
+                item["book_id"] for values in data.values() for item in values
+            )
+        )
         repository = repository_provider()
         if hasattr(repository, "account_state_books"):
             available = repository.account_state_books(requested_ids)
@@ -994,13 +1256,15 @@ def create_user_router(
             for book_id in requested_ids:
                 try:
                     repository.get_book(book_id)
-                except Exception as exc:
-                    raise HTTPException(status_code=404, detail="同步数据包含不存在的作品") from exc
+                except RECOVERABLE_INTEGRATION_ERRORS as exc:
+                    raise HTTPException(
+                        status_code=404, detail="同步数据包含不存在的作品"
+                    ) from exc
         try:
             store().sync_state(session.user_id, data)
-            sync_favorite_metrics([
-                item["book_id"] for item in data.get("favorites", [])
-            ])
+            sync_favorite_metrics(
+                [item["book_id"] for item in data.get("favorites", [])]
+            )
             return authoritative_state(
                 session.user_id,
                 available if hasattr(repository, "account_state_books") else None,
@@ -1036,10 +1300,25 @@ def create_user_router(
         return {"items": store().uploads(session.user_id)}
 
     @router.get("/me/notifications")
-    def notification_history(request: Request, limit: int = 100) -> dict[str, Any]:
+    def notification_history(
+        request: Request, limit: int = 100, page: int = 1
+    ) -> dict[str, Any]:
         session = auth(request)
         reconcile_results(store(), settings, user_id=session.user_id)
-        return store().notifications(session.user_id, limit=limit)
+        page_size = min(max(int(limit), 1), 200)
+        current_page = min(max(int(page), 1), 10_000)
+        result = store().notifications(
+            session.user_id,
+            limit=page_size,
+            offset=(current_page - 1) * page_size,
+        )
+        total = int(result.get("total_count") or 0)
+        return {
+            **result,
+            "page": current_page,
+            "page_size": page_size,
+            "page_count": max(1, (total + page_size - 1) // page_size),
+        }
 
     @router.post("/me/notifications/read")
     def mark_all_notifications_read(request: Request) -> dict[str, Any]:
@@ -1047,18 +1326,27 @@ def create_user_router(
         return {"updated": store().mark_notification_read(session.user_id)}
 
     @router.post("/me/notifications/{notification_id}/read")
-    def mark_one_notification_read(notification_id: UUID4, request: Request) -> dict[str, Any]:
+    def mark_one_notification_read(
+        notification_id: UUID4, request: Request
+    ) -> dict[str, Any]:
         session = auth(request, mutation=True)
-        return {"updated": store().mark_notification_read(session.user_id, str(notification_id))}
+        return {
+            "updated": store().mark_notification_read(
+                session.user_id, str(notification_id)
+            )
+        }
 
     @router.post("/me/uploads", status_code=201)
     async def upload_deconstruction_source(
         request: Request,
+        background_tasks: BackgroundTasks,
         file: UploadFile = File(...),
     ) -> dict[str, Any]:
         session = auth(request, mutation=True)
         if not session.email_verified:
-            raise HTTPException(status_code=403, detail="验证邮箱或使用 Google 登录后才能上传")
+            raise HTTPException(
+                status_code=403, detail="验证邮箱或使用 Google 登录后才能上传"
+            )
         try:
             store().enforce_submission_quota(
                 session.user_id,
@@ -1070,8 +1358,12 @@ def create_user_router(
         original = Path(str(file.filename or "")).name
         suffix = Path(original).suffix.casefold()
         if not original or len(original) > 180 or suffix not in ALLOWED_UPLOAD_SUFFIXES:
-            raise HTTPException(status_code=415, detail="请上传 oh-story-claudecode 结构的 ZIP 文件")
-        upload_id = store().create_upload(session.user_id, original, file.content_type or "")
+            raise HTTPException(
+                status_code=415, detail="请上传 oh-story-claudecode 结构的 ZIP 文件"
+            )
+        upload_id = store().create_upload(
+            session.user_id, original, file.content_type or ""
+        )
         directory = settings.user_upload_root / session.user_id / upload_id
         directory.mkdir(parents=True, exist_ok=False, mode=0o700)
         target = directory / "source.zip"
@@ -1084,41 +1376,44 @@ def create_user_router(
                     if size > settings.max_upload_bytes:
                         raise UploadSecurityError("文件超过上传大小限制")
                     handle.write(chunk)
-            scanner = await asyncio.to_thread(
-                UploadSecurityScanner().scan,
-                target,
-                suffix=suffix,
-                max_bytes=settings.max_upload_bytes,
-            )
-            extracted = directory / "extracted"
-            names = await asyncio.to_thread(
-                UploadSecurityScanner.safe_extract_zip, target, extracted
-            )
-            structure = inspect_deconstruction_structure(names)
-            store().finish_upload(
+            store().receive_upload(
                 upload_id,
                 session.user_id,
                 stored_filename=str(target.relative_to(settings.user_upload_root)),
                 size=size,
-                digest=str(scanner["sha256"]),
-                scanner=scanner,
-                structure=structure,
             )
-        except (UploadSecurityError, AccountError) as exc:
+        except (UploadSecurityError, AccountError, OSError) as exc:
             shutil.rmtree(directory, ignore_errors=True)
             store().reject_upload(upload_id, session.user_id, str(exc))
             if isinstance(exc, AccountError):
                 raise error(exc) from exc
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            status_code = 422 if isinstance(exc, UploadSecurityError) else 503
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
         finally:
             await file.close()
+        account_store = store()
+        account_store.create_notification(
+            session.user_id,
+            kind="submission_received",
+            title="拆书文上传成功",
+            message=f"“{original}”上传成功，正在等待审核。",
+            action_url="#/account/submissions",
+            resource_type="deconstruction",
+            resource_id=upload_id,
+            dedupe_key=f"received:deconstruction:{upload_id}",
+        )
+        background_tasks.add_task(
+            inspect_upload_once,
+            settings,
+            account_store,
+            upload_id=upload_id,
+        )
         return {
             "id": upload_id,
-            "status": "ai_pending",
+            "status": "quarantined",
             "bytes": size,
-            "sha256": scanner["sha256"],
-            "structure": structure,
-            "message": "已通过隔离与病毒扫描，正在等待拆文结构审核",
+            "original_filename": original,
+            "message": "上传成功，正在等待审核",
         }
 
     @router.get("/me/novel-submissions")
@@ -1136,13 +1431,16 @@ def create_user_router(
     ) -> dict[str, Any]:
         session = auth(request, mutation=True)
         if not session.email_verified:
-            raise HTTPException(status_code=403, detail="验证邮箱或使用 Google 登录后才能投稿")
+            raise HTTPException(
+                status_code=403, detail="验证邮箱或使用 Google 登录后才能投稿"
+            )
         try:
             parsed = NovelMetadata.model_validate_json(metadata).model_dump()
             allowed_categories = {
                 str(item.get("source_name") or item.get("name") or "").strip()
                 for item in (
-                    category_provider() if category_provider is not None
+                    category_provider()
+                    if category_provider is not None
                     else repository_provider().categories()
                 )
                 if str(item.get("name") or "").strip()
@@ -1158,13 +1456,17 @@ def create_user_router(
             raise
         except AccountError as exc:
             raise error(exc) from exc
-        except Exception as exc:
-            raise HTTPException(status_code=422, detail="投稿资料字段不完整或格式无效") from exc
+        except RECOVERABLE_INTEGRATION_ERRORS as exc:
+            raise HTTPException(
+                status_code=422, detail="投稿资料字段不完整或格式无效"
+            ) from exc
         original = Path(str(manuscript.filename or "")).name
         suffix = Path(original).suffix.casefold()
         if not original or len(original) > 180 or suffix not in ALLOWED_NOVEL_SUFFIXES:
             raise HTTPException(status_code=415, detail="小说正文仅支持 TXT 或 EPUB")
-        submission_id = store().create_novel_submission(session.user_id, parsed, original)
+        submission_id = store().create_novel_submission(
+            session.user_id, parsed, original
+        )
         directory = settings.user_upload_root / session.user_id / submission_id
         directory.mkdir(parents=True, exist_ok=False, mode=0o700)
         source_path = directory / f"manuscript{suffix}"
@@ -1235,37 +1537,79 @@ def create_user_router(
         background_tasks: BackgroundTasks,
     ) -> FileResponse:
         auth(request)
-        allowed = {str(item.get("slug")) for item in repository_provider().list_deconstructions()}
+        allowed = {
+            str(item.get("slug"))
+            for item in repository_provider().list_deconstructions()
+        }
         if slug not in allowed:
             raise HTTPException(status_code=404, detail="拆书档案不存在")
         root = (settings.deconstruction_root / slug).resolve()
         if root.parent != settings.deconstruction_root.resolve() or not root.is_dir():
             raise HTTPException(status_code=404, detail="拆书档案不存在")
-        handle, archive_name = tempfile.mkstemp(prefix="oohstory-deconstruction-", suffix=".zip")
+        handle, archive_name = tempfile.mkstemp(
+            prefix="oohstory-deconstruction-", suffix=".zip"
+        )
         os.close(handle)
         try:
-            with zipfile.ZipFile(archive_name, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            with zipfile.ZipFile(
+                archive_name, "w", compression=zipfile.ZIP_DEFLATED
+            ) as archive:
                 total = 0
                 count = 0
-                for candidate in sorted(root.rglob("*.md")):
+                for candidate in sorted(path for path in root.rglob("*") if path.is_file()):
                     resolved = candidate.resolve()
-                    if candidate.is_symlink() or not resolved.is_relative_to(root):
+                    relative = resolved.relative_to(root) if resolved.is_relative_to(root) else None
+                    if (
+                        candidate.is_symlink()
+                        or relative is None
+                        or candidate.name == "_submission.json"
+                        or any(part.startswith(".") for part in relative.parts)
+                    ):
                         continue
                     count += 1
                     total += resolved.stat().st_size
                     if count > 2000 or total > 256 * 1024 * 1024:
-                        raise HTTPException(status_code=413, detail="拆书档案超过下载安全上限")
-                    archive.write(resolved, resolved.relative_to(root))
+                        raise HTTPException(
+                            status_code=413, detail="拆书档案超过下载安全上限"
+                        )
+                    archive.write(resolved, relative)
             background_tasks.add_task(Path(archive_name).unlink, missing_ok=True)
             return FileResponse(
                 archive_name,
                 filename=f"{slug}.zip",
                 media_type="application/zip",
-                headers={"Cache-Control": "private, no-store", "X-Download-Options": "noopen"},
+                headers={
+                    "Cache-Control": "private, no-store",
+                    "X-Download-Options": "noopen",
+                },
             )
-        except Exception:
+        except BaseException:
             Path(archive_name).unlink(missing_ok=True)
             raise
+
+    @router.get("/deconstructions/{slug}/likes")
+    def deconstruction_likes(slug: str, request: Request) -> dict[str, Any]:
+        allowed = {
+            str(item.get("slug"))
+            for item in repository_provider().list_deconstructions()
+        }
+        if slug not in allowed:
+            raise HTTPException(status_code=404, detail="拆书档案不存在")
+        session = optional_auth(request)
+        return store().deconstruction_engagement(
+            [slug], viewer_user_id=session.user_id if session else None
+        )[slug]
+
+    @router.post("/deconstructions/{slug}/likes")
+    def toggle_deconstruction_like(slug: str, request: Request) -> dict[str, Any]:
+        session = auth(request, mutation=True)
+        allowed = {
+            str(item.get("slug"))
+            for item in repository_provider().list_deconstructions()
+        }
+        if slug not in allowed:
+            raise HTTPException(status_code=404, detail="拆书档案不存在")
+        return store().toggle_deconstruction_like(session.user_id, slug)
 
     setattr(router, "google_redirect_handler", google_redirect)
     return router

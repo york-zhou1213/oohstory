@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Continuously drain one electronic-library source at a bounded full rate.
 
-Each enabled site owns an independent systemd instance.  Local TXT80 work has
-its own slot; authorized sites share a slot so aggressive crawlers never pile
-onto the same MySQL/NAS queues.  Each site's bounded per-cycle count is read
-from OOHStory's atomic runtime configuration before every cycle; cycle starts
-remain at least 60 seconds apart. Slow upstream sites naturally run below the
-target instead of overlapping another cycle.
+Each enabled site owns an independent systemd instance.  Its execution lane
+matches the real transport boundary: Xbiquge and Ixdzs get separate HTTP lanes,
+while sources that reuse the same browser stay FIFO inside that browser lane.
+Each site's bounded per-cycle count is read from OOHStory's atomic runtime
+configuration before every cycle; cycle starts remain at least 60 seconds
+apart. Slow upstream sites naturally run below the target instead of overlapping
+another cycle.
 """
 
 from __future__ import annotations
@@ -33,6 +34,8 @@ from oohstory_library.services.runtime_controls import (
 
 
 TARGET_BOOKS_PER_MINUTE = SITE_BOOKS_PER_CYCLE_DEFAULT
+MIN_BOOKS_PER_CYCLE = 1
+MAX_BOOKS_PER_CYCLE = 500
 SITE_LABELS = {
     "txt80": "TXT80 本地书库正文",
     "xbiquge": "新笔趣阁授权正文",
@@ -41,8 +44,30 @@ SITE_LABELS = {
     "linovelib": "哔哩轻小说授权正文",
 }
 AUTHORIZED_SITES = frozenset({"xbiquge", "ixdzs", "shubaow", "linovelib"})
+SOURCE_SLOT_LANES = {
+    "txt80": "local",
+    "xbiquge": "http-xbiquge",
+    "ixdzs": "http-ixdzs",
+    "shubaow": "browser-shubaow",
+    "linovelib": "browser-shubaow",
+}
+SITE_BOOK_LIMIT_CAPS = {
+    "shubaow": 1,
+}
+DEFAULT_SITE_WORKERS = {
+    "xbiquge": 3,
+    "ixdzs": 8,
+    "shubaow": 1,
+    "linovelib": 5,
+}
+WORKER_FLAGS = {
+    "xbiquge": "--xbiquge-workers",
+    "ixdzs": "--ixdzs-workers",
+    "shubaow": "--shubaow-workers",
+    "linovelib": "--linovelib-workers",
+}
 TOOLS_ROOT = Path(__file__).resolve().parent
-LIBRARY_ROOT = APP_ROOT / "electronic-library" / "txt80"
+LIBRARY_ROOT = APP_ROOT / "electronic-library"
 STATE_ROOT = LIBRARY_ROOT / "全局索引"
 PYTHON = APP_ROOT / ".venv" / "bin" / "python"
 STOP = threading.Event()
@@ -67,6 +92,10 @@ def atomic_state(site: str, payload: dict[str, object]) -> None:
     os.replace(temporary, path)
 
 
+def slot_lane(site: str) -> str:
+    return SOURCE_SLOT_LANES.get(site, "http")
+
+
 def build_command(site: str, target_books_per_minute: int) -> list[str]:
     if site not in SITE_LABELS:
         raise ValueError("未知正文同步站点")
@@ -86,28 +115,22 @@ def build_command(site: str, target_books_per_minute: int) -> list[str]:
             "--min-free-gb", "15",
             "--limit-books", str(target_books_per_minute),
         ]
-    workers = {
-        "xbiquge": "8",
-        "ixdzs": "96",
-        "shubaow": "8",
-        "linovelib": "8",
-    }
+    effective_limit = min(
+        target_books_per_minute,
+        SITE_BOOK_LIMIT_CAPS.get(site, target_books_per_minute),
+    )
     return [
         python,
         str(TOOLS_ROOT / "authorized_site_catalog_sync.py"),
         "--sources", site,
-        "--download-limit", str(target_books_per_minute),
-        "--page-limit", "1",
-        "--xbiquge-workers", workers["xbiquge"],
-        "--ixdzs-workers", workers["ixdzs"],
-        "--shubaow-workers", workers["shubaow"],
-        "--linovelib-workers", workers["linovelib"],
+        "--download-limit", str(effective_limit),
+        "--page-limit", "5",
+        WORKER_FLAGS[site], str(DEFAULT_SITE_WORKERS[site]),
     ]
 
 
 def slot_path(site: str) -> Path:
-    name = "local" if site == "txt80" else "authorized"
-    return LIBRARY_ROOT / f".site-full-sync-{name}.lock"
+    return LIBRARY_ROOT / f".site-full-sync-{slot_lane(site)}.lock"
 
 
 def sleep_remaining(started: float, interval: float) -> None:
@@ -136,6 +159,7 @@ def run_loop(site: str, target_books_per_minute: int, *, once: bool = False) -> 
         "label": SITE_LABELS[site],
         "target_books_per_minute": target_books_per_minute,
         "cycle_limit": target_books_per_minute,
+        "slot_lane": slot_lane(site),
         "message": "全力同步准备启动",
     }
     atomic_state(site, state)
@@ -155,11 +179,8 @@ def run_loop(site: str, target_books_per_minute: int, *, once: bool = False) -> 
             cycle=cycle,
             target_books_per_minute=cycle_limit,
             cycle_limit=cycle_limit,
-            message=(
-                "等待授权站点全速槽位"
-                if site in AUTHORIZED_SITES
-                else "等待本地正文全速槽位"
-            ),
+            slot_lane=slot_lane(site),
+            message=f"等待 {slot_lane(site)} 执行槽位",
         )
         atomic_state(site, state)
         with lock_path.open("a+", encoding="utf-8") as slot:
@@ -169,6 +190,7 @@ def run_loop(site: str, target_books_per_minute: int, *, once: bool = False) -> 
             state.update(
                 status="running",
                 cycle_started_at=now(),
+                slot_lane=slot_lane(site),
                 message=f"正在同步；本轮最多 {cycle_limit} 本",
             )
             atomic_state(site, state)
@@ -179,6 +201,7 @@ def run_loop(site: str, target_books_per_minute: int, *, once: bool = False) -> 
                 last_returncode=int(completed.returncode),
                 last_cycle_seconds=elapsed,
                 last_cycle_finished_at=now(),
+                slot_lane=slot_lane(site),
                 message=(
                     "本轮完成，等待下一分钟"
                     if completed.returncode == 0

@@ -167,6 +167,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
         ? const Color(0xFF16A085)
         : AppTheme.seedPurple;
     final read = (item['read_at'] as String? ?? '').isNotEmpty;
+    final resourceStatus = item['resource_status'] as String? ?? '';
     final date = DateTime.tryParse(
       item['created_at'] as String? ?? '',
     )?.toLocal();
@@ -249,6 +250,27 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
                     color: theme.colorScheme.onSurface.withValues(alpha: .62),
                   ),
                 ),
+                if (resourceStatus.isNotEmpty) ...[
+                  const SizedBox(height: 9),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 9,
+                      vertical: 5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: color.withValues(alpha: .1),
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Text(
+                      '当前状态：${_resourceStatusLabel(resourceStatus)}',
+                      style: TextStyle(
+                        color: color,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 10),
                 Row(
                   children: [
@@ -278,6 +300,17 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
       ),
     );
   }
+
+  String _resourceStatusLabel(String status) => switch (status) {
+    'quarantined' => '等待后台检查',
+    'scanning' => '后台安全检查中',
+    'ai_pending' => '等待审核',
+    'reviewing' => '审核中',
+    'approved' => '已通过，等待入库',
+    'completed' => '已入库',
+    'rejected' => '已驳回',
+    _ => status,
+  };
 
   Widget _empty(IconData icon, String text) => Padding(
     padding: const EdgeInsets.only(top: 80),

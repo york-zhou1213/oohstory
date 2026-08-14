@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-library_root=${OOHSTORY_LIBRARY_ROOT:-/srv/oohstory/library}
-reader_user=${OOHSTORY_READER_USER:-oohstory}
+library_root=/srv/oohstory/library
+reader_user=oohstory
 
 id "$reader_user" >/dev/null
 setfacl -m "u:${reader_user}:r" "$library_root/catalog.sqlite3"

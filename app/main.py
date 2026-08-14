@@ -1,22 +1,30 @@
 from __future__ import annotations
 
-from base64 import b64encode
-from contextlib import asynccontextmanager
+from app.error_boundaries import RECOVERABLE_INTEGRATION_ERRORS
+
+import asyncio
+from base64 import b64decode, b64encode
+from contextlib import asynccontextmanager, suppress
 from copy import deepcopy
 from functools import lru_cache
 from hashlib import sha256
 from html import escape
+from io import BytesIO
 import json
 import mimetypes
 import os
 from pathlib import Path
 import re
 import secrets
+import shutil
+import subprocess
 import threading
 import time
 from typing import Any, Callable
 from uuid import UUID
+import wave
 
+import edge_tts
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.gzip import GZipMiddleware
@@ -25,9 +33,11 @@ from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
     PlainTextResponse,
+    Response,
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
+from PIL import Image, ImageOps
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, ConfigDict, UUID4, field_validator
 
@@ -36,12 +46,33 @@ from .accounts import AccountError, AccountStore
 from .category_management import CategoryManager
 from .settings import PROJECT_ROOT, load_settings
 from .user_api import create_user_router
+from .admin_api import create_admin_router
+from .audiobook import (
+    AudiobookService,
+    has_spoken_content,
+    mp3_duration_ms,
+)
+from .audiobook_policy import (
+    AudiobookContractError,
+    LOCAL_TTS_PROVIDER,
+    MODE_LANGUAGE,
+    POLICY_VERSION as AUDIOBOOK_POLICY_VERSION,
+    TTS_VOICES,
+    validate_voice_selection,
+    voice_language,
+)
+from .comments import CommentStore
+from .rate_limiter import RateLimiter
 
 
 HOME_FEATURED_BOOK_COUNT = 14
 HOME_PRIMARY_CACHE_SECONDS = 60
 HOME_SECONDARY_CACHE_SECONDS = 300
 STATIC_ROOT = PROJECT_ROOT / "static"
+MAINTENANCE_PAGE = STATIC_ROOT / "maintenance.html"
+MAINTENANCE_STATIC_PATHS = frozenset(
+    {"/icon-192.png", "/favicon.ico", "/favicon-32.png"}
+)
 STRUCTURED_DATA_PATTERN = re.compile(
     r'<script id="structured-data" type="application/ld\+json">(.*?)</script>',
     re.DOTALL,
@@ -63,10 +94,52 @@ SITE_DESCRIPTION = (
     "书库检索与深度拆书档案。"
 )
 SITE_KEYWORDS = (
-    "OOH Story, 免费小说阅读, 免费小说下载, 中文小说, 全本小说, "
-    "TXT电子书, 深度拆书"
+    "OOH Story, 免费小说阅读, 免费小说下载, 中文小说, 全本小说, TXT电子书, 深度拆书"
 )
+AUDIOBOOK_CLIENT_COOKIE = "oohstory_audiobook_client"
+AUDIOBOOK_CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,96}$")
 SEO_CSP_HASH_HEADER = "X-OOHStory-SEO-CSP-Hash"
+ANDROID_LATEST_VERSION_NAME = "1.18.20"
+ANDROID_LATEST_VERSION_CODE = 64
+ANDROID_LATEST_RELEASE_DATE = "2026-08-14"
+ANDROID_LATEST_APK_PATH = STATIC_ROOT / "downloads" / "android" / "latest.apk"
+ANDROID_LATEST_DOWNLOAD_URL = f"{SITE_ORIGIN}/downloads/android/latest.apk"
+ANDROID_LATEST_RELEASE_NOTES_PUBLIC = (
+    "后台听书改为单章节连续媒体源，不再在五段边界自动暂停。",
+    "重复媒体请求返回同一段音频，修复播放进度与正文光标错位。",
+    "播放光标只按服务端精确音频时长推进，不再使用估算时长抢跑。",
+    "普通听书会重新创建本章第 0 段播放，不再恢复旧听书会话。",
+    "从此处听书继续按所选段落起播，与普通听书入口分离。",
+    "听书播放光标会跟随真实音频段位同步滚动。",
+    "从此处听书会由服务端识别所选段落，避免选段起播错位。",
+    "听书 MP3 不再跨会话持久复用，退出听书会清理本地音频缓存。",
+    "服务端连续播放改为五段滚动窗口，避免超长听书请求失败。",
+    "继续保留当前书籍封面的后台播放通知展示。",
+)
+
+
+@lru_cache(maxsize=8)
+def _file_sha256(path: str, mtime_ns: int, size: int) -> str:
+    _ = (mtime_ns, size)
+    return sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _android_latest_apk_metadata() -> dict[str, Any]:
+    size = 0
+    digest = ""
+    if ANDROID_LATEST_APK_PATH.is_file():
+        stat_result = ANDROID_LATEST_APK_PATH.stat()
+        size = int(stat_result.st_size)
+        digest = _file_sha256(
+            str(ANDROID_LATEST_APK_PATH),
+            int(stat_result.st_mtime_ns),
+            size,
+        )
+    return {
+        "url": ANDROID_LATEST_DOWNLOAD_URL,
+        "sha256": digest,
+        "size_bytes": size,
+    }
 
 
 @lru_cache(maxsize=1)
@@ -314,10 +387,7 @@ def _book_entity(
             value
             for value in (
                 _seo_text(book.get("category"), 40),
-                *(
-                    _seo_text(item, 40)
-                    for item in (book.get("genre_tags") or [])
-                ),
+                *(_seo_text(item, 40) for item in (book.get("genre_tags") or [])),
             )
             if value
         )
@@ -374,6 +444,94 @@ class PublicMetricEvent(BaseModel):
         return value
 
 
+class AudiobookSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    book_id: str
+    chapter_id: int
+    client_id: str
+    mode: str = "smart"
+    narrator: str = "mocheng"
+    voice: str = "nuanxi"
+    emotion: str = "auto"
+    rate: float = 1.0
+    resume: bool = True
+    start_paragraph_index: int = 0
+
+    @field_validator("book_id")
+    @classmethod
+    def valid_book_id(cls, value: str) -> str:
+        if not PUBLIC_BOOK_ID.fullmatch(value):
+            raise ValueError("作品标识无效")
+        return value
+
+    @field_validator("chapter_id")
+    @classmethod
+    def valid_chapter_id(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("章节标识无效")
+        return value
+
+    @field_validator("client_id")
+    @classmethod
+    def valid_client_id(cls, value: str) -> str:
+        clean = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,96}", clean):
+            raise ValueError("客户端标识无效")
+        return clean
+
+    @field_validator("mode")
+    @classmethod
+    def valid_mode(cls, value: str) -> str:
+        if value not in {"normal", "smart", "cantonese", "hokkien"}:
+            raise ValueError("听书模式无效")
+        return value
+
+    @field_validator("emotion")
+    @classmethod
+    def valid_emotion(cls, value: str) -> str:
+        if value != "auto" and value not in TTS_EMOTIONS:
+            raise ValueError("情感模式无效")
+        return value
+
+    @field_validator("rate")
+    @classmethod
+    def valid_rate(cls, value: float) -> float:
+        if value < 0.5 or value > 3:
+            raise ValueError("语速无效")
+        return round(value, 2)
+
+    @field_validator("start_paragraph_index")
+    @classmethod
+    def valid_start_paragraph_index(cls, value: int) -> int:
+        if value < 0 or value > 200_000:
+            raise ValueError("起始段落无效")
+        return value
+
+
+class AudiobookProgressRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    chapter_id: int
+    paragraph_index: int = 0
+    item_index: int = 0
+    audio_offset_ms: int = 0
+
+    @field_validator("chapter_id")
+    @classmethod
+    def valid_progress_chapter_id(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("chapter_id must be positive")
+        return value
+
+    @field_validator("paragraph_index", "item_index", "audio_offset_ms")
+    @classmethod
+    def non_negative_progress(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("progress values must be non-negative")
+        return value
+
+
 class StaleWhileRevalidateSnapshot:
     """Small per-worker snapshot with a stale-while-revalidate refresh path."""
 
@@ -394,7 +552,7 @@ class StaleWhileRevalidateSnapshot:
     ) -> dict[str, Any] | None:
         try:
             value = builder()
-        except Exception:
+        except RECOVERABLE_INTEGRATION_ERRORS:
             with self._condition:
                 if self._namespace is namespace:
                     self._refreshing = False
@@ -464,12 +622,281 @@ class StaleWhileRevalidateSnapshot:
 
 
 settings = load_settings()
-_home_primary_snapshot = StaleWhileRevalidateSnapshot(
-    HOME_PRIMARY_CACHE_SECONDS
-)
-_home_secondary_snapshot = StaleWhileRevalidateSnapshot(
-    HOME_SECONDARY_CACHE_SECONDS
-)
+_home_primary_snapshot = StaleWhileRevalidateSnapshot(HOME_PRIMARY_CACHE_SECONDS)
+_home_secondary_snapshot = StaleWhileRevalidateSnapshot(HOME_SECONDARY_CACHE_SECONDS)
+
+
+AUDIOBOOK_STREAM_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+AUDIOBOOK_MANIFEST_HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+AUDIOBOOK_STREAM_BATCH_SEGMENTS = 5
+
+
+def _normalize_audiobook_stream_id(stream_id: str | None) -> str | None:
+    raw = str(stream_id or "").strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    if AUDIOBOOK_STREAM_ID_PATTERN.fullmatch(lowered):
+        return lowered
+    if len(raw) > 128:
+        return None
+    return sha256(
+        f"legacy-stream:{raw}".encode("utf-8", "surrogatepass")
+    ).hexdigest()[:32]
+
+
+def _audiobook_stream_receipt_path(
+    session_id: str, manifest_hash: str, stream_id: str
+) -> Path:
+    if not AUDIOBOOK_STREAM_ID_PATTERN.fullmatch(session_id):
+        raise ValueError("invalid audiobook session id")
+    if not AUDIOBOOK_MANIFEST_HASH_PATTERN.fullmatch(manifest_hash):
+        raise ValueError("invalid audiobook manifest hash")
+    if not AUDIOBOOK_STREAM_ID_PATTERN.fullmatch(stream_id):
+        raise ValueError("invalid audiobook stream id")
+    return (
+        settings.audiobook_storage_root
+        / "audiobook-stream-receipts"
+        / session_id
+        / f"{manifest_hash}.{stream_id}.complete"
+    )
+
+
+def _audiobook_stream_intent_path(
+    session_id: str, manifest_hash: str, stream_id: str
+) -> Path:
+    receipt = _audiobook_stream_receipt_path(
+        session_id, manifest_hash, stream_id
+    )
+    return receipt.with_suffix(".intent")
+
+
+def _audiobook_stream_cursor_path(
+    session_id: str, manifest_hash: str, stream_id: str
+) -> Path:
+    receipt = _audiobook_stream_receipt_path(
+        session_id, manifest_hash, stream_id
+    )
+    return receipt.with_suffix(".cursor")
+
+
+def _read_audiobook_stream_cursor(
+    session_id: str, manifest_hash: str, stream_id: str
+) -> int | None:
+    target = _audiobook_stream_cursor_path(session_id, manifest_hash, stream_id)
+    try:
+        raw = target.read_text(encoding="ascii").strip()
+    except OSError:
+        return None
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return None
+
+
+def _write_audiobook_stream_cursor(
+    session_id: str, manifest_hash: str, stream_id: str, next_start: int
+) -> None:
+    target = _audiobook_stream_cursor_path(session_id, manifest_hash, stream_id)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}")
+    try:
+        with temporary.open("x", encoding="ascii") as handle:
+            handle.write(f"{max(0, int(next_start))}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _claim_audiobook_stream_intent(
+    session_id: str, manifest_hash: str, stream_id: str | None
+) -> bool:
+    """Claim one logical play intent across workers and media reconnects.
+
+    Browsers may repeat the same media URL with several Range requests.  Only
+    the first request for a client-generated stream ID consumes request quota;
+    synthesis cost and global TTS leases remain independently enforced.
+    """
+    if not stream_id:
+        return True
+    target = _audiobook_stream_intent_path(
+        session_id, manifest_hash, stream_id
+    )
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(
+            target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+        )
+    except FileExistsError:
+        return False
+    except OSError:
+        # Fail safe: a storage fault must not disable abuse protection.
+        return True
+    with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+        handle.write("intent\n")
+    return True
+
+
+def _mp3_frame_payload(audio: bytes) -> bytes:
+    """Remove leading ID3v2 metadata before concatenating MP3 segments.
+
+    Every independently generated segment can carry its own ID3 header. Raw
+    byte concatenation leaves those headers in the middle of the chapter and
+    mobile decoders may skip the following dialogue as corrupt data. MP3 audio
+    frames are safe to concatenate after all leading ID3v2 tags are removed.
+    """
+    payload = bytes(audio)
+    while payload.startswith(b"ID3") and len(payload) >= 10:
+        if any(byte & 0x80 for byte in payload[6:10]):
+            break
+        tag_size = sum(
+            (payload[6 + index] & 0x7F) << (21 - 7 * index)
+            for index in range(4)
+        )
+        total = 10 + tag_size + (10 if payload[5] & 0x10 else 0)
+        if total <= 10 or total >= len(payload):
+            break
+        payload = payload[total:]
+    return payload
+
+
+def _mark_audiobook_stream_complete(
+    session_id: str, manifest_hash: str, stream_id: str
+) -> None:
+    target = _audiobook_stream_receipt_path(session_id, manifest_hash, stream_id)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}")
+    try:
+        with temporary.open("x", encoding="ascii") as handle:
+            handle.write("complete\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _consume_audiobook_stream_receipt(
+    session_id: str, manifest_hash: str, stream_id: str
+) -> bool:
+    target = _audiobook_stream_receipt_path(session_id, manifest_hash, stream_id)
+    try:
+        target.unlink()
+    except FileNotFoundError:
+        return False
+    try:
+        target.parent.rmdir()
+    except OSError:
+        pass
+    return True
+
+
+def _delete_audiobook_session_receipts(session_id: str) -> None:
+    """Remove transient receipts and session-scoped audio owned by one session."""
+    if not AUDIOBOOK_STREAM_ID_PATTERN.fullmatch(session_id):
+        return
+    directory = (
+        settings.audiobook_storage_root
+        / "audiobook-stream-receipts"
+        / session_id
+    )
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+def _audiobook_session_segment_paths(
+    session_id: str,
+    manifest_hash: str,
+    segment: dict[str, Any],
+) -> tuple[Path, Path]:
+    if not AUDIOBOOK_STREAM_ID_PATTERN.fullmatch(session_id):
+        raise ValueError("invalid audiobook session id")
+    if not AUDIOBOOK_MANIFEST_HASH_PATTERN.fullmatch(manifest_hash):
+        raise ValueError("invalid audiobook manifest hash")
+    segment_hash = str(segment.get("sha256") or "")
+    if not AUDIOBOOK_MANIFEST_HASH_PATTERN.fullmatch(segment_hash):
+        segment_hash = sha256(
+            json.dumps(segment, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+    directory = (
+        settings.audiobook_storage_root
+        / "audiobook-stream-receipts"
+        / session_id
+        / "audio"
+        / manifest_hash
+    )
+    target = directory / f"{segment_hash}.mp3"
+    return target, target.with_suffix(".lock")
+
+
+def _read_audiobook_session_segment(target: Path) -> bytes | None:
+    try:
+        audio = target.read_bytes()
+    except OSError:
+        return None
+    return audio or None
+
+
+def _claim_audiobook_session_segment(lock: Path) -> bool:
+    lock.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        try:
+            if time.time() - lock.stat().st_mtime > 300:
+                lock.unlink()
+        except OSError:
+            pass
+        return False
+    with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+        handle.write(f"{os.getpid()}\n")
+    return True
+
+
+def _publish_audiobook_session_segment(target: Path, audio: bytes) -> None:
+    temporary = target.with_name(
+        f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}"
+    )
+    try:
+        with temporary.open("x+b") as handle:
+            handle.write(audio)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _purge_cancelled_audiobook_session(
+    session_id: str, owner_key: str
+) -> None:
+    """Physically remove the exact cancelled session after access is revoked."""
+    if (
+        not AUDIOBOOK_STREAM_ID_PATTERN.fullmatch(session_id)
+        or not AUDIOBOOK_MANIFEST_HASH_PATTERN.fullmatch(owner_key)
+    ):
+        return
+    repository_owner = getattr(audiobook_service(), "repository", None)
+    mysql = getattr(repository_owner, "_mysql", None)
+    if mysql is None:
+        return
+    with mysql.pool.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM audiobook_sessions WHERE session_id=%s "
+                "AND owner_hash=UNHEX(%s) AND cancelled=1",
+                (session_id, owner_key),
+            )
 
 
 @asynccontextmanager
@@ -480,7 +907,7 @@ async def lifespan(_app: FastAPI):
         try:
             home_primary()
             home_secondary()
-        except Exception:
+        except RECOVERABLE_INTEGRATION_ERRORS:
             # A later request performs the same guarded cold build. Readiness
             # and unrelated routes must not fail because optional prewarming did.
             return
@@ -506,10 +933,27 @@ app.add_middleware(
 )
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
+_rate_limiter = RateLimiter(
+    global_rate=2.0,
+    global_burst=15,
+    sitemap_rate=0.05,
+    sitemap_burst=2,
+    chapter_rate=0.2,
+    chapter_burst=3,
+    ban_threshold=10,
+    ban_duration=7200,
+    reader_guard_enabled=True,
+)
+
 
 @lru_cache(maxsize=1)
 def repository() -> LibraryRepository:
     return LibraryRepository(settings)
+
+
+@lru_cache(maxsize=1)
+def audiobook_service() -> AudiobookService:
+    return AudiobookService(repository())
 
 
 @lru_cache(maxsize=1)
@@ -518,6 +962,11 @@ def account_store() -> AccountStore:
         settings.user_database_path,
         session_ttl_seconds=settings.session_ttl_seconds,
     )
+
+
+@lru_cache(maxsize=1)
+def comment_store() -> CommentStore:
+    return CommentStore(repository(), settings.comment_object_root)
 
 
 category_manager = CategoryManager(lambda: account_store(), lambda: repository())
@@ -534,8 +983,22 @@ user_router = create_user_router(
     on_public_metrics_changed=invalidate_home_snapshots,
     store_provider=account_store,
     category_provider=lambda: category_manager.items(),
+    on_logout=lambda _raw, session, request: _cancel_audiobook_logout(
+        int(session.user_id), request
+    ),
+    comment_provider=comment_store,
 )
 app.include_router(user_router)
+
+admin_router = create_admin_router(
+    settings,
+    store_provider=account_store,
+    repository_provider=repository,
+    category_manager=category_manager,
+    on_catalog_changed=invalidate_home_snapshots,
+)
+app.include_router(admin_router)
+
 app.add_api_route(
     "/",
     getattr(user_router, "google_redirect_handler"),
@@ -546,19 +1009,94 @@ app.add_api_route(
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    response = await call_next(request)
+    blocked = _rate_limiter.check(request)
+    if blocked is not None:
+        return blocked
+    if request.method in ("POST", "PUT", "DELETE"):
+        origin = request.headers.get("origin")
+        if origin:
+            allowed_origins = {SITE_ORIGIN, SITE_ORIGIN.replace("://", "://www.")}
+            if request.url.path == "/":
+                allowed_origins.add("https://accounts.google.com")
+            content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            google_null_origin_form = (
+                request.method == "POST"
+                and request.url.path == "/"
+                and origin == "null"
+                and content_type in {
+                    "application/x-www-form-urlencoded",
+                    "multipart/form-data",
+                }
+            )
+            if origin.rstrip("/") not in allowed_origins and not google_null_origin_form:
+                return JSONResponse(
+                    {"detail": "跨站请求已拒绝"},
+                    status_code=403,
+                    headers={"Cache-Control": "no-store"},
+                )
+    maintenance_enabled = settings.maintenance_flag_path.is_file()
+    maintenance_bypass = request.url.path == "/healthz" or (
+        request.method in {"GET", "HEAD"}
+        and request.url.path in MAINTENANCE_STATIC_PATHS
+    )
+    if maintenance_enabled and not maintenance_bypass:
+        if request.method in {"GET", "HEAD"} and not request.url.path.startswith(
+            "/api/"
+        ):
+            response = HTMLResponse(
+                MAINTENANCE_PAGE.read_text(encoding="utf-8"),
+                status_code=503,
+            )
+        else:
+            response = JSONResponse(
+                {
+                    "detail": "OOHStory 正在维护，请稍后重试",
+                    "maintenance": True,
+                },
+                status_code=503,
+            )
+        response.headers["Retry-After"] = "300"
+        response.headers["X-Robots-Tag"] = "noindex, nofollow, noarchive"
+        response.headers["Content-Language"] = "zh-CN"
+    else:
+        response = await call_next(request)
+    audiobook_client = request.headers.get("x-audiobook-client", "")
+    if (
+        request.url.path.startswith("/api/v1/audiobook/")
+        and request.method != "DELETE"
+        and AUDIOBOOK_CLIENT_ID_RE.fullmatch(audiobook_client)
+        and AUDIOBOOK_CLIENT_COOKIE not in response.headers.get("set-cookie", "")
+    ):
+        forwarded_proto = request.headers.get("x-forwarded-proto", "")
+        response.set_cookie(
+            AUDIOBOOK_CLIENT_COOKIE,
+            audiobook_client,
+            max_age=43_200,
+            httponly=True,
+            secure=request.url.scheme == "https" or forwarded_proto == "https",
+            samesite="lax",
+            path="/api/v1/audiobook/",
+        )
     dynamic_script_hash = response.headers.get(SEO_CSP_HASH_HEADER, "")
     if SEO_CSP_HASH_HEADER in response.headers:
         del response.headers[SEO_CSP_HASH_HEADER]
-    script_sources = ["'self'"]
+    script_sources = [
+        "'self'",
+        "https://static.cloudflareinsights.com",
+        "https://challenges.cloudflare.com",
+    ]
     if settings.google_web_client_id:
         script_sources.append("https://accounts.google.com/gsi/client")
     content_type = response.headers.get("content-type", "").split(";", 1)[0].strip()
     if content_type == "text/html":
-        script_sources.extend([
-            dynamic_script_hash or STRUCTURED_DATA_CSP_HASH,
-            f"'nonce-{secrets.token_urlsafe(24)}'",
-        ])
+        # Cloudflare JavaScript Detections copies a nonce found in the CSP
+        # response header onto the inline challenge script it injects.
+        script_sources.extend(
+            [
+                dynamic_script_hash or STRUCTURED_DATA_CSP_HASH,
+                f"'nonce-{secrets.token_urlsafe(24)}'",
+            ]
+        )
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
@@ -575,11 +1113,16 @@ async def security_headers(request: Request, call_next):
         "max-age=31536000; includeSubDomains"
     )
     response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
+        "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob: data:; "
+        "style-src 'self' 'unsafe-inline'; "
         f"script-src {' '.join(script_sources)}; script-src-attr 'none'; "
-        "connect-src 'self' "
+        "connect-src 'self' https://cloudflareinsights.com https://*.cloudflareinsights.com "
         + ("https://accounts.google.com; " if settings.google_web_client_id else "; ")
-        + ("frame-src https://accounts.google.com; " if settings.google_web_client_id else "")
+        + (
+            "frame-src https://accounts.google.com; "
+            if settings.google_web_client_id
+            else ""
+        )
         + "font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
     )
     if (
@@ -588,20 +1131,39 @@ async def security_headers(request: Request, call_next):
         or request.url.path.startswith("/api/v1/me/")
     ):
         response.headers["Cache-Control"] = "no-store"
-    elif (
-        request.url.path in {
-            "/api/v1/home",
-            "/api/v1/home/primary",
-            "/api/v1/home/secondary",
-            "/api/v1/recommendations",
-            "/api/v1/rankings",
-        }
-        or re.fullmatch(
-            r"/api/v1/books/[A-Za-z0-9_-]{22}/metrics",
-            request.url.path,
+    elif request.url.path == "/api/v1/home/primary":
+        response.headers["Cache-Control"] = (
+            "public, max-age=60, stale-while-revalidate=300"
         )
+        response.headers.setdefault("X-Robots-Tag", "noindex, nofollow")
+    elif request.url.path in {
+        "/api/v1/home",
+        "/api/v1/home/secondary",
+        "/api/v1/recommendations",
+        "/api/v1/rankings",
+    } or re.fullmatch(
+        r"/api/v1/books/[A-Za-z0-9_-]{22}/metrics",
+        request.url.path,
     ):
         response.headers["Cache-Control"] = "no-cache"
+        response.headers.setdefault("X-Robots-Tag", "noindex, nofollow")
+    elif response.status_code < 400 and re.fullmatch(
+        r"/books/[A-Za-z0-9_-]{22}/chapters/[1-9][0-9]*",
+        request.url.path,
+    ):
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["CDN-Cache-Control"] = "no-store"
+        response.headers["Cloudflare-CDN-Cache-Control"] = "no-store"
+    elif re.fullmatch(
+        r"/api/v1/books/[A-Za-z0-9_-]{22}/chapters/[1-9][0-9]*",
+        request.url.path,
+    ):
+        # Chapter bodies must reach the origin so source-IP blocks and future
+        # behavior controls cannot be bypassed by an edge cache. The Web and
+        # mobile readers already keep their own bounded chapter caches.
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["CDN-Cache-Control"] = "no-store"
+        response.headers["Cloudflare-CDN-Cache-Control"] = "no-store"
         response.headers.setdefault("X-Robots-Tag", "noindex, nofollow")
     elif request.url.path.startswith("/api/") and response.status_code < 400:
         response.headers.setdefault("Cache-Control", "public, max-age=60")
@@ -621,8 +1183,7 @@ async def security_headers(request: Request, call_next):
             if directive.strip()
         ]
         if not any(
-            directive.casefold() == "no-transform"
-            for directive in cache_directives
+            directive.casefold() == "no-transform" for directive in cache_directives
         ):
             cache_directives.append("no-transform")
         response.headers["Cache-Control"] = ", ".join(cache_directives)
@@ -655,6 +1216,46 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/api/v1/app/android/latest")
+def android_latest_app(
+    version_code: int = Query(default=0, ge=0),
+    version_name: str = Query(default="", max_length=32),
+):
+    apk = _android_latest_apk_metadata()
+    available = version_code < ANDROID_LATEST_VERSION_CODE
+    return {
+        "platform": "android",
+        "available": available,
+        "current": {
+            "version_name": version_name,
+            "version_code": version_code,
+        },
+        "latest": {
+            "version_name": ANDROID_LATEST_VERSION_NAME,
+            "version_code": ANDROID_LATEST_VERSION_CODE,
+            "release_date": ANDROID_LATEST_RELEASE_DATE,
+            "download_url": apk["url"],
+            "sha256": apk["sha256"],
+            "size_bytes": apk["size_bytes"],
+            "release_notes_public": list(ANDROID_LATEST_RELEASE_NOTES_PUBLIC),
+        },
+    }
+
+
+@app.get("/api/v1/admin/rate-limit-stats")
+def rate_limit_stats(request: Request):
+    token = request.headers.get("authorization", "")
+    if token.startswith("Bearer "):
+        token = token[7:].strip()
+    try:
+        session = account_store().validate_session(token)
+        if session.role not in {"admin", "owner"}:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    except Exception:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return _rate_limiter.stats()
+
+
 def _build_home_primary(repo: LibraryRepository) -> dict[str, Any]:
     featured = repo.list_books(
         page=1,
@@ -672,15 +1273,23 @@ def _build_home_primary(repo: LibraryRepository) -> dict[str, Any]:
         "stats": repo.stats(),
         "categories": category_manager.public_items(),
         "featured": category_manager.decorate_books(featured),
-        "recommendations": category_manager.decorate_books(repo.random_recommendations(14)),
+        "recommendations": category_manager.decorate_books(
+            repo.random_recommendations(14)
+        ),
     }
 
 
 def _build_home_secondary(repo: LibraryRepository) -> dict[str, Any]:
     return {
-        "long_novels": category_manager.decorate_books(repo.random_recommendations(7, words="over_1m")),
-        "short_novels": category_manager.decorate_books(repo.random_recommendations(30, words="under_100k")),
-        "category_books": category_manager.decorate_category_books(repo.category_books(10)),
+        "long_novels": category_manager.decorate_books(
+            repo.random_recommendations(7, words="over_1m")
+        ),
+        "short_novels": category_manager.decorate_books(
+            repo.random_recommendations(30, words="under_100k")
+        ),
+        "category_books": category_manager.decorate_category_books(
+            repo.category_books(10)
+        ),
         "rankings": {
             key: category_manager.decorate_books(items)
             for key, items in repo.rankings(10).items()
@@ -695,6 +1304,102 @@ def home_primary():
     return _home_primary_snapshot.get(
         lambda: _build_home_primary(repo),
         repo,
+    )
+
+
+@lru_cache(maxsize=32)
+def _mobile_hero_cover_bytes(
+    path_text: str,
+    modified_ns: int,
+    source_size: int,
+) -> bytes:
+    del modified_ns, source_size
+    with Image.open(path_text) as source:
+        normalized = ImageOps.exif_transpose(source).convert("RGB")
+        mobile = ImageOps.fit(
+            normalized,
+            (160, 240),
+            method=Image.Resampling.LANCZOS,
+        )
+        output = BytesIO()
+        mobile.save(
+            output,
+            format="JPEG",
+            quality=48,
+            optimize=True,
+            progressive=True,
+        )
+    return output.getvalue()
+
+
+@lru_cache(maxsize=64)
+def _media_cover_art_bytes(
+    path_text: str,
+    modified_ns: int,
+    source_size: int,
+) -> bytes:
+    del modified_ns, source_size
+    with Image.open(path_text) as source:
+        normalized = ImageOps.exif_transpose(source).convert("RGB")
+        normalized.thumbnail((512, 512), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (512, 512), (246, 247, 249))
+        left = (512 - normalized.width) // 2
+        top = (512 - normalized.height) // 2
+        canvas.paste(normalized, (left, top))
+        output = BytesIO()
+        canvas.save(
+            output,
+            format="JPEG",
+            quality=82,
+            optimize=True,
+            progressive=True,
+        )
+    return output.getvalue()
+
+
+@app.api_route(
+    "/api/v1/home/hero-cover",
+    methods=["GET", "HEAD"],
+)
+def home_hero_cover(
+    variant: str = Query("", pattern="^(|mobile)$"),
+):
+    """Serve the current lead cover from a stable, preloadable URL."""
+    featured = home_primary().get("featured", [])
+    if not featured:
+        raise HTTPException(status_code=404, detail="当前没有推荐作品")
+    lead = featured[0]
+    cover_url = str(lead.get("cover_url") or "")
+    repo = repository()
+    if cover_url.startswith("/api/v1/assets/default-cover"):
+        path = repo.shared_default_cover_path()
+    else:
+        book_id = require_public_book_id(str(lead.get("public_id") or ""))
+        path, _version = repo.cover_path_and_version(book_id)
+    if variant == "mobile":
+        stat = path.stat()
+        return Response(
+            _mobile_hero_cover_bytes(
+                str(path),
+                stat.st_mtime_ns,
+                stat.st_size,
+            ),
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": (
+                    "public, max-age=60, stale-while-revalidate=300, no-transform"
+                )
+            },
+        )
+    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={
+            "Cache-Control": (
+                "public, max-age=60, stale-while-revalidate=300, no-transform"
+            )
+        },
     )
 
 
@@ -716,7 +1421,11 @@ def home():
 
 @app.get("/api/v1/recommendations")
 def recommendations():
-    return {"items": category_manager.decorate_books(repository().random_recommendations(14))}
+    return {
+        "items": category_manager.decorate_books(
+            repository().random_recommendations(14)
+        )
+    }
 
 
 @app.get("/api/v1/categories")
@@ -797,9 +1506,25 @@ def record_book_metric(
 
 
 @app.get("/api/v1/books/{book_id}/cover")
-def cover(book_id: str, v: str = ""):
+def cover(
+    book_id: str,
+    v: str = "",
+    variant: str = Query("", pattern="^(|media-art)$"),
+):
     book_id = require_public_book_id(book_id)
     path, current_version = repository().cover_path_and_version(book_id)
+    if variant == "media-art":
+        stat = path.stat()
+        return Response(
+            _media_cover_art_bytes(str(path), stat.st_mtime_ns, stat.st_size),
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": (
+                    "public, max-age=300, stale-while-revalidate=3600, "
+                    "no-transform"
+                )
+            },
+        )
     media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     cache_control = (
         "public, max-age=31536000, immutable, no-transform"
@@ -819,9 +1544,7 @@ def default_cover():
     return FileResponse(
         path,
         media_type="image/jpeg",
-        headers={
-            "Cache-Control": "public, max-age=31536000, immutable, no-transform"
-        },
+        headers={"Cache-Control": "public, max-age=31536000, immutable, no-transform"},
     )
 
 
@@ -851,9 +1574,30 @@ def chapter_catalog(book_id: str):
 
 
 @app.get("/api/v1/books/{book_id}/chapters/{chapter_id}")
-def chapter(book_id: str, chapter_id: int):
+def chapter(request: Request, book_id: str, chapter_id: int):
     book_id = require_public_book_id(book_id)
-    return repository().reader_chapter(book_id, chapter_id)
+    payload = dict(repository().reader_chapter(book_id, chapter_id))
+    probe = _rate_limiter.reader_probe_path(request, book_id, chapter_id)
+    if probe:
+        payload["_reader_probe"] = probe
+    return payload
+
+
+@app.get(
+    "/api/v1/reader-probe/{book_id}/{chapter_id}/{token}",
+    include_in_schema=False,
+)
+def reader_probe(
+    request: Request,
+    book_id: str,
+    chapter_id: int,
+    token: str,
+):
+    book_id = require_public_book_id(book_id)
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise HTTPException(status_code=404, detail="Not Found")
+    _rate_limiter.record_reader_probe(request, book_id, chapter_id, token)
+    raise HTTPException(status_code=404, detail="Not Found")
 
 
 @app.get("/api/v1/books/{book_id}/illustrations/{subpath:path}")
@@ -876,14 +1620,41 @@ def rankings():
     }
 
 
+def _deconstruction_viewer(request: Request) -> str | None:
+    authorization = request.headers.get("authorization", "")
+    raw = (
+        authorization[7:].strip()
+        if authorization.startswith("Bearer ")
+        else request.cookies.get(settings.session_cookie, "")
+    )
+    session = account_store().session(raw) if raw else None
+    return session.user_id if session else None
+
+
+def _enrich_deconstruction_engagement(
+    items: list[dict[str, Any]], request: Request
+) -> list[dict[str, Any]]:
+    engagement = account_store().deconstruction_engagement(
+        [str(item.get("slug") or "") for item in items],
+        viewer_user_id=_deconstruction_viewer(request),
+    )
+    return [item | engagement.get(str(item.get("slug") or ""), {}) for item in items]
+
+
 @app.get("/api/v1/deconstructions")
-def deconstructions():
-    return {"items": repository().list_deconstructions()}
+def deconstructions(request: Request):
+    return {
+        "items": _enrich_deconstruction_engagement(
+            repository().list_deconstructions(), request
+        )
+    }
 
 
 @app.get("/api/v1/deconstructions/{slug}")
-def deconstruction(slug: str):
-    return repository().get_deconstruction(slug)
+def deconstruction(slug: str, request: Request):
+    return _enrich_deconstruction_engagement(
+        [repository().get_deconstruction(slug)], request
+    )[0]
 
 
 @app.get("/api/v1/deconstructions/{slug}/file/{subpath:path}")
@@ -891,54 +1662,375 @@ def deconstruction_file(slug: str, subpath: str):
     return repository().get_deconstruction_file(slug, subpath)
 
 
-TTS_VOICES = {
-    "nuanxi": {"id": "zh-CN-XiaoxiaoNeural", "label": "暖溪", "gender": "female", "desc": "温婉知性"},
-    "lingxian": {"id": "zh-CN-XiaoyiNeural", "label": "灵弦", "gender": "female", "desc": "灵动俏皮"},
-    "shuanger": {"id": "zh-CN-liaoning-XiaobeiNeural", "label": "霜儿", "gender": "female", "desc": "爽朗飒然"},
-    "yanzhi": {"id": "zh-CN-shaanxi-XiaoniNeural", "label": "燕知", "gender": "female", "desc": "清亮质朴"},
-    "wanqing": {"id": "zh-HK-HiuGaaiNeural", "label": "晚晴", "gender": "female", "desc": "柔婉细腻"},
-    "muyao": {"id": "zh-HK-HiuMaanNeural", "label": "沐瑶", "gender": "female", "desc": "端庄优雅"},
-    "qianyu": {"id": "zh-TW-HsiaoChenNeural", "label": "浅语", "gender": "female", "desc": "温润恬静"},
-    "ruoxi": {"id": "zh-TW-HsiaoYuNeural", "label": "若汐", "gender": "female", "desc": "甜美亲和"},
-    "kuangyun": {"id": "zh-CN-YunjianNeural", "label": "旷云", "gender": "male", "desc": "热血豪迈"},
-    "qingyan": {"id": "zh-CN-YunxiNeural", "label": "清砚", "gender": "male", "desc": "少年朗逸"},
-    "tongzhen": {"id": "zh-CN-YunxiaNeural", "label": "童真", "gender": "male", "desc": "稚气天真"},
-    "mocheng": {"id": "zh-CN-YunyangNeural", "label": "墨澄", "gender": "male", "desc": "沉稳儒雅"},
-    "yueming": {"id": "zh-HK-WanLungNeural", "label": "岳鸣", "gender": "male", "desc": "浑厚磁性"},
-    "hanfeng": {"id": "zh-TW-YunJheNeural", "label": "寒枫", "gender": "male", "desc": "清冷内敛"},
+TTS_EMOTIONS = {
+    "neutral": {
+        "label": "平稳",
+        "desc": "自然克制的标准叙述",
+        "rate": 0,
+        "pitch": 0,
+        "volume": 0,
+    },
+    "gentle": {
+        "label": "温柔",
+        "desc": "柔和亲近、低压舒缓",
+        "rate": -8,
+        "pitch": 1,
+        "volume": -4,
+    },
+    "joyful": {
+        "label": "喜悦",
+        "desc": "明快轻盈、笑意充沛",
+        "rate": 9,
+        "pitch": 4,
+        "volume": 3,
+    },
+    "excited": {
+        "label": "激昂",
+        "desc": "高能振奋、节奏强烈",
+        "rate": 18,
+        "pitch": 6,
+        "volume": 8,
+    },
+    "angry": {
+        "label": "愤怒",
+        "desc": "强硬紧迫、压迫感突出",
+        "rate": 12,
+        "pitch": -3,
+        "volume": 10,
+    },
+    "sad": {
+        "label": "悲伤",
+        "desc": "低沉迟缓、情绪下坠",
+        "rate": -18,
+        "pitch": -5,
+        "volume": -8,
+    },
+    "fearful": {
+        "label": "惊惧",
+        "desc": "呼吸急促、音线绷紧",
+        "rate": 13,
+        "pitch": 7,
+        "volume": -2,
+    },
+    "tense": {
+        "label": "紧张",
+        "desc": "节奏收紧、悬念增强",
+        "rate": 8,
+        "pitch": 3,
+        "volume": 2,
+    },
+    "mysterious": {
+        "label": "神秘",
+        "desc": "低声慢述、幽微莫测",
+        "rate": -14,
+        "pitch": -7,
+        "volume": -10,
+    },
+    "solemn": {
+        "label": "庄重",
+        "desc": "沉稳肃穆、字句清晰",
+        "rate": -12,
+        "pitch": -5,
+        "volume": 1,
+    },
+    "affectionate": {
+        "label": "深情",
+        "desc": "细腻温暖、情感绵长",
+        "rate": -10,
+        "pitch": 2,
+        "volume": -3,
+    },
+    "humorous": {
+        "label": "诙谐",
+        "desc": "灵动俏皮、节拍跳跃",
+        "rate": 10,
+        "pitch": 6,
+        "volume": 1,
+    },
+    "weary": {
+        "label": "疲惫",
+        "desc": "缓慢虚弱、气息低落",
+        "rate": -22,
+        "pitch": -6,
+        "volume": -12,
+    },
+    "surprised": {
+        "label": "惊讶",
+        "desc": "语调上扬、反应鲜明",
+        "rate": 10,
+        "pitch": 8,
+        "volume": 3,
+    },
+    "comforting": {
+        "label": "安抚",
+        "desc": "柔和放慢、给予安全感",
+        "rate": -12,
+        "pitch": 1,
+        "volume": -5,
+    },
+    "confident": {
+        "label": "笃定",
+        "desc": "节奏稳健、语气有力",
+        "rate": 2,
+        "pitch": -2,
+        "volume": 5,
+    },
+    "shy": {
+        "label": "羞怯",
+        "desc": "轻柔迟疑、情绪内收",
+        "rate": -9,
+        "pitch": 4,
+        "volume": -7,
+    },
+    "disgusted": {
+        "label": "厌恶",
+        "desc": "冷硬克制、排斥感突出",
+        "rate": -3,
+        "pitch": -5,
+        "volume": 1,
+    },
+    "whispering": {
+        "label": "低语",
+        "desc": "压低声线、贴近耳语",
+        "rate": -16,
+        "pitch": -4,
+        "volume": -18,
+    },
 }
 
-TTS_EMOTIONS = {
-    "neutral": {"label": "平稳", "desc": "自然克制的标准叙述", "rate": 0, "pitch": 0, "volume": 0},
-    "gentle": {"label": "温柔", "desc": "柔和亲近、低压舒缓", "rate": -8, "pitch": 1, "volume": -4},
-    "joyful": {"label": "喜悦", "desc": "明快轻盈、笑意充沛", "rate": 9, "pitch": 4, "volume": 3},
-    "excited": {"label": "激昂", "desc": "高能振奋、节奏强烈", "rate": 18, "pitch": 6, "volume": 8},
-    "angry": {"label": "愤怒", "desc": "强硬紧迫、压迫感突出", "rate": 12, "pitch": -3, "volume": 10},
-    "sad": {"label": "悲伤", "desc": "低沉迟缓、情绪下坠", "rate": -18, "pitch": -5, "volume": -8},
-    "fearful": {"label": "惊惧", "desc": "呼吸急促、音线绷紧", "rate": 13, "pitch": 7, "volume": -2},
-    "tense": {"label": "紧张", "desc": "节奏收紧、悬念增强", "rate": 8, "pitch": 3, "volume": 2},
-    "mysterious": {"label": "神秘", "desc": "低声慢述、幽微莫测", "rate": -14, "pitch": -7, "volume": -10},
-    "solemn": {"label": "庄重", "desc": "沉稳肃穆、字句清晰", "rate": -12, "pitch": -5, "volume": 1},
-    "affectionate": {"label": "深情", "desc": "细腻温暖、情感绵长", "rate": -10, "pitch": 2, "volume": -3},
-    "humorous": {"label": "诙谐", "desc": "灵动俏皮、节拍跳跃", "rate": 10, "pitch": 6, "volume": 1},
-    "weary": {"label": "疲惫", "desc": "缓慢虚弱、气息低落", "rate": -22, "pitch": -6, "volume": -12},
+EDGE_MULTILINGUAL_CHINESE_VOICES = frozenset({"ava", "emma", "andrew", "brian"})
+EDGE_MULTILINGUAL_VOICE_BASE_PROSODY = {
+    "ava": {"rate": -1, "pitch": -1, "volume": -1},
+    "emma": {"rate": -2, "pitch": -2, "volume": -1},
+    "andrew": {"rate": -4, "pitch": -3, "volume": 1},
+    "brian": {"rate": -5, "pitch": -4, "volume": 2},
 }
+EDGE_MULTILINGUAL_CHINESE_EMOTIONS = {
+    "neutral": {"rate": 0, "pitch": 0, "volume": 0},
+    "gentle": {"rate": -7, "pitch": -1, "volume": -4},
+    "joyful": {"rate": 7, "pitch": 2, "volume": 1},
+    "excited": {"rate": 12, "pitch": 3, "volume": 5},
+    "angry": {"rate": 8, "pitch": -4, "volume": 7},
+    "sad": {"rate": -13, "pitch": -4, "volume": -7},
+    "fearful": {"rate": 9, "pitch": 4, "volume": -2},
+    "tense": {"rate": 6, "pitch": 1, "volume": 2},
+    "mysterious": {"rate": -11, "pitch": -5, "volume": -8},
+    "solemn": {"rate": -10, "pitch": -5, "volume": 1},
+    "affectionate": {"rate": -8, "pitch": 0, "volume": -4},
+    "humorous": {"rate": 7, "pitch": 3, "volume": 0},
+    "weary": {"rate": -16, "pitch": -5, "volume": -11},
+    "surprised": {"rate": 8, "pitch": 4, "volume": 2},
+    "comforting": {"rate": -9, "pitch": -1, "volume": -5},
+    "confident": {"rate": 1, "pitch": -3, "volume": 4},
+    "shy": {"rate": -8, "pitch": 2, "volume": -7},
+    "disgusted": {"rate": -3, "pitch": -5, "volume": 1},
+    "whispering": {"rate": -13, "pitch": -5, "volume": -16},
+}
+EDGE_MULTILINGUAL_VOICE_EMOTION_PROSODY = {
+    "ava": {
+        "joyful": {"rate": 1, "pitch": 1, "volume": 0},
+        "humorous": {"rate": 1, "pitch": 1, "volume": 0},
+        "surprised": {"rate": 0, "pitch": 1, "volume": 0},
+    },
+    "emma": {
+        "gentle": {"rate": -1, "pitch": 0, "volume": -1},
+        "affectionate": {"rate": -1, "pitch": 0, "volume": -1},
+        "comforting": {"rate": -1, "pitch": 0, "volume": -1},
+    },
+    "andrew": {
+        "angry": {"rate": 0, "pitch": -1, "volume": 1},
+        "confident": {"rate": 0, "pitch": 0, "volume": 1},
+        "solemn": {"rate": -1, "pitch": -1, "volume": 1},
+    },
+    "brian": {
+        "sad": {"rate": -1, "pitch": 0, "volume": 0},
+        "mysterious": {"rate": -1, "pitch": -1, "volume": -1},
+        "whispering": {"rate": -1, "pitch": -1, "volume": -1},
+    },
+}
+PROSODY_FIELDS = ("rate", "pitch", "volume")
+
+
+def _edge_multilingual_chinese_profile(voice: str, emotion: str) -> dict[str, int]:
+    base = EDGE_MULTILINGUAL_VOICE_BASE_PROSODY.get(
+        voice, {"rate": 0, "pitch": 0, "volume": 0}
+    )
+    tuned = EDGE_MULTILINGUAL_CHINESE_EMOTIONS.get(
+        emotion, TTS_EMOTIONS[emotion]
+    )
+    override = EDGE_MULTILINGUAL_VOICE_EMOTION_PROSODY.get(voice, {}).get(
+        emotion, {}
+    )
+    return {
+        field: int(base.get(field, 0))
+        + int(tuned.get(field, 0))
+        + int(override.get(field, 0))
+        for field in PROSODY_FIELDS
+    }
+
+
+LOCAL_TTS_DEFAULT_ROOT = Path(
+    "/srv/oohstory/library/oohstory/tts-models/"
+    "vits-icefall-zh-aishell3"
+)
+_local_tts_engine: Any | None = None
+_local_tts_engine_lock = threading.Lock()
+_local_tts_synth_lock = threading.Lock()
+
+
+def _get_local_tts_engine() -> Any:
+    """Lazily load the bounded, offline Mandarin multi-speaker engine."""
+    global _local_tts_engine
+    if _local_tts_engine is not None:
+        return _local_tts_engine
+    with _local_tts_engine_lock:
+        if _local_tts_engine is not None:
+            return _local_tts_engine
+        try:
+            import sherpa_onnx
+        except ImportError as exc:  # pragma: no cover - deployment guard
+            raise RuntimeError("本地普通话声线运行库未安装") from exc
+        root = Path(
+            os.getenv("OOHSTORY_LOCAL_TTS_MODEL_ROOT", str(LOCAL_TTS_DEFAULT_ROOT))
+        ).resolve()
+        required = {
+            "model": root / "model.onnx",
+            "lexicon": root / "lexicon.txt",
+            "tokens": root / "tokens.txt",
+            "phone": root / "phone.fst",
+            "date": root / "date.fst",
+            "number": root / "number.fst",
+        }
+        missing = [str(path) for path in required.values() if not path.is_file()]
+        if missing:
+            raise RuntimeError("本地普通话声线模型不完整")
+        vits = sherpa_onnx.OfflineTtsVitsModelConfig(
+            model=str(required["model"]),
+            lexicon=str(required["lexicon"]),
+            tokens=str(required["tokens"]),
+        )
+        model = sherpa_onnx.OfflineTtsModelConfig(
+            vits=vits,
+            num_threads=min(4, max(1, os.cpu_count() or 1)),
+            debug=False,
+            provider="cpu",
+        )
+        config = sherpa_onnx.OfflineTtsConfig(
+            model=model,
+            rule_fsts=",".join(
+                str(required[key]) for key in ("phone", "date", "number")
+            ),
+            max_num_sentences=1,
+            silence_scale=0.2,
+        )
+        if not config.validate():
+            raise RuntimeError("本地普通话声线模型配置无效")
+        engine = sherpa_onnx.OfflineTts(config)
+        if int(engine.num_speakers) <= 33:
+            raise RuntimeError("本地普通话声线缺少所需说话人")
+        _local_tts_engine = engine
+        return _local_tts_engine
+
+
+def _local_tts_wav_bytes(samples: Any, sample_rate: int) -> bytes:
+    import numpy as np
+
+    pcm = (np.clip(np.asarray(samples), -1.0, 1.0) * 32767).astype("<i2")
+    output = BytesIO()
+    with wave.open(output, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(int(sample_rate))
+        handle.writeframes(pcm.tobytes())
+    return output.getvalue()
+
+
+def _synthesize_local_tts_bytes(
+    text: str,
+    *,
+    speaker_id: int,
+    speed: float,
+    pitch_hz: int,
+    volume_percent: int,
+) -> bytes:
+    """Generate one local Mandarin segment and encode it as browser-safe MP3."""
+    with _local_tts_synth_lock:
+        audio = _get_local_tts_engine().generate(
+            text,
+            sid=int(speaker_id),
+            speed=max(0.5, min(2.0, float(speed))),
+        )
+    wav_bytes = _local_tts_wav_bytes(audio.samples, int(audio.sample_rate))
+    pitch_factor = 2 ** (max(-30, min(30, int(pitch_hz))) / 120.0)
+    volume_factor = max(0.2, min(2.0, 1.0 + int(volume_percent) / 100.0))
+    command = [
+        "/usr/bin/ffmpeg",
+        "-v", "error",
+        "-f", "wav",
+        "-i", "pipe:0",
+        "-af", f"rubberband=pitch={pitch_factor:.6f},volume={volume_factor:.4f}",
+        "-ac", "1",
+        "-ar", "16000",
+        "-codec:a", "libmp3lame",
+        "-b:a", "48k",
+        "-f", "mp3",
+        "pipe:1",
+    ]
+    process = subprocess.run(
+        command,
+        input=wav_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=30,
+    )
+    if process.returncode != 0 or not process.stdout:
+        raise RuntimeError("本地普通话声线编码失败")
+    return bytes(process.stdout)
+
+# Existing immutable v7.3 manifests may contain punctuation-only segments such
+# as an em-dash. Edge TTS returns NoAudioReceived for these, so preserve the
+# old timing with a tiny valid MP3 pause while v7.4 omits them from new plans.
+TTS_PUNCTUATION_PAUSE_MP3 = b64decode(
+    "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjYwLjE2LjEwMAAAAAAAAAAAAAAA//NExAAAAANI"
+    "AAAAAExBTUUzLjEwMFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMu//NExFMAAANIAAAAADEwMFVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVV//NExKYAAANIAAAAAFVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVV//NExKwAAANIAAAAAFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+)
 
 
 @app.get("/api/v1/tts/voices")
 def tts_voices():
     emotion_keys = list(TTS_EMOTIONS)
     return {
+        "policy_version": AUDIOBOOK_POLICY_VERSION,
+        "mode_languages": MODE_LANGUAGE,
+        "mode_defaults": {
+            "normal": "nuanxi", "smart": "nuanxi",
+            "cantonese": "wanqing", "hokkien": "qianyu",
+        },
         "voices": [
             {
                 "key": k,
                 "label": v["label"],
                 "gender": v["gender"],
                 "desc": v["desc"],
+                "language": voice_language(k),
+                "roles": ["narrator", "character"],
+                "emotion_tuning": (
+                    "edge-multilingual-chinese"
+                    if k in EDGE_MULTILINGUAL_CHINESE_VOICES
+                    else "standard"
+                ),
                 "emotion_count": len(emotion_keys),
                 "emotions": emotion_keys,
             }
             for k, v in TTS_VOICES.items()
+            if not bool(v.get("hidden"))
         ],
         "emotions": [
             {"key": key, "label": item["label"], "desc": item["desc"]}
@@ -947,82 +2039,1114 @@ def tts_voices():
     }
 
 
-import edge_tts
+@app.get("/api/v1/audiobook/capacity")
+def audiobook_prefetch_capacity():
+    """Expose only the bounded signal clients need for optional prefetch."""
+    return JSONResponse(
+        tts_concurrency_limiter().capacity(),
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
-@app.get("/api/v1/tts/speak")
-async def tts_speak(
-    text: str = Query(..., max_length=2000),
-    voice: str = Query("nuanxi"),
-    rate: str = Query("+0%"),
-    pitch: str = Query("+0Hz"),
-    volume: str = Query("+0%"),
-    emotion: str = Query("neutral"),
-    style: str = Query(""),
-):
-    import re as _re
+def _audiobook_owner(request: Request, client_id: str = "") -> str:
+    raw = request.headers.get("authorization", "")
+    if raw.startswith("Bearer "):
+        raw = raw[7:].strip()
+    else:
+        raw = request.cookies.get(settings.session_cookie, "")
+    session = account_store().session(raw) if raw else None
+    if session is not None:
+        # A user ID is stable across browsers and login sessions, enabling
+        # true cross-device audiobook progress without sharing playback state.
+        identity = f"user:{session.user_id}"
+    else:
+        identity = (
+            client_id
+            or request.headers.get("x-audiobook-client", "")
+            or request.cookies.get(AUDIOBOOK_CLIENT_COOKIE, "")
+        )
+        if not AUDIOBOOK_CLIENT_ID_RE.fullmatch(identity):
+            if raw:
+                raise HTTPException(401, "登录状态已失效")
+            raise HTTPException(401, "缺少有效的听书客户端标识")
+    if not identity:
+        raise HTTPException(401, "缺少听书客户端标识")
+    return sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _audiobook_device(request: Request, client_id: str = "") -> str:
+    identity = (
+        client_id
+        or request.headers.get("x-audiobook-client", "")
+        or request.cookies.get(AUDIOBOOK_CLIENT_COOKIE, "")
+    )
+    if not AUDIOBOOK_CLIENT_ID_RE.fullmatch(identity):
+        raise HTTPException(401, "缺少有效的听书设备标识")
+    return sha256(f"device:{identity}".encode("utf-8")).hexdigest()
+
+
+def _audiobook_session_owner(request: Request, session_id: str) -> str:
+    owner = _audiobook_owner(request)
+    try:
+        device = _audiobook_device(request)
+    except HTTPException:
+        device = ""
+    resolver = getattr(audiobook_service(), "session_owner", None)
+    if not callable(resolver):
+        return owner
+    resolved = resolver(session_id, owner_key=owner, device_key=device)
+    if not resolved:
+        raise HTTPException(404, "听书会话不存在或已失效")
+    return resolved
+
+
+def _cancel_audiobook_logout(user_id: int, request: Request) -> int:
+    """Cancel this browser's playback without disturbing another device."""
+    owner = sha256(f"user:{int(user_id)}".encode("utf-8")).hexdigest()
+    client_id = request.headers.get("x-audiobook-client", "")
+    if re.fullmatch(r"[A-Za-z0-9_-]{16,96}", client_id):
+        device = sha256(f"device:{client_id}".encode("utf-8")).hexdigest()
+        return audiobook_service().cancel_device(owner, device)
+    # Old clients do not provide a device ID.  Account-wide cancellation is
+    # the secure fallback on logout; current clients remain device-scoped.
+    return audiobook_service().cancel_owner(owner)
+
+
+def _request_ip(request: Request) -> str:
+    return str(request.client.host if request.client else "unknown")[:100]
+
+
+def _audiobook_quota(
+    owner: str,
+    ip: str,
+    bucket: str,
+    *,
+    owner_limit: int,
+    ip_limit: int,
+    window: int,
+    cost: int = 1,
+) -> None:
+    try:
+        store = account_store()
+        store.enforce_rate_limit(
+            f"audiobook:{bucket}:owner:{owner}",
+            limit=owner_limit,
+            window=window,
+            cost=cost,
+        )
+        store.enforce_rate_limit(
+            f"audiobook:{bucket}:ip:{ip}",
+            limit=ip_limit,
+            window=window,
+            cost=cost,
+        )
+    except AccountError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+
+
+class TtsConcurrencyLimiter:
+    lease_minutes = 5
+    renew_interval_seconds = 60.0
+    def __init__(
+        self, owner_limit: int = 3, ip_limit: int = 6, site_limit: int = 8
+    ) -> None:
+        self.owner_limit = owner_limit
+        self.ip_limit = ip_limit
+        self.site_limit = site_limit
+        self._owner_counts: dict[str, int] = {}
+        self._ip_counts: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def _distributed_acquire(self, owner: str, ip: str) -> str | None:
+        mysql = getattr(
+            getattr(audiobook_service(), "repository", None), "_mysql", None
+        )
+        if mysql is None:
+            return None
+        token = secrets.token_hex(16)
+        ip_hash = sha256(ip.encode("utf-8")).hexdigest()
+        with mysql.pool.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT guard_id FROM audiobook_tts_concurrency_guard "
+                    "WHERE guard_id=1 FOR UPDATE"
+                )
+                if not cursor.fetchone():
+                    raise RuntimeError("audiobook TTS concurrency guard missing")
+                cursor.execute(
+                    "DELETE FROM audiobook_tts_leases "
+                    "WHERE expires_at<=UTC_TIMESTAMP(6)"
+                )
+                cursor.execute(
+                    "SELECT COUNT(*) AS amount FROM audiobook_tts_leases "
+                    "WHERE expires_at>UTC_TIMESTAMP(6)"
+                )
+                if int((cursor.fetchone() or {}).get("amount") or 0) >= self.site_limit:
+                    raise HTTPException(429, "听书生成服务繁忙，请稍后再试")
+                cursor.execute(
+                    "SELECT COUNT(*) AS amount FROM audiobook_tts_leases "
+                    "WHERE owner_hash=UNHEX(%s) AND expires_at>UTC_TIMESTAMP(6)",
+                    (owner,),
+                )
+                if int((cursor.fetchone() or {}).get("amount") or 0) >= self.owner_limit:
+                    raise HTTPException(429, "听书生成并发过高，请稍后再试")
+                cursor.execute(
+                    "SELECT COUNT(*) AS amount FROM audiobook_tts_leases "
+                    "WHERE ip_hash=UNHEX(%s) AND expires_at>UTC_TIMESTAMP(6)",
+                    (ip_hash,),
+                )
+                if int((cursor.fetchone() or {}).get("amount") or 0) >= self.ip_limit:
+                    raise HTTPException(429, "当前网络的听书生成并发过高")
+                cursor.execute(
+                    "INSERT INTO audiobook_tts_leases "
+                    "(lease_token,owner_hash,ip_hash,expires_at) "
+                    "VALUES (%s,UNHEX(%s),UNHEX(%s),"
+                    "DATE_ADD(UTC_TIMESTAMP(6),INTERVAL %s MINUTE))",
+                    (token, owner, ip_hash, self.lease_minutes),
+                )
+        return token
+
+    def _distributed_renew(self, token: str) -> bool:
+        mysql = getattr(
+            getattr(audiobook_service(), "repository", None), "_mysql", None
+        )
+        if mysql is None:
+            return False
+        with mysql.pool.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE audiobook_tts_leases SET "
+                    "expires_at=DATE_ADD(UTC_TIMESTAMP(6),INTERVAL %s MINUTE) "
+                    "WHERE lease_token=%s AND expires_at>UTC_TIMESTAMP(6)",
+                    (self.lease_minutes, token),
+                )
+                return cursor.rowcount == 1
+
+    async def _renew_lease(
+        self,
+        token: str,
+        stopped: asyncio.Event,
+        lease_lost: asyncio.Event,
+        owner_task: asyncio.Task[Any],
+    ) -> None:
+        while True:
+            try:
+                await asyncio.wait_for(
+                    stopped.wait(), timeout=self.renew_interval_seconds
+                )
+                return
+            except TimeoutError:
+                try:
+                    renewed = await asyncio.to_thread(
+                        self._distributed_renew, token
+                    )
+                except Exception:
+                    renewed = False
+                if not renewed:
+                    # Capacity protection is meaningful only while the active
+                    # synthesis owns a live lease.  Stop the request task as
+                    # soon as renewal is lost so a replacement lease cannot
+                    # push actual work beyond the global limit.
+                    lease_lost.set()
+                    owner_task.cancel()
+                    return
+
+    def _distributed_release(self, token: str) -> None:
+        mysql = getattr(
+            getattr(audiobook_service(), "repository", None), "_mysql", None
+        )
+        if mysql is None:
+            return
+        with mysql.pool.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM audiobook_tts_leases WHERE lease_token=%s",
+                    (token,),
+                )
+
+    def capacity(self) -> dict[str, Any]:
+        mysql = getattr(
+            getattr(audiobook_service(), "repository", None), "_mysql", None
+        )
+        active = 0
+        if mysql is not None:
+            with mysql.pool.connection() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT COUNT(*) AS amount FROM audiobook_tts_leases "
+                        "WHERE expires_at>UTC_TIMESTAMP(6)"
+                    )
+                    active = int((cursor.fetchone() or {}).get("amount") or 0)
+        cpu_count = max(1, int(os.cpu_count() or 1))
+        try:
+            normalized_load = max(0.0, float(os.getloadavg()[0]) / cpu_count)
+        except (AttributeError, OSError):
+            normalized_load = 0.0
+        allow = active < max(1, self.site_limit // 2) and normalized_load < 0.8
+        return {
+            "allow_prefetch": allow,
+            "active_tts": active,
+            "site_limit": self.site_limit,
+            "load_ratio": round(normalized_load, 3),
+        }
+
+    @asynccontextmanager
+    async def slot(self, owner: str, ip: str):
+        distributed = await asyncio.to_thread(self._distributed_acquire, owner, ip)
+        if distributed is not None:
+            stopped = asyncio.Event()
+            lease_lost = asyncio.Event()
+            owner_task = asyncio.current_task()
+            if owner_task is None:
+                raise RuntimeError("TTS request task is unavailable")
+            heartbeat = asyncio.create_task(
+                self._renew_lease(
+                    distributed, stopped, lease_lost, owner_task
+                )
+            )
+            try:
+                yield
+            except asyncio.CancelledError:
+                if lease_lost.is_set():
+                    raise RuntimeError(
+                        "audiobook TTS concurrency lease was lost"
+                    ) from None
+                raise
+            finally:
+                stopped.set()
+                heartbeat.cancel()
+                try:
+                    with suppress(asyncio.CancelledError):
+                        await heartbeat
+                finally:
+                    # StreamingResponse cancellation can cancel this task while
+                    # its generator is unwinding.  Shield the database release
+                    # so an abandoned client never leaves a five-minute ghost
+                    # lease occupying global TTS capacity.
+                    release = asyncio.create_task(
+                        asyncio.to_thread(self._distributed_release, distributed)
+                    )
+                    try:
+                        await asyncio.shield(release)
+                    except asyncio.CancelledError:
+                        with suppress(asyncio.CancelledError):
+                            await release
+            return
+        with self._lock:
+            if self._owner_counts.get(owner, 0) >= self.owner_limit:
+                raise HTTPException(429, "听书生成并发过高，请稍后再试")
+            if self._ip_counts.get(ip, 0) >= self.ip_limit:
+                raise HTTPException(429, "当前网络的听书生成并发过高")
+            self._owner_counts[owner] = self._owner_counts.get(owner, 0) + 1
+            self._ip_counts[ip] = self._ip_counts.get(ip, 0) + 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._owner_counts[owner] -= 1
+                self._ip_counts[ip] -= 1
+                if self._owner_counts[owner] == 0:
+                    self._owner_counts.pop(owner)
+                if self._ip_counts[ip] == 0:
+                    self._ip_counts.pop(ip)
+
+
+@lru_cache(maxsize=1)
+def tts_concurrency_limiter() -> TtsConcurrencyLimiter:
+    return TtsConcurrencyLimiter()
+
+
+async def _synthesize_tts_bytes(
+    text: str,
+    voice: str,
+    rate: str,
+    pitch: str,
+    volume: str,
+    emotion: str,
+) -> tuple[bytes, str]:
     voice_entry = TTS_VOICES.get(voice)
     if not voice_entry:
         raise HTTPException(400, "不支持的语音")
     clean = text.strip()
     if not clean:
         raise HTTPException(400, "文本不能为空")
-    if not _re.fullmatch(r"[+-]\d{1,3}%", rate):
+    if not re.fullmatch(r"[+-]\d{1,3}%", rate):
         raise HTTPException(400, "语速格式无效")
-    if pitch and not _re.fullmatch(r"[+-]\d{1,3}Hz", pitch):
+    if pitch and not re.fullmatch(r"[+-]\d{1,3}Hz", pitch):
         raise HTTPException(400, "音调格式无效")
-    if volume and not _re.fullmatch(r"[+-]\d{1,3}%", volume):
+    if volume and not re.fullmatch(r"[+-]\d{1,3}%", volume):
         raise HTTPException(400, "音量格式无效")
-
-    selected_emotion = emotion.strip().lower()
-    if selected_emotion == "neutral" and style.strip().lower() in TTS_EMOTIONS:
-        selected_emotion = style.strip().lower()
-    profile = TTS_EMOTIONS.get(selected_emotion)
-    if not profile:
+    if emotion not in TTS_EMOTIONS:
         raise HTTPException(400, "不支持的情感模式")
+    profile = (
+        _edge_multilingual_chinese_profile(voice, emotion)
+        if voice in EDGE_MULTILINGUAL_CHINESE_VOICES
+        else TTS_EMOTIONS[emotion]
+    )
 
     def adjusted(value: str, suffix: str, offset: int, lower: int, upper: int) -> str:
         base = int(value.removesuffix(suffix))
-        result = max(lower, min(upper, base + offset))
-        return f"{result:+d}{suffix}"
+        return f"{max(lower, min(upper, base + offset)):+d}{suffix}"
 
-    final_rate = adjusted(rate, "%", profile["rate"], -90, 200)
-    final_pitch = adjusted(pitch, "Hz", profile["pitch"], -50, 50)
-    final_volume = adjusted(volume, "%", profile["volume"], -50, 50)
+    adjusted_rate = adjusted(rate, "%", profile["rate"], -90, 200)
+    adjusted_pitch = adjusted(pitch, "Hz", profile["pitch"], -50, 50)
+    adjusted_volume = adjusted(volume, "%", profile["volume"], -50, 50)
+    if voice_entry.get("provider") == LOCAL_TTS_PROVIDER:
+        try:
+            audio = await asyncio.to_thread(
+                _synthesize_local_tts_bytes,
+                clean,
+                speaker_id=int(voice_entry["speaker_id"]),
+                speed=max(0.5, (100 + int(adjusted_rate.removesuffix("%"))) / 100),
+                pitch_hz=int(adjusted_pitch.removesuffix("Hz")),
+                volume_percent=int(adjusted_volume.removesuffix("%")),
+            )
+        except Exception as exc:
+            raise HTTPException(500, "本地普通话语音合成失败") from exc
+        return audio, emotion
 
-    voice_id = voice_entry["id"]
+    last_error: Exception | None = None
+    for attempt in range(4):
+        try:
+            communicate = edge_tts.Communicate(
+                clean,
+                voice_entry["id"],
+                rate=adjusted_rate,
+                pitch=adjusted_pitch,
+                volume=adjusted_volume,
+            )
+            chunks = []
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    chunks.append(chunk["data"])
+            audio = b"".join(chunks)
+            if audio:
+                return audio, emotion
+            last_error = RuntimeError("empty TTS audio")
+        except HTTPException:
+            raise
+        except RECOVERABLE_INTEGRATION_ERRORS as exc:
+            last_error = exc
+        if attempt < 3:
+            await asyncio.sleep(0.25 * (2**attempt))
+    raise HTTPException(500, "语音合成失败") from last_error
 
-    try:
-        comm = edge_tts.Communicate(
-            clean,
-            voice_id,
-            rate=final_rate,
-            pitch=final_pitch,
-            volume=final_volume,
+
+async def _audiobook_segment_bytes(segment: dict[str, Any]) -> bytes:
+    if not has_spoken_content(str(segment.get("text") or "")):
+        return TTS_PUNCTUATION_PAUSE_MP3
+    rate_number = max(0.5, min(float(segment.get("rate") or 1), 3.0))
+    rate_percent = round((rate_number - 1) * 100)
+
+    async def build() -> bytes:
+        result, _ = await _synthesize_tts_bytes(
+            str(segment["text"]),
+            str(segment["voice"]),
+            f"{rate_percent:+d}%",
+            "+0Hz",
+            "+0%",
+            str(segment["emotion"]),
         )
-        audio_data = b""
-        async for chunk in comm.stream():
-            if chunk["type"] == "audio":
-                audio_data += chunk["data"]
-    except Exception:
-        raise HTTPException(500, "语音合成失败")
+        return result
 
-    if not audio_data:
-        raise HTTPException(500, "语音合成结果为空")
+    return await build()
 
-    return StreamingResponse(
-        iter([audio_data]),
+
+def _record_audiobook_segment_duration(
+    segment: dict[str, Any], audio: bytes, duration_ms: int | None = None
+) -> None:
+    key = str(segment.get("sha256") or "")
+    if not AUDIOBOOK_MANIFEST_HASH_PATTERN.fullmatch(key):
+        return
+    measured_ms = int(duration_ms if duration_ms is not None else mp3_duration_ms(audio))
+    if measured_ms <= 0:
+        return
+    repository_owner = getattr(audiobook_service(), "repository", None)
+    mysql = getattr(repository_owner, "_mysql", None)
+    if mysql is None:
+        return
+    with mysql.pool.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO audiobook_audio_jobs "
+                "(segment_hash,status,ref_count,audio_hash,byte_count,duration_ms,expires_at) "
+                "VALUES (UNHEX(%s),'complete',0,%s,%s,%s,"
+                "DATE_ADD(UTC_TIMESTAMP(6),INTERVAL 6 HOUR)) "
+                "ON DUPLICATE KEY UPDATE status='complete',"
+                "audio_hash=VALUES(audio_hash),byte_count=VALUES(byte_count),"
+                "duration_ms=VALUES(duration_ms),expires_at=VALUES(expires_at)",
+                (key, sha256(audio).digest(), len(audio), measured_ms),
+            )
+
+
+async def _audiobook_segment_while_active(
+    segment: dict[str, Any],
+    request: Request,
+    session_id: str,
+    manifest_hash: str,
+    owner: str,
+) -> bytes | None:
+    """Cancel an unshared in-flight synthesis when its playback session dies."""
+    task = asyncio.create_task(_audiobook_segment_bytes(segment))
+    try:
+        while True:
+            done, _pending = await asyncio.wait({task}, timeout=1.0)
+            if done:
+                return await task
+            if await request.is_disconnected():
+                task.cancel()
+                return None
+            try:
+                await asyncio.to_thread(
+                    audiobook_service().manifest,
+                    session_id,
+                    manifest_hash,
+                    owner,
+                )
+            except KeyError:
+                task.cancel()
+                return None
+    finally:
+        if not task.done():
+            task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+async def _audiobook_stream_segment_while_active(
+    segment: dict[str, Any],
+    request: Request,
+    session_id: str,
+    manifest_hash: str,
+    owner: str,
+    ip: str,
+) -> bytes | None:
+    """Return one byte-stable session segment across media-stack reconnects."""
+    target, lock = _audiobook_session_segment_paths(
+        session_id, manifest_hash, segment
+    )
+    cached = await asyncio.to_thread(_read_audiobook_session_segment, target)
+    if cached is not None:
+        return cached
+    while True:
+        cached = await asyncio.to_thread(
+            _read_audiobook_session_segment, target
+        )
+        if cached is not None:
+            return cached
+        if await asyncio.to_thread(_claim_audiobook_session_segment, lock):
+            cached = await asyncio.to_thread(
+                _read_audiobook_session_segment, target
+            )
+            if cached is not None:
+                try:
+                    lock.unlink()
+                except OSError:
+                    pass
+                return cached
+            break
+        if await request.is_disconnected():
+            return None
+        try:
+            audiobook_service().manifest(
+                session_id, manifest_hash, owner
+            )
+        except KeyError:
+            return None
+        await asyncio.sleep(0.1)
+
+    attempt = 0
+    try:
+        while True:
+            if await request.is_disconnected():
+                return None
+            try:
+                async with tts_concurrency_limiter().slot(owner, ip):
+                    audio = await _audiobook_segment_while_active(
+                        segment, request, session_id, manifest_hash, owner
+                    )
+                if audio is not None:
+                    await asyncio.to_thread(
+                        _publish_audiobook_session_segment, target, audio
+                    )
+                return audio
+            except HTTPException as exc:
+                if exc.status_code != 429:
+                    raise
+            except RuntimeError as exc:
+                if "concurrency lease was lost" not in str(exc):
+                    raise
+            attempt += 1
+            await asyncio.sleep(min(2.0, 0.2 * attempt))
+    finally:
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+
+def _trim_mp3_audio(audio: bytes, offset_ms: int) -> bytes:
+    """Trim only a resume segment; frame-copy keeps CPU and latency bounded."""
+    if offset_ms <= 0 or not audio:
+        return audio
+    completed = subprocess.run(
+        [
+            "/usr/bin/ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{offset_ms / 1000:.3f}",
+            "-i",
+            "pipe:0",
+            "-map_metadata",
+            "-1",
+            "-c:a",
+            "copy",
+            "-f",
+            "mp3",
+            "pipe:1",
+        ],
+        input=audio,
+        capture_output=True,
+        check=False,
+        timeout=15,
+    )
+    if completed.returncode != 0 or not completed.stdout:
+        return audio
+    return completed.stdout
+
+
+@app.post("/api/v1/audiobook/sessions", status_code=201)
+def create_audiobook_session(
+    payload: AudiobookSessionRequest, request: Request, response: Response
+):
+    try:
+        validate_voice_selection(
+            mode=payload.mode, narrator=payload.narrator, voice=payload.voice,
+        )
+    except AudiobookContractError as exc:
+        raise HTTPException(400, "所选音源与听书模式不匹配") from exc
+    settings_payload = {
+        "mode": payload.mode,
+        "narrator": payload.narrator,
+        "voice": payload.voice,
+        "emotion": payload.emotion,
+        "rate": payload.rate,
+    }
+    owner = _audiobook_owner(request, payload.client_id)
+    device = _audiobook_device(request, payload.client_id)
+    _audiobook_quota(
+        owner,
+        _request_ip(request),
+        "session",
+        owner_limit=20,
+        ip_limit=40,
+        window=3600,
+    )
+    try:
+        result = audiobook_service().create(
+            owner_key=owner,
+            device_key=device,
+            book_id=payload.book_id,
+            chapter_id=payload.chapter_id,
+            settings=settings_payload,
+            resume_existing=payload.resume,
+            start_paragraph_index=payload.start_paragraph_index,
+        )
+    except AudiobookContractError as exc:
+        raise HTTPException(409, "听书清单已失效，请刷新后重试") from exc
+    except NotFoundError as exc:
+        raise HTTPException(404, "章节不存在") from exc
+    except KeyError as exc:
+        raise HTTPException(404, "作品不存在") from exc
+    forwarded_proto = request.headers.get("x-forwarded-proto", "")
+    response.set_cookie(
+        AUDIOBOOK_CLIENT_COOKIE,
+        payload.client_id,
+        max_age=43_200,
+        httponly=True,
+        secure=request.url.scheme == "https" or forwarded_proto == "https",
+        samesite="lax",
+        path="/api/v1/audiobook/",
+    )
+    return result
+
+
+@app.delete("/api/v1/audiobook/sessions/{session_id}", status_code=204)
+async def cancel_audiobook_session(session_id: str, request: Request):
+    owner = _audiobook_session_owner(request, session_id)
+    if not audiobook_service().cancel(session_id, owner):
+        raise HTTPException(404, "听书会话不存在")
+    await asyncio.to_thread(
+        _purge_cancelled_audiobook_session, session_id, owner
+    )
+    await asyncio.to_thread(_delete_audiobook_session_receipts, session_id)
+    response = PlainTextResponse("", status_code=204)
+    forwarded_proto = request.headers.get("x-forwarded-proto", "")
+    response.delete_cookie(
+        AUDIOBOOK_CLIENT_COOKIE,
+        path="/api/v1/audiobook/",
+        secure=request.url.scheme == "https" or forwarded_proto == "https",
+        httponly=True,
+        samesite="lax",
+    )
+    return response
+
+
+@app.post("/api/v1/audiobook/sessions/{session_id}/next")
+def prefetch_next_audiobook_chapter(
+    session_id: str,
+    request: Request,
+    from_chapter_id: int | None = Query(default=None, ge=1),
+):
+    owner = _audiobook_session_owner(request, session_id)
+    _audiobook_quota(
+        owner,
+        _request_ip(request),
+        "prefetch",
+        owner_limit=60,
+        ip_limit=120,
+        window=3600,
+    )
+    try:
+        manifest = audiobook_service().prefetch_next(
+            session_id, owner, from_chapter_id=from_chapter_id
+        )
+    except AudiobookContractError as exc:
+        raise HTTPException(409, "听书预载清单校验失败，请刷新后重试") from exc
+    except KeyError as exc:
+        raise HTTPException(404, "听书会话不存在") from exc
+    return {"next": manifest}
+
+
+@app.post(
+    "/api/v1/audiobook/sessions/{session_id}/chapters/{chapter_id}/activate",
+    status_code=204,
+)
+def activate_audiobook_chapter(session_id: str, chapter_id: int, request: Request):
+    owner = _audiobook_session_owner(request, session_id)
+    try:
+        audiobook_service().activate_chapter(session_id, chapter_id, owner)
+    except KeyError as exc:
+        raise HTTPException(404, "听书章节不存在或尚未预加载") from exc
+    return PlainTextResponse("", status_code=204)
+
+
+@app.get("/api/v1/audiobook/progress/{book_id}")
+def get_audiobook_progress(book_id: str, request: Request):
+    owner = _audiobook_owner(request)
+    device = _audiobook_device(request)
+    try:
+        return {
+            "progress": audiobook_service().progress(
+                owner, book_id, device_key=device
+            )
+        }
+    except KeyError as exc:
+        raise HTTPException(404, "书籍不存在") from exc
+
+
+@app.put("/api/v1/audiobook/sessions/{session_id}/progress", status_code=204)
+def save_audiobook_progress(
+    session_id: str, payload: AudiobookProgressRequest, request: Request
+):
+    owner = _audiobook_session_owner(request, session_id)
+    device = _audiobook_device(request)
+    try:
+        audiobook_service().save_progress(
+            session_id,
+            owner,
+            device_key=device,
+            chapter_id=payload.chapter_id,
+            paragraph_index=payload.paragraph_index,
+            item_index=payload.item_index,
+            audio_offset_ms=payload.audio_offset_ms,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "听书会话不存在") from exc
+    return PlainTextResponse("", status_code=204)
+
+
+@app.post(
+    "/api/v1/audiobook/sessions/{session_id}/segments/{manifest_hash}/{segment_index}"
+)
+async def audiobook_segment_audio(
+    session_id: str,
+    manifest_hash: str,
+    segment_index: int,
+    request: Request,
+):
+    owner = _audiobook_session_owner(request, session_id)
+    ip = _request_ip(request)
+    try:
+        segment = audiobook_service().segment(
+            session_id, manifest_hash, segment_index, owner
+        )
+    except AudiobookContractError as exc:
+        raise HTTPException(409, "听书预载清单校验失败，请刷新后重试") from exc
+    except KeyError as exc:
+        raise HTTPException(404, "听书片段不存在或已取消") from exc
+    _audiobook_quota(
+        owner,
+        ip,
+        "segment-requests",
+        owner_limit=180,
+        ip_limit=360,
+        window=60,
+    )
+    # This endpoint delivers immutable server-owned book audio. Charging the
+    # source text on every cache read or reconnect eventually blocks ordinary
+    # listening even though no new TTS work is performed. Abuse is bounded by
+    # the request quota above and by the owner/IP/site synthesis leases below.
+    async with tts_concurrency_limiter().slot(owner, ip):
+        audio = await _audiobook_segment_while_active(
+            segment,
+            request,
+            session_id,
+            manifest_hash,
+            owner,
+        )
+    if audio is None:
+        raise HTTPException(409, "听书会话已结束")
+    duration_ms = mp3_duration_ms(audio)
+    await asyncio.to_thread(_record_audiobook_segment_duration, segment, audio, duration_ms)
+    return Response(
+        content=audio,
         media_type="audio/mpeg",
         headers={
-            "Cache-Control": "public, max-age=3600",
-            "X-TTS-Emotion": selected_emotion,
+            "Cache-Control": "private, no-store",
+            "X-Content-SHA256": sha256(audio).hexdigest(),
+            "X-TTS-Segment": segment["sha256"],
+            "X-Audio-Duration-Ms": str(duration_ms),
         },
     )
 
 
+@app.get(
+    "/api/v1/audiobook/sessions/{session_id}/chapters/{manifest_hash}/stream.mp3"
+)
+async def audiobook_chapter_stream(
+    session_id: str,
+    manifest_hash: str,
+    request: Request,
+    start: int = Query(default=0, ge=0),
+    offset_ms: int = Query(default=0, ge=0, le=3_600_000),
+    stream_id: str | None = Query(default=None, max_length=128),
+    continuous: bool = Query(default=False),
+    full_chapter: bool = Query(default=False),
+):
+    """Stream audiobook audio through an idempotent media URL.
+
+    Ordinary clients receive one five-segment window. Background-capable
+    clients may request the remaining chapter through one media URL; synthesis
+    is still bounded to five concurrent segments at a time. Repeating the same
+    URL always returns the same starting audio because media stacks commonly
+    issue a second GET before playback.
+    """
+    owner = _audiobook_session_owner(request, session_id)
+    ip = _request_ip(request)
+    try:
+        manifest = audiobook_service().manifest(session_id, manifest_hash, owner)
+    except AudiobookContractError as exc:
+        raise HTTPException(409, "听书预载清单校验失败，请刷新后重试") from exc
+    except KeyError as exc:
+        raise HTTPException(404, "听书章节不存在或已取消") from exc
+    segments = list(manifest.get("segments") or [])
+    if start >= len(segments):
+        raise HTTPException(404, "听书起始片段不存在")
+    stream_id = _normalize_audiobook_stream_id(stream_id)
+    claimed_stream_intent = await asyncio.to_thread(
+        _claim_audiobook_stream_intent,
+        session_id,
+        manifest_hash,
+        stream_id,
+    )
+    batch = segments[start : start + AUDIOBOOK_STREAM_BATCH_SEGMENTS]
+    batch_end = start + len(batch)
+    response_end = len(segments) if full_chapter else batch_end
+    chapter_complete = response_end >= len(segments)
+    if claimed_stream_intent:
+        try:
+            _audiobook_quota(
+                owner,
+                ip,
+                "chapter-stream-requests",
+                owner_limit=30,
+                ip_limit=60,
+                window=60,
+            )
+        except HTTPException:
+            if stream_id:
+                try:
+                    _audiobook_stream_intent_path(
+                        session_id, manifest_hash, stream_id
+                    ).unlink()
+                except OSError:
+                    pass
+            raise
+
+    common_headers = {
+        "Content-Encoding": "identity",
+        "Content-Disposition": "inline",
+        "X-Audiobook-Manifest": manifest_hash,
+        "X-Audiobook-Start-Segment": str(start),
+        "X-Audiobook-Resume-Offset-Ms": str(offset_ms),
+        "X-Audiobook-Batch-Start": str(start),
+        "X-Audiobook-Batch-End": str(response_end),
+        "X-Audiobook-Batch-Size": str(len(batch)),
+        "X-Audiobook-Stream-End": str(response_end),
+        "X-Audiobook-Chapter-Complete": "1" if chapter_complete else "0",
+        "X-Audiobook-Continuous": "1" if continuous else "0",
+        "X-Audiobook-Full-Chapter": "1" if full_chapter else "0",
+    }
+
+    async def audio_chunks():
+        completed = False
+        try:
+            if continuous and stream_id:
+                await asyncio.to_thread(
+                    _write_audiobook_stream_cursor,
+                    session_id,
+                    manifest_hash,
+                    stream_id,
+                    start,
+                )
+            starts = range(
+                start,
+                response_end,
+                AUDIOBOOK_STREAM_BATCH_SEGMENTS,
+            )
+            for batch_start in starts:
+                batch_segments = segments[
+                    batch_start : batch_start + AUDIOBOOK_STREAM_BATCH_SEGMENTS
+                ]
+                first_batch = batch_start == start
+                tasks: list[asyncio.Task[bytes | None]] = []
+                try:
+                    tasks = [
+                        asyncio.create_task(
+                            _audiobook_stream_segment_while_active(
+                                segment,
+                                request,
+                                session_id,
+                                manifest_hash,
+                                owner,
+                                ip,
+                            )
+                        )
+                        for segment in batch_segments
+                    ]
+                    for position, (segment, task) in enumerate(zip(batch_segments, tasks)):
+                        if position % 3 == 0:
+                            if await request.is_disconnected():
+                                return
+                            try:
+                                audiobook_service().manifest(
+                                    session_id, manifest_hash, owner
+                                )
+                            except KeyError:
+                                return
+                        # Capacity protects synthesis, not network delivery. If every
+                        # slot is momentarily busy, wait here instead of raising after
+                        # StreamingResponse has already sent HTTP 200 headers.
+                        audio = await task
+                        if audio is None:
+                            return
+                        await asyncio.to_thread(
+                            _record_audiobook_segment_duration, segment, audio
+                        )
+                        frame_audio = _mp3_frame_payload(audio)
+                        segment_index = int(
+                            segment.get("index")
+                            if segment.get("index") is not None
+                            else batch_start + position
+                        )
+                        if continuous and stream_id:
+                            await asyncio.to_thread(
+                                _write_audiobook_stream_cursor,
+                                session_id,
+                                manifest_hash,
+                                stream_id,
+                                min(segment_index + 1, len(segments) - 1),
+                            )
+                        if first_batch and position == 0 and offset_ms > 0:
+                            yield _mp3_frame_payload(
+                                await asyncio.to_thread(
+                                    _trim_mp3_audio, audio, offset_ms
+                                )
+                            )
+                        else:
+                            yield frame_audio
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+            completed = True
+        finally:
+            if completed and stream_id:
+                await asyncio.to_thread(
+                    _mark_audiobook_stream_complete,
+                    session_id,
+                    manifest_hash,
+                    stream_id,
+                )
+
+    return StreamingResponse(
+        audio_chunks(),
+        media_type="audio/mpeg",
+        headers={
+            **common_headers,
+            "Accept-Ranges": "none",
+            "Cache-Control": "private, no-store",
+            "X-Accel-Buffering": "no",
+            "X-Audiobook-Stream-Mode": "continuous" if continuous else "live",
+        },
+    )
+
+
+@app.get(
+    "/api/v1/audiobook/sessions/{session_id}/chapters/{manifest_hash}/streams/{stream_id}"
+)
+def audiobook_chapter_stream_status(
+    session_id: str,
+    manifest_hash: str,
+    stream_id: str,
+    request: Request,
+):
+    """Confirm that the exact five-segment media batch reached server EOF."""
+    owner = _audiobook_session_owner(request, session_id)
+    stream_id = _normalize_audiobook_stream_id(stream_id)
+    if not stream_id:
+        raise HTTPException(404, "听书音频流不存在或已取消")
+    try:
+        audiobook_service().manifest(session_id, manifest_hash, owner)
+        completed = _consume_audiobook_stream_receipt(
+            session_id, manifest_hash, stream_id
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(404, "听书音频流不存在或已取消") from exc
+    return {"complete": completed}
+
+
+@app.get(
+    "/api/v1/audiobook/sessions/{session_id}/chapters/{manifest_hash}/timeline"
+)
+def audiobook_chapter_timeline(
+    session_id: str,
+    manifest_hash: str,
+    request: Request,
+    start: int = Query(default=0, ge=0),
+    limit: int = Query(default=AUDIOBOOK_STREAM_BATCH_SEGMENTS, ge=1, le=64),
+):
+    owner = _audiobook_session_owner(request, session_id)
+    try:
+        result = audiobook_service().timeline(
+            session_id, manifest_hash, owner, start=start, limit=limit
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "听书时间轴不存在或已取消") from exc
+    return JSONResponse(result, headers={"Cache-Control": "private, no-store"})
+
+
 @app.get("/robots.txt", response_class=PlainTextResponse)
 def robots():
-    return f"User-agent: *\nAllow: /\nSitemap: {SITE_ORIGIN}/sitemap.xml\n"
+    return (
+        "User-agent: *\n"
+        "Allow: /\n"
+        "Allow: /books/\n"
+        "Disallow: /api/\n"
+        "Disallow: /books/*/chapters/\n"
+        "Disallow: /books/*/volumes/\n"
+        "Disallow: /admin\n"
+        "Disallow: /account\n"
+        "Crawl-delay: 30\n"
+        "\n"
+        "User-agent: Googlebot\n"
+        "Allow: /\n"
+        "Allow: /books/\n"
+        "Disallow: /api/\n"
+        "Disallow: /books/*/chapters/\n"
+        "Disallow: /books/*/volumes/\n"
+        "Disallow: /admin\n"
+        "Disallow: /account\n"
+        "Crawl-delay: 30\n"
+        "\n"
+        "User-agent: Bingbot\n"
+        "Allow: /\n"
+        "Allow: /books/\n"
+        "Disallow: /api/\n"
+        "Disallow: /books/*/chapters/\n"
+        "Disallow: /books/*/volumes/\n"
+        "Disallow: /admin\n"
+        "Disallow: /account\n"
+        "Crawl-delay: 30\n"
+        "\n"
+        "User-agent: Amazonbot\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: GPTBot\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: ClaudeBot\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: CCBot\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: Bytespider\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: Applebot\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: PetalBot\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: SemrushBot\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: AhrefsBot\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: MJ12bot\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: DotBot\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: YandexBot\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: DataForSeoBot\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: BLEXBot\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: ZoominfoBot\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: Sogou\n"
+        "Disallow: /\n"
+        "\n"
+        "User-agent: 360Spider\n"
+        "Disallow: /\n"
+        "\n"
+        f"Sitemap: {SITE_ORIGIN}/sitemap.xml\n"
+    )
+
+
+@app.get("/wp-admin", include_in_schema=False)
+@app.get("/wp-login.php", include_in_schema=False)
+@app.get("/.env", include_in_schema=False)
+@app.get("/xmlrpc.php", include_in_schema=False)
+@app.get("/admin/config", include_in_schema=False)
+def honeypot_trap(request: Request):
+    _rate_limiter.record_honeypot(request)
+    raise HTTPException(status_code=404, detail="Not Found")
 
 
 def _search_favicon(filename: str, media_type: str) -> FileResponse:
@@ -1064,13 +3188,13 @@ def search_favicon_96():
     return _search_favicon("favicon-96.png", "image/png")
 
 
-@app.get("/sitemap.xml")
-def sitemap():
-    urls = (
-        f"{SITE_ORIGIN}/",
-        f"{SITE_ORIGIN}/library",
-        f"{SITE_ORIGIN}/deconstructions",
-    )
+def _require_search_engine_ip(request: Request) -> None:
+    ip = _rate_limiter._get_client_ip(request)
+    if not _rate_limiter.is_search_engine_ip(ip):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+def _sitemap_urlset(urls: tuple[str, ...] | list[str]) -> PlainTextResponse:
     locations = "".join(
         f"<url><loc>{escape(url, quote=True)}</loc></url>" for url in urls
     )
@@ -1079,34 +3203,76 @@ def sitemap():
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
         f"{locations}</urlset>"
     )
-    return PlainTextResponse(body, media_type="application/xml")
-
-
-def spa_index() -> HTMLResponse:
-    source = index_html_template().replace(
-        "https://reader.example.com", SITE_ORIGIN
-    )
-    match = STRUCTURED_DATA_PATTERN.search(source)
-    if match is None:
-        raise RuntimeError("structured-data JSON-LD script is missing")
-    digest = b64encode(
-        sha256(match.group(1).encode("utf-8")).digest()
-    ).decode("ascii")
-    return HTMLResponse(
-        source,
-        headers={
-            "Cache-Control": "no-cache",
-            SEO_CSP_HASH_HEADER: f"'sha256-{digest}'",
-        },
+    return PlainTextResponse(
+        body,
+        media_type="application/xml",
+        headers={"Cache-Control": "public, max-age=86400"},
     )
 
 
-@app.get("/", response_class=HTMLResponse)
-def index_page():
-    return spa_index()
+@app.get("/sitemaps/static.xml")
+def static_sitemap(request: Request):
+    _require_search_engine_ip(request)
+    urls = (
+        f"{SITE_ORIGIN}/",
+        f"{SITE_ORIGIN}/library",
+        f"{SITE_ORIGIN}/deconstructions",
+    )
+    return _sitemap_urlset(urls)
 
 
-@app.get("/library", response_class=HTMLResponse)
+@app.get("/sitemaps/books/{book_id}.xml")
+def book_sitemap(request: Request, book_id: str):
+    _require_search_engine_ip(request)
+    require_public_book_id(book_id)
+    repo = repository()
+    repo.get_book(book_id)
+    urls = [f"{SITE_ORIGIN}/books/{book_id}"]
+    try:
+        catalog = repo.reader_catalog(book_id)
+    except InputError:
+        catalog = {"chapters": []}
+    urls.extend(
+        f"{SITE_ORIGIN}/books/{book_id}/chapters/{int(chapter['id'])}"
+        for chapter in (catalog.get("chapters") or [])
+        if int(chapter.get("id") or 0) > 0
+    )
+    return _sitemap_urlset(urls)
+
+
+@app.get("/sitemap.xml")
+def sitemap(request: Request):
+    _require_search_engine_ip(request)
+    sitemap_urls = [f"{SITE_ORIGIN}/sitemaps/static.xml"]
+    sitemap_urls.extend(
+        f"{SITE_ORIGIN}/sitemaps/books/{book_id}.xml"
+        for book_id in repository().sitemap_book_ids()
+    )
+    locations = "".join(
+        f"<sitemap><loc>{escape(url, quote=True)}</loc></sitemap>"
+        for url in sitemap_urls
+    )
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        f"{locations}</sitemapindex>"
+    )
+    return PlainTextResponse(
+        body,
+        media_type="application/xml",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+def spa_index() -> FileResponse:
+    return FileResponse(
+        STATIC_ROOT / "index.html",
+        media_type="text/html",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/library", response_class=FileResponse)
 def library_page():
     return spa_index()
 
@@ -1286,31 +3452,36 @@ def volume_page(book_id: str, volume_id: int):
     )
 
 
-@app.get("/rankings", response_class=HTMLResponse)
+@app.get("/rankings", response_class=FileResponse)
 def rankings_page():
     return spa_index()
 
 
-@app.get("/deconstructions", response_class=HTMLResponse)
+@app.get("/deconstructions", response_class=FileResponse)
 def deconstructions_page():
     return spa_index()
 
 
-@app.get("/account", response_class=HTMLResponse)
+@app.get("/account", response_class=FileResponse)
 def account_page():
     return spa_index()
 
 
-@app.get("/about", response_class=HTMLResponse)
-@app.get("/disclaimer", response_class=HTMLResponse)
-@app.get("/guide", response_class=HTMLResponse)
-@app.get("/contact", response_class=HTMLResponse)
-@app.get("/client", response_class=HTMLResponse)
+@app.get("/admin", response_class=FileResponse)
+def admin_page():
+    return spa_index()
+
+
+@app.get("/about", response_class=FileResponse)
+@app.get("/disclaimer", response_class=FileResponse)
+@app.get("/guide", response_class=FileResponse)
+@app.get("/contact", response_class=FileResponse)
+@app.get("/client", response_class=FileResponse)
 def static_information_page():
     return spa_index()
 
 
-@app.get("/deconstructions/{slug}", response_class=HTMLResponse)
+@app.get("/deconstructions/{slug}", response_class=FileResponse)
 def deconstruction_page(slug: str):
     return spa_index()
 

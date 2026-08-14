@@ -8,6 +8,8 @@ automates its stable v2026.7.26-709 UI inside an isolated Xvfb display.
 
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import difflib
 import fcntl
 import json
@@ -187,7 +189,7 @@ class FanqieDownloaderBridge:
                 window_id = output.splitlines()[-1].strip()
                 if window_id:
                     return window_id
-            except Exception as exc:
+            except RECOVERABLE_OPERATION_ERRORS as exc:
                 last_error = str(exc)
             time.sleep(0.5)
         raise RuntimeError(

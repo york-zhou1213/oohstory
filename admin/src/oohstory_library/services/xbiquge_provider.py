@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import os
 import re
 import threading
@@ -81,9 +83,8 @@ class AuthorizedXbiqugeProvider:
             Path(configured_cache).expanduser().resolve()
             if configured_cache
             else (
-                Path(__file__).resolve().parents[2]
+                Path(__file__).resolve().parents[3]
                 / "electronic-library"
-                / "txt80"
                 / ".download-cache"
                 / "xbiquge"
             )
@@ -529,7 +530,7 @@ class AuthorizedXbiqugeProvider:
                 if len(content) < 10:
                     raise RuntimeError("正文为空或过短")
                 return index, title, content
-            except Exception as exc:
+            except RECOVERABLE_OPERATION_ERRORS as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 if attempt < 4:
                     time.sleep(min(0.5 * attempt, 1.5))
@@ -606,7 +607,7 @@ class AuthorizedXbiqugeProvider:
                     chapter_ref = str(chapters[index].get("path") or "")
                     if chapter_ref:
                         manifest[chapter_ref] = cache_path.name
-                except Exception as exc:
+                except RECOVERABLE_OPERATION_ERRORS as exc:
                     errors.append(
                         f"章节 {index + 1}: {type(exc).__name__}: {str(exc)[:160]}"
                     )

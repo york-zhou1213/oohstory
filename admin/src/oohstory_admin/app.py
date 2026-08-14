@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from oohstory_library.services.error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import asyncio
 import hashlib
 import hmac
@@ -25,18 +27,12 @@ from .config import Settings
 from .library_status import LibraryClient
 from .library_catalog import LibraryCatalog, VIEWS, hot_cache_from_settings
 from .library_actions import LibraryActionClient, LibraryActionError, SEARCH_SOURCES
+from .maintenance import MaintenanceController, MaintenanceError
 from .operations import (
     MAX_MULTIPART_BYTES,
     OperationsClient,
     OperationsError,
     parse_multipart,
-)
-from .script_store import (
-    ScriptConflictError,
-    ScriptNotFoundError,
-    ScriptStore,
-    ScriptStoreError,
-    ScriptValidationError,
 )
 from .security import LoginRateLimiter, SessionSigner, verify_password
 from oohstory_library.services.default_cover import (
@@ -49,7 +45,6 @@ from .units import ALLOWED_ACTIONS, UNIT_ALLOWLIST
 
 PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MAX_MUTATION_BODY = 64 * 1024
-MAX_SCRIPT_MUTATION_BODY = 192 * 1024
 MAX_COVER_UPLOAD_BODY = 12 * 1024 * 1024
 MAX_CATALOG_DELETE_BOOKS = 100
 
@@ -324,9 +319,24 @@ class LibrarySiteFullSyncRequest(BaseModel):
     books_per_cycle: int | None = Field(None, ge=1, le=500)
 
 
+class LibrarySerializedUpdateSourceRequest(BaseModel):
+    source_id: str = Field(min_length=1, max_length=16)
+    enabled: bool
+
+
 class LibraryCoverRedrawControlRequest(BaseModel):
     target_per_hour: int = Field(60, ge=50, le=160)
     enabled: bool | None = None
+
+
+class LibraryRootPreflightRequest(BaseModel):
+    source: str = Field(min_length=2, max_length=1024)
+    destination: str = Field(min_length=2, max_length=1024)
+
+
+class LibraryRootMigrationRequest(BaseModel):
+    plan_token: str = Field(pattern=r"^[a-f0-9]{32}$")
+    confirmation: str = Field(min_length=1, max_length=32)
 
 
 class LibraryIndexRefreshRequest(BaseModel):
@@ -366,10 +376,10 @@ def create_app(
     library: LibraryClient | None = None,
     systemd: SystemdController | None = None,
     audit: AuditLog | None = None,
-    script_store: ScriptStore | None = None,
     catalog: LibraryCatalog | None = None,
     library_actions: LibraryActionClient | None = None,
     operations: OperationsClient | None = None,
+    maintenance: MaintenanceController | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     package_dir = Path(__file__).resolve().parent
@@ -405,10 +415,9 @@ def create_app(
         use_sudo_helper=settings.use_sudo_helper,
         helper_path=settings.systemctl_helper_path,
     )
-    script_store = script_store or ScriptStore(
-        settings.managed_script_root,
+    maintenance = maintenance or MaintenanceController(
+        settings.maintenance_helper_path,
         use_sudo_helper=settings.use_sudo_helper,
-        helper_path=settings.script_store_helper_path,
     )
     audit = audit or AuditLog(settings.database_path)
     audit.initialize()
@@ -422,8 +431,8 @@ def create_app(
     app.state.library_actions = library_actions
     app.state.operations = operations
     app.state.systemd = systemd
+    app.state.maintenance = maintenance
     app.state.audit = audit
-    app.state.script_store = script_store
     app.state.signer = signer
     app.state.login_limiter = limiter
 
@@ -434,9 +443,7 @@ def create_app(
     async def security_headers(request: Request, call_next):
         if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
             body_limit = (
-                MAX_SCRIPT_MUTATION_BODY
-                if "/pipeline/scripts/" in request.url.path
-                else MAX_COVER_UPLOAD_BODY
+                MAX_COVER_UPLOAD_BODY
                 if request.url.path.endswith("/cover-upload")
                 else MAX_MULTIPART_BYTES
                 if request.url.path.endswith("/operations/novels/upload")
@@ -504,9 +511,10 @@ def create_app(
             "reader_home": reader.home,
             "system": system_summary,
             "services": systemd.statuses,
+            "maintenance": maintenance.status,
         }
         output: dict[str, Any] = {}
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="admin-dashboard") as pool:
+        with ThreadPoolExecutor(max_workers=5, thread_name_prefix="admin-dashboard") as pool:
             futures = {pool.submit(function): name for name, function in functions.items()}
             for future in as_completed(futures):
                 name = futures[future]
@@ -520,7 +528,7 @@ def create_app(
                         }
                     else:
                         output[name] = value
-                except Exception:
+                except RECOVERABLE_OPERATION_ERRORS:
                     output[name] = {"available": False, "error": "状态读取失败"}
         return output
 
@@ -553,7 +561,7 @@ def create_app(
                     output[name] = {"available": False, "data": None, "error": "书籍不存在"}
                 except UpstreamUnavailable as exc:
                     output[name] = {"available": False, "data": None, "error": str(exc)}
-                except Exception:
+                except RECOVERABLE_OPERATION_ERRORS:
                     output[name] = {"available": False, "data": None, "error": "上游读取失败"}
         return output
 
@@ -563,7 +571,7 @@ def create_app(
             service_future = pool.submit(systemd.statuses)
             try:
                 statuses = status_future.result()
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 statuses = {
                     "library": {
                         "available": False,
@@ -574,25 +582,12 @@ def create_app(
                 }
             try:
                 services = service_future.result()
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 services = []
         return _library_view_model(statuses, services)
 
     def pipeline_services() -> list[dict[str, Any]]:
-        services: list[dict[str, Any]] = []
-        for original in systemd.statuses():
-            service = dict(original)
-            managed = script_store.describe_unit(str(service.get("unit") or ""))
-            if managed:
-                runtime_path = str(service.get("runtime_path") or "")
-                managed["runtime_matches"] = bool(
-                    runtime_path
-                    and Path(runtime_path).resolve(strict=False)
-                    == Path(str(managed["absolute_path"])).resolve(strict=False)
-                )
-                service["script"] = managed
-            services.append(service)
-        return services
+        return [dict(item) for item in systemd.statuses()]
 
     def perform_action(actor: str, action: str, target: str) -> ActionResult:
         if action not in ALLOWED_ACTIONS or target not in UNIT_ALLOWLIST:
@@ -735,12 +730,85 @@ def create_app(
     if settings.base_path:
         ui_router.add_api_route("", dashboard_page, methods=["GET"], response_class=HTMLResponse)
 
+    @ui_router.get("/maintenance", response_class=HTMLResponse)
+    async def maintenance_page(
+        request: Request,
+        result: str = Query("", max_length=16),
+    ):
+        session = session_for(request)
+        if not session:
+            return RedirectResponse(settings.login_path, status_code=303)
+        status = await asyncio.to_thread(maintenance.status)
+        notice = "维护模式已开启" if result == "enabled" else (
+            "站点已恢复正常访问" if result == "disabled" else ""
+        )
+        return templates.TemplateResponse(
+            request,
+            "maintenance.html",
+            template_context(
+                request,
+                session,
+                page="maintenance",
+                maintenance=status,
+                notice=notice,
+                error=(
+                    "切换失败，请查看审计日志"
+                    if result == "failed"
+                    else ""
+                ),
+            ),
+        )
+
+    @ui_router.post("/maintenance")
+    async def maintenance_action(request: Request):
+        session = session_for(request)
+        if not session:
+            return RedirectResponse(settings.login_path, status_code=303)
+        form = await _form_data(request)
+        supplied = form.get("csrf_token", "")
+        if not supplied or not hmac.compare_digest(supplied, session["csrf"]):
+            raise HTTPException(status_code=403, detail="CSRF 校验失败")
+        action = form.get("action", "")
+        if action not in {"enable", "disable"}:
+            audit.record(
+                session["sub"],
+                "maintenance_rejected",
+                "reader.example.com",
+                "invalid_action",
+            )
+            raise HTTPException(status_code=400, detail="维护模式操作无效")
+        enabled = action == "enable"
+        audit_action = f"maintenance_{action}"
+        try:
+            await asyncio.to_thread(maintenance.set_enabled, enabled)
+        except MaintenanceError as exc:
+            audit.record(
+                session["sub"],
+                audit_action,
+                "reader.example.com",
+                f"failure:{str(exc)[:240]}",
+            )
+            return RedirectResponse(
+                _ui(settings, "/maintenance?result=failed"),
+                status_code=303,
+            )
+        audit.record(session["sub"], audit_action, "reader.example.com", "success")
+        return RedirectResponse(
+            _ui(
+                settings,
+                "/maintenance?result=enabled"
+                if enabled
+                else "/maintenance?result=disabled",
+            ),
+            status_code=303,
+        )
+
     @ui_router.get("/books", response_class=HTMLResponse)
     @ui_router.get("/books/catalog", response_class=HTMLResponse)
     async def books_page(
         request: Request,
         view: str = Query("all", max_length=32),
-        result: str = Query("", max_length=16),
+        result: str = "",
         q: str = Query("", max_length=100),
         category: str = Query("", max_length=100),
         availability: str = Query("all", max_length=16),
@@ -769,7 +837,7 @@ def create_app(
                 page_size=page_size,
             )
             catalog_result = {"available": True, "data": data, "error": None}
-        except Exception as catalog_exc:
+        except RECOVERABLE_OPERATION_ERRORS as catalog_exc:
             # A fresh installation may bring the admin up before MySQL.  Keep
             # the old public Reader list as an honest all-books fallback.
             if view == "all":
@@ -802,7 +870,7 @@ def create_app(
                 }
         try:
             workspace = await asyncio.to_thread(library_dashboard_data)
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             workspace = {"metrics": (), "tone": {}, "plot": {}, "deconstruction": {}}
         task_runners: dict[str, Any] = {"runners": [], "default_runner": "", "max_parallel": 0}
         if view == "deconstruction":
@@ -946,6 +1014,43 @@ def create_app(
             session["sub"],
             "site_full_sync",
             site_id,
+            f"success:{'enabled' if enabled_value == '1' else 'disabled'}",
+        )
+        return RedirectResponse(
+            f"{_ui(settings, '/library/sync')}?result={'ok' if result.ok else 'failed'}",
+            status_code=303,
+        )
+
+    @ui_router.post("/books/serialized-update-sync")
+    async def books_serialized_update_sync(request: Request):
+        session = session_for(request)
+        if not session:
+            return RedirectResponse(settings.login_path, status_code=303)
+        form = await _form_data(request)
+        supplied = form.get("csrf_token", "")
+        if not supplied or not hmac.compare_digest(supplied, session["csrf"]):
+            raise HTTPException(status_code=403, detail="CSRF 校验失败")
+        source_id = form.get("source_id", "")
+        enabled_value = form.get("enabled", "")
+        if source_id not in {"xbiquge", "ixdzs", "shubaow", "linovelib"} or enabled_value not in {"0", "1"}:
+            raise HTTPException(status_code=400, detail="连载追更参数无效")
+        try:
+            result = await asyncio.to_thread(
+                library_actions.run,
+                "serialized_update_source",
+                {
+                    "source_id": source_id,
+                    "enabled": enabled_value == "1",
+                },
+                timeout_seconds=120,
+            )
+        except LibraryActionError as exc:
+            audit.record(session["sub"], "serialized_update_source", source_id, f"failure:{str(exc)[:240]}")
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        audit.record(
+            session["sub"],
+            "serialized_update_source",
+            source_id,
             f"success:{'enabled' if enabled_value == '1' else 'disabled'}",
         )
         return RedirectResponse(
@@ -1260,7 +1365,7 @@ def create_app(
             item = await asyncio.to_thread(catalog.book, catalog_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="书籍不存在") from exc
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             raise HTTPException(status_code=503, detail="电子书库目录不可用") from exc
         return templates.TemplateResponse(
             request,
@@ -1283,7 +1388,7 @@ def create_app(
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="剧情证据不存在") from exc
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             raise HTTPException(status_code=503, detail="剧情证据索引不可用") from exc
         return templates.TemplateResponse(
             request,
@@ -1579,128 +1684,6 @@ def create_app(
             status_code=303,
         )
 
-    async def render_script_editor(
-        request: Request,
-        session: dict[str, Any],
-        script_id: str,
-        *,
-        content: str | None = None,
-        expected_sha256: str | None = None,
-        error: str = "",
-        notice: str = "",
-        status_code: int = 200,
-    ):
-        try:
-            script = await asyncio.to_thread(script_store.read, script_id)
-        except ScriptNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except ScriptStoreError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        if content is not None:
-            script["content"] = content
-        if expected_sha256 is not None:
-            script["sha256"] = expected_sha256
-        statuses = await asyncio.to_thread(pipeline_services)
-        affected = [item for item in statuses if item.get("unit") in script["units"]]
-        return templates.TemplateResponse(
-            request,
-            "script_edit.html",
-            template_context(
-                request,
-                session,
-                page="pipeline",
-                script=script,
-                affected_services=affected,
-                save_path=_ui(settings, f"/pipeline/scripts/{script_id}"),
-                pipeline_path=_ui(settings, "/pipeline"),
-                error=error,
-                notice=notice,
-            ),
-            status_code=status_code,
-        )
-
-    @ui_router.get("/pipeline/scripts/{script_id}", response_class=HTMLResponse)
-    async def pipeline_script_page(
-        request: Request,
-        script_id: str,
-        saved: str = Query("", max_length=1),
-    ):
-        session = session_for(request)
-        if not session:
-            return RedirectResponse(settings.login_path, status_code=303)
-        return await render_script_editor(
-            request,
-            session,
-            script_id,
-            notice="脚本已校验并原子保存；服务未自动重启" if saved == "1" else "",
-        )
-
-    @ui_router.post("/pipeline/scripts/{script_id}", response_class=HTMLResponse)
-    async def pipeline_script_save(request: Request, script_id: str):
-        session = session_for(request)
-        if not session:
-            return RedirectResponse(settings.login_path, status_code=303)
-        form = await _form_data(request, max_body=MAX_SCRIPT_MUTATION_BODY, max_fields=8)
-        supplied = form.get("csrf_token", "")
-        if not supplied or not hmac.compare_digest(supplied, session["csrf"]):
-            audit.record(session["sub"], "script_save", script_id, "rejected:csrf")
-            raise HTTPException(status_code=403, detail="CSRF 校验失败")
-        content = form.get("content", "")
-        expected_sha256 = form.get("expected_sha256", "")
-        try:
-            result = await asyncio.to_thread(
-                script_store.save,
-                script_id,
-                content,
-                expected_sha256,
-            )
-        except ScriptNotFoundError as exc:
-            audit.record(session["sub"], "script_save", script_id, "rejected:not_allowlisted")
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except ScriptConflictError as exc:
-            audit.record(session["sub"], "script_save", script_id, "rejected:sha_conflict")
-            return await render_script_editor(
-                request,
-                session,
-                script_id,
-                content=content,
-                expected_sha256=expected_sha256,
-                error=str(exc),
-                status_code=409,
-            )
-        except ScriptValidationError as exc:
-            audit.record(session["sub"], "script_save", script_id, "rejected:validation")
-            return await render_script_editor(
-                request,
-                session,
-                script_id,
-                content=content,
-                expected_sha256=expected_sha256,
-                error=str(exc),
-                status_code=400,
-            )
-        except ScriptStoreError as exc:
-            audit.record(session["sub"], "script_save", script_id, "failure:helper")
-            return await render_script_editor(
-                request,
-                session,
-                script_id,
-                content=content,
-                expected_sha256=expected_sha256,
-                error=str(exc),
-                status_code=502,
-            )
-        audit.record(
-            session["sub"],
-            "script_save",
-            script_id,
-            f"success:{result.old_sha256[:12]}->{result.new_sha256[:12]}",
-        )
-        return RedirectResponse(
-            f"{_ui(settings, f'/pipeline/scripts/{script_id}')}?saved=1",
-            status_code=303,
-        )
-
     @ui_router.get("/library", response_class=HTMLResponse)
     async def library_page(request: Request, result: str = Query("", max_length=16)):
         session = session_for(request)
@@ -1721,14 +1704,14 @@ def create_app(
             ),
         )
 
-    @ui_router.get("/library/sync", response_class=HTMLResponse)
-    async def library_sync_page(
+    async def render_library_sync_page(
         request: Request,
-        result: str = Query("", max_length=16),
+        session: dict[str, Any],
+        *,
+        result: str = "",
+        root_migration_plan: dict[str, Any] | None = None,
+        root_migration_error: str = "",
     ):
-        session = session_for(request)
-        if not session:
-            return RedirectResponse(settings.login_path, status_code=303)
         dashboard = await asyncio.to_thread(library_dashboard_data)
         sync_controls: dict[str, Any] = {}
         sync_error = ""
@@ -1742,6 +1725,17 @@ def create_app(
             ).data
         except LibraryActionError as exc:
             sync_error = str(exc)
+        root_migration_status: dict[str, Any] = {}
+        try:
+            root_migration_status = (
+                await asyncio.to_thread(
+                    library_actions.run,
+                    "root_migration_status",
+                    timeout_seconds=30,
+                )
+            ).data
+        except LibraryActionError as exc:
+            root_migration_error = root_migration_error or str(exc)
         return templates.TemplateResponse(
             request,
             "library_sync.html",
@@ -1753,6 +1747,9 @@ def create_app(
                 dashboard=dashboard,
                 sync_controls=sync_controls,
                 sync_error=sync_error,
+                root_migration_status=root_migration_status,
+                root_migration_plan=root_migration_plan,
+                root_migration_error=root_migration_error,
                 library_action_path=_ui(settings, "/library/action"),
                 notice=(
                     "操作成功"
@@ -1762,6 +1759,79 @@ def create_app(
                     else ""
                 ),
             ),
+        )
+
+    @ui_router.get("/library/sync", response_class=HTMLResponse)
+    async def library_sync_page(
+        request: Request,
+        result: str = Query("", max_length=16),
+    ):
+        session = session_for(request)
+        if not session:
+            return RedirectResponse(settings.login_path, status_code=303)
+        return await render_library_sync_page(request, session, result=result)
+
+    @ui_router.post("/books/root-migration/preflight", response_class=HTMLResponse)
+    async def books_root_migration_preflight(request: Request):
+        session = session_for(request)
+        if not session:
+            return RedirectResponse(settings.login_path, status_code=303)
+        form = await _form_data(request, max_fields=8)
+        supplied = form.get("csrf_token", "")
+        if not supplied or not hmac.compare_digest(supplied, session["csrf"]):
+            raise HTTPException(status_code=403, detail="CSRF 校验失败")
+        source = form.get("source", "").strip()
+        destination = form.get("destination", "").strip()
+        try:
+            result = await asyncio.to_thread(
+                library_actions.run,
+                "root_migration_preflight",
+                {"source": source, "destination": destination},
+                timeout_seconds=180,
+            )
+        except LibraryActionError as exc:
+            audit.record(session["sub"], "root_migration_preflight", destination[:160], f"rejected:{str(exc)[:240]}")
+            return await render_library_sync_page(
+                request,
+                session,
+                root_migration_error=str(exc),
+            )
+        audit.record(session["sub"], "root_migration_preflight", destination[:160], "success")
+        return await render_library_sync_page(
+            request,
+            session,
+            root_migration_plan=result.data,
+        )
+
+    @ui_router.post("/books/root-migration/start")
+    async def books_root_migration_start(request: Request):
+        session = session_for(request)
+        if not session:
+            return RedirectResponse(settings.login_path, status_code=303)
+        form = await _form_data(request, max_fields=6)
+        supplied = form.get("csrf_token", "")
+        if not supplied or not hmac.compare_digest(supplied, session["csrf"]):
+            raise HTTPException(status_code=403, detail="CSRF 校验失败")
+        token = form.get("plan_token", "")
+        confirmation = form.get("confirmation", "")
+        try:
+            result = await asyncio.to_thread(
+                library_actions.run,
+                "root_migration_start",
+                {"plan_token": token, "confirmation": confirmation},
+                timeout_seconds=60,
+            )
+        except LibraryActionError as exc:
+            audit.record(session["sub"], "root_migration_start", token[:12], f"failure:{str(exc)[:240]}")
+            return await render_library_sync_page(
+                request,
+                session,
+                root_migration_error=str(exc),
+            )
+        audit.record(session["sub"], "root_migration_start", token[:12], "success:queued")
+        return RedirectResponse(
+            f"{_ui(settings, '/library/sync')}?result={'ok' if result.ok else 'failed'}#root-migration",
+            status_code=303,
         )
 
     @ui_router.get("/jobs", response_class=HTMLResponse)
@@ -2121,7 +2191,7 @@ def create_app(
                 page=page,
                 page_size=page_size,
             )
-        except Exception as catalog_exc:
+        except RECOVERABLE_OPERATION_ERRORS as catalog_exc:
             if view != "all":
                 raise HTTPException(status_code=503, detail="电子书库目录不可用") from catalog_exc
             try:
@@ -2375,7 +2445,7 @@ def create_app(
             return await asyncio.to_thread(catalog.book, catalog_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="书籍不存在") from exc
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             raise HTTPException(status_code=503, detail="电子书库目录不可用") from exc
 
     @api_router.get("/books/catalog/{catalog_id}/cover", response_class=FileResponse)
@@ -2388,7 +2458,7 @@ def create_app(
             cover = await asyncio.to_thread(catalog.cover_file, catalog_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="封面不存在") from exc
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             raise HTTPException(status_code=503, detail="封面服务不可用") from exc
         return FileResponse(
             cover["path"],
@@ -2427,7 +2497,7 @@ def create_app(
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="剧情证据不存在") from exc
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             raise HTTPException(status_code=503, detail="剧情证据索引不可用") from exc
 
     @api_router.get("/books/sync-controls")
@@ -2445,6 +2515,60 @@ def create_app(
             ).data
         except LibraryActionError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @api_router.get("/books/root-migration/status")
+    async def api_books_root_migration_status(
+        session: dict[str, Any] = Depends(require_api_session),
+    ):
+        del session
+        try:
+            result = await asyncio.to_thread(
+                library_actions.run,
+                "root_migration_status",
+                timeout_seconds=30,
+            )
+        except LibraryActionError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {"ok": True, "message": result.message, "data": result.data}
+
+    @api_router.post("/books/root-migration/preflight")
+    async def api_books_root_migration_preflight(
+        payload: LibraryRootPreflightRequest,
+        session: dict[str, Any] = Depends(require_csrf),
+    ):
+        try:
+            result = await asyncio.to_thread(
+                library_actions.run,
+                "root_migration_preflight",
+                {"source": payload.source, "destination": payload.destination},
+                timeout_seconds=180,
+            )
+        except LibraryActionError as exc:
+            audit.record(session["sub"], "root_migration_preflight", payload.destination[:160], f"rejected:{str(exc)[:240]}")
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        audit.record(session["sub"], "root_migration_preflight", payload.destination[:160], "success")
+        return {"ok": True, "message": result.message, "data": result.data}
+
+    @api_router.post("/books/root-migration/start")
+    async def api_books_root_migration_start(
+        payload: LibraryRootMigrationRequest,
+        session: dict[str, Any] = Depends(require_csrf),
+    ):
+        try:
+            result = await asyncio.to_thread(
+                library_actions.run,
+                "root_migration_start",
+                {
+                    "plan_token": payload.plan_token,
+                    "confirmation": payload.confirmation,
+                },
+                timeout_seconds=60,
+            )
+        except LibraryActionError as exc:
+            audit.record(session["sub"], "root_migration_start", payload.plan_token[:12], f"failure:{str(exc)[:240]}")
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        audit.record(session["sub"], "root_migration_start", payload.plan_token[:12], "success:queued")
+        return {"ok": True, "message": result.message, "data": result.data}
 
     @api_router.post("/books/sync-control")
     async def api_books_sync_control(
@@ -2492,6 +2616,29 @@ def create_app(
             audit.record(session["sub"], "site_full_sync", payload.site_id, f"failure:{str(exc)[:240]}")
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         audit.record(session["sub"], "site_full_sync", payload.site_id, f"success:{payload.enabled}")
+        return {"ok": True, "message": result.message, "data": result.data}
+
+    @api_router.post("/books/serialized-update-sync")
+    async def api_books_serialized_update_sync(
+        payload: LibrarySerializedUpdateSourceRequest,
+        session: dict[str, Any] = Depends(require_csrf),
+    ):
+        if payload.source_id not in {"xbiquge", "ixdzs", "shubaow", "linovelib"}:
+            raise HTTPException(status_code=400, detail="未知连载追更来源")
+        try:
+            result = await asyncio.to_thread(
+                library_actions.run,
+                "serialized_update_source",
+                {
+                    "source_id": payload.source_id,
+                    "enabled": payload.enabled,
+                },
+                timeout_seconds=120,
+            )
+        except LibraryActionError as exc:
+            audit.record(session["sub"], "serialized_update_source", payload.source_id, f"failure:{str(exc)[:240]}")
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        audit.record(session["sub"], "serialized_update_source", payload.source_id, f"success:{payload.enabled}")
         return {"ok": True, "message": result.message, "data": result.data}
 
     @api_router.post("/books/cover-redraw-control")

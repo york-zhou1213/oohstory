@@ -21,7 +21,7 @@ from project_paths import APP_ROOT  # noqa: E402
 
 
 BACKEND_ROOT = APP_ROOT / "src"
-LIBRARY_ROOT = APP_ROOT / "electronic-library" / "txt80"
+LIBRARY_ROOT = APP_ROOT / "electronic-library"
 STATE_PATH = LIBRARY_ROOT / "全局索引" / "authorized-site-catalog-sync.json"
 LOCK_PATH = STATE_PATH.with_suffix(".lock")
 CATEGORY_BACKFILL_STATE_PATH = (

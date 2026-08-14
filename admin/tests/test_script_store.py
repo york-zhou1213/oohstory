@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,7 +10,6 @@ from fastapi.testclient import TestClient
 
 from conftest import FakeLibrary, FakeReader, FakeSystemd, login
 from oohstory_admin.app import create_app
-from oohstory_admin.audit import AuditLog
 from oohstory_admin.script_store import (
     ScriptConflictError,
     ScriptNotFoundError,
@@ -94,61 +92,18 @@ def test_sudo_helper_invocation_uses_fixed_id_and_stdin(tmp_path):
     assert calls[0][1]["input"] == record["content"].encode()
 
 
-def test_authenticated_editor_csrf_validation_conflict_and_audit(tmp_path, settings):
-    root = make_project(
-        tmp_path / "project",
-        "#!/usr/bin/env python3\n# </textarea><script>alert(1)</script>\nprint('ok')\n",
-    )
-    local_settings = replace(
-        settings,
-        managed_script_root=root,
-        database_path=tmp_path / "audit.db",
-    )
-    audit = AuditLog(local_settings.database_path)
+def test_script_editor_routes_are_not_registered(tmp_path, settings):
     app = create_app(
-        local_settings,
+        settings,
         reader=FakeReader(),
         library=FakeLibrary(),
         systemd=FakeSystemd(),
-        audit=audit,
     )
     with TestClient(app) as client:
         assert login(client).status_code == 303
-        page = client.get(f"/admin/pipeline/scripts/{SCRIPT_ID}")
+        page = client.get("/admin/pipeline")
         assert page.status_code == 200
-        assert "&lt;/textarea&gt;&lt;script&gt;" in page.text
-        assert "</textarea><script>alert(1)</script>" not in page.text
-        csrf = client.get("/api/admin/session").json()["csrf_token"]
-        sha = ScriptStore(root).read(SCRIPT_ID)["sha256"]
-
-        missing_csrf = client.post(
-            f"/admin/pipeline/scripts/{SCRIPT_ID}",
-            data={"expected_sha256": sha, "content": "#!/usr/bin/env python3\nprint(1)\n"},
-        )
-        assert missing_csrf.status_code == 403
-
-        invalid = client.post(
-            f"/admin/pipeline/scripts/{SCRIPT_ID}",
-            data={"csrf_token": csrf, "expected_sha256": sha, "content": "#!/usr/bin/env python3\nif:\n"},
-        )
-        assert invalid.status_code == 400
-
-        replacement = "#!/usr/bin/env python3\nprint('saved')\n"
-        saved = client.post(
-            f"/admin/pipeline/scripts/{SCRIPT_ID}",
-            data={"csrf_token": csrf, "expected_sha256": sha, "content": replacement},
-            follow_redirects=False,
-        )
-        assert saved.status_code == 303
-        assert (root / SCRIPT_RELATIVE).read_text() == replacement
-
-        stale = client.post(
-            f"/admin/pipeline/scripts/{SCRIPT_ID}",
-            data={"csrf_token": csrf, "expected_sha256": sha, "content": replacement},
-        )
-        assert stale.status_code == 409
-        assert client.get("/admin/pipeline/scripts/not-allowed").status_code == 404
-
-    rows = audit.list()
-    assert any(row["result"].startswith("success:") for row in rows)
-    assert all("print('saved')" not in row["result"] for row in rows)
+        assert "/pipeline/scripts/" not in page.text
+        assert "编辑脚本" not in page.text
+        assert client.get(f"/admin/pipeline/scripts/{SCRIPT_ID}").status_code == 404
+        assert client.post(f"/admin/pipeline/scripts/{SCRIPT_ID}", data={}).status_code == 404

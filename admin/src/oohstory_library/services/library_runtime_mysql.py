@@ -8,7 +8,6 @@ must persist all queue, lease, cover, and reader-metric state here.
 from __future__ import annotations
 
 import json
-import hashlib
 import re
 import socket
 import unicodedata
@@ -267,7 +266,7 @@ class MySQLLibraryRuntime:
             {**item, "title": normalize_catalog_title(item.get("title"))}
             for item in books
         ]
-        stamp = datetime.utcnow()
+        stamp = datetime.now(UTC).replace(tzinfo=None)
         with self.pool.connection() as connection:
             with connection.cursor() as cursor:
                 for item in items:

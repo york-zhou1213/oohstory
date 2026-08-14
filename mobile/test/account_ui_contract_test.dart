@@ -159,6 +159,16 @@ void main() {
     }
     expect(submissions, isNot(contains('AI 审核')));
     expect(submissions, contains('请上传 ZIP。我们会长/短篇结构审核与内容复核完后，并通过消息中心告知您上传结果。'));
+    expect(
+      submissions,
+      contains("message: result['message'] as String? ?? '上传成功，正在等待审核'"),
+    );
+    expect(submissions, contains('showAccountSuccessToast('));
+    expect(submissions, isNot(contains('正在隔离、验毒并检查文件结构')));
+    expect(
+      notifications,
+      contains("'当前状态：\${_resourceStatusLabel(resourceStatus)}'"),
+    );
     expect(notifications, isNot(contains('AI 审核')));
     expect(submissions, contains('覆盖 TXT 全文、EPUB 内部章节'));
     expect(submissions, contains('伪装成正常书籍'));

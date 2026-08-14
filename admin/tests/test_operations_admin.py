@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from oohstory_library.services.error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 from pathlib import Path
 import importlib.machinery
 import importlib.util
@@ -286,7 +288,7 @@ def test_standard_library_multipart_parser_rejects_duplicate_fields():
     ).encode()
     try:
         parse_multipart(f"multipart/form-data; boundary={boundary}", body)
-    except Exception as exc:
+    except RECOVERABLE_OPERATION_ERRORS as exc:
         assert "重复" in str(exc)
     else:
         raise AssertionError("duplicate multipart field must be rejected")

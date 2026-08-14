@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import hashlib
 import os
 import shutil
@@ -41,9 +43,7 @@ class NasObjectStore:
             raise ValueError("sha256 must be a 64-character hexadecimal digest")
         safe_type = asset_type.strip().lower()
         if safe_type == "body":
-            raise ValueError(
-                "body objects are stored directly below txt80/书籍/"
-            )
+            raise ValueError("正文对象直接存放在电子书库根目录的书籍/目录下")
         if safe_type not in {"cover", "archive"}:
             raise ValueError("unsupported object asset type")
         suffix = extension.lower().strip().lstrip(".")
@@ -94,7 +94,7 @@ class NasObjectStore:
                     writer.flush()
                     os.fsync(writer.fileno())
                 os.replace(temporary_name, destination)
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 try:
                     os.unlink(temporary_name)
                 except FileNotFoundError:

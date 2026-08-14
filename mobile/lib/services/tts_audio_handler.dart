@@ -7,6 +7,7 @@ class TtsAudioHandler extends BaseAudioHandler with SeekHandler {
   String _title = '听书';
   String _album = '';
   String _artist = 'OOH Story';
+  Uri? _artUri;
 
   void Function()? onSkipPrev;
   void Function()? onSkipNext;
@@ -17,16 +18,25 @@ class TtsAudioHandler extends BaseAudioHandler with SeekHandler {
     });
   }
 
-  void updateMetadata({String? title, String? album, String? artist}) {
+  void updateMetadata({
+    String? title,
+    String? album,
+    String? artist,
+    Uri? artUri,
+  }) {
     if (title != null) _title = title;
     if (album != null) _album = album;
     if (artist != null) _artist = artist;
-    mediaItem.add(MediaItem(
-      id: 'tts',
-      title: _title,
-      album: _album,
-      artist: _artist,
-    ));
+    if (artUri != null) _artUri = artUri;
+    mediaItem.add(
+      MediaItem(
+        id: 'tts',
+        title: _title,
+        album: _album,
+        artist: _artist,
+        artUri: _artUri,
+      ),
+    );
   }
 
   PlaybackState _buildState(PlayerState state) {
@@ -68,10 +78,9 @@ class TtsAudioHandler extends BaseAudioHandler with SeekHandler {
   @override
   Future<void> stop() async {
     await player.stop();
-    playbackState.add(PlaybackState(
-      processingState: AudioProcessingState.idle,
-      playing: false,
-    ));
+    playbackState.add(
+      PlaybackState(processingState: AudioProcessingState.idle, playing: false),
+    );
   }
 
   @override

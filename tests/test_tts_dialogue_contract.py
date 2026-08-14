@@ -1,65 +1,208 @@
 from __future__ import annotations
 
-import json
-import subprocess
+from tests.frontend_contract_source import frontend_contract_source
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _dialogue_probe() -> dict[str, bool]:
-    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
-    start = script.index("  const ttsAllQuoteRe =")
-    end = script.index("\n\n  const ttsNonNameWords", start)
-    source = script[start:end]
-    cases = [
-        "“你终于来了。”",
-        '"你终于来了。"',
-        "「你终于来了。」",
-        "『你终于来了。』",
-        "【你终于来了。】",
-        "[你终于来了。]",
-        "［你终于来了。］",
-        "林夏：你终于来了。",
-        "林夏: 你终于来了。",
-        "雨还在下，街上没有人。",
-    ]
-    probe = (
-        source
-        + "\nconsole.log(JSON.stringify(Object.fromEntries("
-        + json.dumps(cases, ensure_ascii=False)
-        + ".map(line => [line, ttsIsDialogueLine(line)]))))"
-    )
-    result = subprocess.run(
-        ["node", "--input-type=module", "--eval", probe],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return json.loads(result.stdout)
-
-
-def test_web_smart_tts_recognizes_supported_dialogue_forms() -> None:
-    results = _dialogue_probe()
-
-    assert all(results[line] for line in list(results)[:-1])
-    assert results["雨还在下，街上没有人。"] is False
-
-
 def test_web_tts_rebuilds_active_plan_and_versions_prefetch() -> None:
-    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    script = frontend_contract_source(PROJECT_ROOT)
 
     assert "const ttsSettingsSignature = () => JSON.stringify" in script
-    assert "signature !== ttsSettingsSignature()" in script
-    assert "ttsNextChapterSignature = signature" in script
+    assert "const ttsBackendManifest = async (startParagraph, allowServerResume = true) =>" in script
+    lifecycle = (PROJECT_ROOT / "static" / "audiobook-lifecycle.js").read_text(encoding="utf-8")
+    assert "const responseError = async response =>" in lifecycle
+    assert "const failureNotice = error =>" in lifecycle
+    assert "if (!response.ok) throw await ttsBackendResponseError(response)" in script
+    assert "ttsBackendFailureNotice(error)" in script
+    assert "Number(error?.status) === 401 && /登录状态已失效|请先登录/" in lifecycle
+    assert "Number(error?.status) === 403" in lifecycle
     assert "generation !== ttsPlanGeneration" in script
     assert script.count("ttsScheduleRebuild()") >= 4
     assert "state.ttsController.stop({ preservePending: true })" in script
 
 
+def test_web_tts_voice_selector_shows_only_voice_names() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+
+    assert "key: voice.key, label: voice.label," in script
+    assert "label: `${voice.label} · ${voice.desc}`" not in script
+
+
+def test_web_audiobook_uses_authoritative_manifest_and_volatile_session_cache() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    cache = (PROJECT_ROOT / "static" / "audiobook-cache.js").read_text(encoding="utf-8")
+    assert "fetch('/api/v1/audiobook/sessions'" in script
+    assert "method: 'POST'" in script
+    assert "?text=" not in script[script.index("const ttsBackendManifest"):script.index("const ttsCacheWindow")]
+    manifest_source = script[
+        script.index("  const ttsBackendManifest =") : script.index(
+            "  const ttsCacheWindow ="
+        )
+    ]
+    assert "OOHStoryAudiobookCache.prepare" not in manifest_source
+    assert "full_chapter=1" in script
+    assert "class VolatileAudiobookCache" in cache
+    assert "sessionSegments = new Map" in cache
+    assert "clearPersistentStorage" in cache
+    assert "caches.open" not in cache
+    assert "indexedDB.open" not in cache
+    assert "const TTS_STREAM_BATCH_SEGMENTS = 5" in script
+    assert "stream:${batchStart}" in script
+    assert "row.complete = manifest.segments.every" not in cache
+    assert "lastAccessedAt" not in cache
+    assert "navigator.storage?.estimate?.()" not in cache
+    assert "connection?.saveData" in cache
+    assert "const SEGMENT_STORE = 'segments'" not in cache
+    assert "navigator.locks?.request" not in cache
+
+
+def test_web_audiobook_cancels_on_end_logout_and_keeps_backend_next_chain() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    assert "window.OOHStoryAudiobookCache?.cancel?.()" in script
+    assert "state.ttsController?.stop?.()" in script
+    assert "method: 'DELETE'" in script
+    assert "`/api/v1/audiobook/sessions/${audiobookServerSessionId}/next?from_chapter_id=${encodeURIComponent(fromChapterId)}`" in script
+    rebuild = script[script.index("  const ttsRebuildActivePlan ="):script.index("  const ttsScheduleRebuild =")]
+    assert "ttsBackendManifest(startIdx, false)" in rebuild
+    assert "ttsBuildChapterPlan(ttsParagraphs(), startIdx)" not in rebuild
+
+
+def test_web_audiobook_delegates_prefetch_to_stream_cache() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    window = script[script.index("  const ttsCacheWindow ="):script.index("  const ttsStopPlayback =")]
+    assert "ttsChapterStreamUrl" in window
+    assert "preload=1" in window
+    assert "fetch(url" in window
+    assert "await response.arrayBuffer()" in window
+    assert "OOHStoryAudiobookCache.prepare" not in window
+    assert "ttsContinuousStreamMode) return null" not in window
+
+
+def test_web_audiobook_uses_one_full_chapter_media_source() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    play = script[
+        script.index("  const ttsPlayItem ="):
+        script.index("\n\n  const ttsPrefetchNextChapter", script.index("  const ttsPlayItem ="))
+    ]
+    assert "stream_id=${encodeURIComponent(streamId)}&continuous=1&full_chapter=1`" in play
+    assert "ttsContinuousStreamMode = true" in script
+    assert "? ttsChapterPlan.length" in script
+    assert "if (!ttsChapterPlan[idx]?.durationExact)" in script
+    assert "audio.src = item.url" not in play
+    assert "audio.ontimeupdate = ttsSyncStreamPosition" in play
+    assert "const nextBatchIdx" not in play
+    assert "ttsChapterEnd()" in play
+    assert "ttsConfirmStreamComplete(streamId, generation)" in play
+    assert "ttsActiveStreamId !== streamId" in play
+    assert "ttsStreamEnding = false" in script
+    assert "ttsStreamEnding = true" in play
+    assert "if (ttsContinuousStreamMode) {" not in play
+    assert "ttsSetActiveItem(finalPlanIndex)" in play
+    assert "audio batch ended before its final segment" in play
+    assert "本组音频流中断，已停在当前段，点击重试" in play
+    assert "chapter stream failed; switching to finite segment playback" in play
+    assert "ttsFallbackPlayback.play(fallbackIdx, fallbackOffset)" in play
+    assert "ttsPrefetchNextChapter().catch(() => {})" in play
+    assert "limit=${TTS_STREAM_BATCH_SEGMENTS}" in script
+    assert "limit=24" not in script
+    assert "retryCount < 6" not in play
+
+
+def test_web_audiobook_does_not_resume_ended_chapter_stream_during_transition() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    resume = script[
+        script.index("  const ttsResumePlayback ="):
+        script.index("\n\n  const restartTTSFromChapterStart", script.index("  const ttsResumePlayback ="))
+    ]
+    visibility = script[
+        script.index("  visibilityListener ="):
+        script.index("  window.addEventListener('pagehide'", script.index("  visibilityListener ="))
+    ]
+    chapter_end = script[
+        script.index("  const ttsChapterEnd = async () =>"):
+        script.index("\n\n  const ttsUpdateMediaSession", script.index("  const ttsChapterEnd = async () =>"))
+    ]
+
+    assert "if (!state.reader.ttsActive || ttsStreamEnding) return" in resume
+    assert "!ttsStreamEnding && !ttsLifecycle.isPausedByUser()" in visibility
+    assert "ttsStreamEnding = false; ttsMarkPlaybackBlocked" in chapter_end
+
+
+def test_web_media_session_uses_current_book_cover_artwork() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    media = script[
+        script.index("  const ttsUpdateMediaSession ="):
+        script.index("\n\n  const ttsEstimatedDuration", script.index("  const ttsUpdateMediaSession ="))
+    ]
+
+    assert "state.ttsSession?.mediaCoverUrl" in media
+    assert "artwork: [{ src: cover }]" in media
+    assert "`/api/v1/books/${requestedBookId}/cover?variant=media-art`" in media
+    assert "mediaCoverUrl: `/api/v1/books/${requestedBookId}/cover?variant=media-art`" in script
+
+
+def test_web_audiobook_has_a_finite_segment_fallback_for_stalled_chapter_streams() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    fallback = (PROJECT_ROOT / "static" / "audiobook-fallback.js").read_text(encoding="utf-8")
+    timeline = script[
+        script.index("  const ttsRefreshTimeline ="):
+        script.index("\n  const ttsNewStreamId", script.index("  const ttsRefreshTimeline ="))
+    ]
+    play = script[
+        script.index("  const ttsPlayItem ="):
+        script.index("\n\n  const ttsPrefetchNextChapter", script.index("  const ttsPlayItem ="))
+    ]
+
+    assert "if (timelineStart > lastAbsolute) return true" in timeline
+    assert "method: 'POST'" in fallback
+    assert "response.blob()" in fallback
+    assert "play(index + 1)" in fallback
+    assert "const BATCH_SIZE = 5" in fallback
+    assert "prepareBatchRemainder" in fallback
+    assert "Math.max(1000, Number(options.timeoutMs) || 8000)" in fallback
+    assert "正在生成当前片段" in script
+    assert "chapter stream connection stalled; switching to finite segment playback" in play
+    assert "Math.max(idx, ttsPlanIndex, ttsTrustedPlanIndex)" in play
+    assert "ttsFallbackPlayback.play(fallbackIdx, fallbackIdx === ttsTrustedPlanIndex ? ttsTrustedItemOffsetSeconds : ttsCurrentItemOffsetSeconds(fallbackIdx))" in play
+    assert "media stream replayed from the beginning; reopening at trusted position" in script
+    assert "ttsRecoverFromStreamReplay()" in script
+    assert "audio.removeAttribute('src')" in play
+    assert "OOHStoryAudiobookConnectTimeoutMs || 8000" in script
+    assert "progress: force => ttsQueueServerProgress(force)" in script
+    assert "progress: ttsQueueServerProgress" not in script
+
+
+def test_finite_segment_endpoint_returns_a_bounded_response() -> None:
+    backend = (PROJECT_ROOT / "app" / "main.py").read_text(encoding="utf-8")
+    endpoint = backend[
+        backend.index("async def audiobook_segment_audio"):
+        backend.index("\n\n@", backend.index("async def audiobook_segment_audio"))
+    ]
+    assert "return Response(" in endpoint
+    assert "content=audio" in endpoint
+    assert "StreamingResponse(iter([audio])" not in endpoint
+    assert "await _audiobook_segment_while_active(" in endpoint
+    assert 'raise HTTPException(409, "听书会话已结束")' in endpoint
+
+
+def test_web_audiobook_counts_only_readable_chapters_and_commits_real_transitions() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+
+    assert "const ttsChapterMetrics = chapterId =>" in script
+    assert "catalog.chapters.filter(item => !isFrontMatterChapter(item))" in script
+    assert "count: exactCount > 0 ? exactCount" in script
+    assert "chapterNumber: chapterMetrics.number" in script
+    assert "chapterCount: chapterMetrics.count" in script
+    assert "await ttsActivateChapter(enteringChapterId)" in script
+    assert "/chapters/${encodeURIComponent(chapterId)}/activate`" in script
+    assert "?from_chapter_id=${encodeURIComponent(fromChapterId)}`" in script
+
+
 def test_web_tts_keeps_ios_audio_unlock_during_hot_switch() -> None:
-    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    script = frontend_contract_source(PROJECT_ROOT)
     play_start = script.index("  const ttsPlayItem =")
     play_end = script.index("\n\n  const ttsPrefetchNextChapter", play_start)
     play_source = script[play_start:play_end]
@@ -67,25 +210,124 @@ def test_web_tts_keeps_ios_audio_unlock_during_hot_switch() -> None:
     rebuild_end = script.index("\n\n  const startTTS =", rebuild_start)
     rebuild_source = script[rebuild_start:rebuild_end]
 
-    assert "audio.src = item.url" in play_source
+    assert "stream_id=${encodeURIComponent(streamId)}&continuous=1&full_chapter=1`" in play_source
     assert "await ttsGetBlobUrl" not in play_source
     assert "ttsStopPlayback()" not in rebuild_source
-    assert "if (audio.paused || audio.ended || !audio.src || ttsPlaybackBlocked)" in rebuild_source
-    assert "if (ttsRebuildRequested)" in play_source
+    assert "audio.ontimeupdate = null" in rebuild_source
+    assert "ttsRebuildTimer = window.setTimeout" in script
 
 
 def test_web_tts_does_not_skip_safari_policy_rejections() -> None:
-    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    script = frontend_contract_source(PROJECT_ROOT)
 
     assert "['NotAllowedError', 'AbortError']" in script
     assert "ttsMarkPlaybackBlocked(error)" in script
     assert "点击继续智能听书" in script
-    assert "else if (ttsPlaybackBlocked) ttsResumePlayback()" in script
-    assert "onclick: openTTS" in script
+    open_tts = script[
+        script.index("  const restartTTSFromChapterStart = () =>"):
+        script.index("\n\n  desktopProgressFill", script.index("  const restartTTSFromChapterStart = () =>"))
+    ]
+    assert "startTTS(0)" in open_tts
+    assert "ttsResumePlayback()" not in open_tts
+    assert "onclick: restartTTSFromChapterStart" in script
+
+
+def test_web_tts_full_exit_is_immediate_and_reentry_safe() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    stop_playback = script[
+        script.index("  const ttsStopPlayback ="):
+        script.index("\n\n  const ttsModeLabel", script.index("  const ttsStopPlayback ="))
+    ]
+    stop_session = script[
+        script.index("  const stopTTS ="):
+        script.index("\n\n  const ttsFirstVisibleParagraph", script.index("  const stopTTS ="))
+    ]
+    runtime = (PROJECT_ROOT / "tests" / "tts_ios_webkit_runtime.js").read_text(encoding="utf-8")
+
+    assert "let ttsAudioUnlockGeneration = 0" in script
+    assert "const unlockGeneration = ++ttsAudioUnlockGeneration" in script
+    assert "unlockGeneration !== ttsAudioUnlockGeneration || audio !== ttsAudioEl" in script
+    assert "ttsAudioUnlockGeneration++" in stop_playback
+    assert "ttsAudioEl = null" not in stop_playback
+    assert "ttsAudioUnlocked = false" not in stop_playback
+    assert "if (ttsAudioUnlockPromise && !ttsAudioUnlocked)" not in script
+    assert "audio.onplaying = markActuallyPlaying" in script
+    assert "if (ttsLifecycle.snapshot().state === 'connecting') ttsLifecycle.playing()" in script
+    assert "Promise.resolve(playPromise).then(markActuallyPlaying)" in script
+    delete_call = "fetch(`/api/v1/audiobook/sessions/${closingSessionId}`"
+    assert delete_call in stop_session
+    assert "if (closingSessionId) audiobookAbortController?.abort()" in stop_session
+    assert "Promise.resolve(finalProgress).finally" not in stop_session
+    assert "for (let round = 0; round < 3; round++)" in runtime
+    assert "pause must stop the active stream" in runtime
+    assert "paused === false" in runtime
+
+
+def test_web_tts_preserves_the_requested_smart_narrator_contract() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    manifest = script[
+        script.index("  const ttsBackendManifest ="):
+        script.index("\n\n  const ttsCacheWindow", script.index("  const ttsBackendManifest ="))
+    ]
+    runtime = (PROJECT_ROOT / "tests" / "tts_ios_webkit_runtime.js").read_text(encoding="utf-8")
+
+    assert "const requestedNarrator = String(state.reader.ttsNarrator || 'mocheng')" in manifest
+    assert "fetch('/api/v1/tts/voices'" in script
+    assert "const ttsMandarinPool" not in script
+    assert "const streamId = ttsNewStreamId()" in script
+    assert "chapter stream failed; switching to finite segment playback" in script
+    assert "正在连接音频" in script
+    assert "modeVoiceFilter = policy.mode_languages || {}" in script
+    assert "narrator: requestedNarrator" in manifest
+    assert "responseRequestedNarrator !== requestedNarrator || effectiveNarrator !== requestedNarrator" in manifest
+    assert "error.code = 'narrator_voice_mismatch'" in manifest
+    assert "state.ttsSession.requestedNarrator = requestedNarrator" in manifest
+    assert "state.ttsSession.effectiveNarrator = effectiveNarrator" in manifest
+    assert "payload.narrator === 'lingxian'" in runtime
+    assert "payload.current?.effective_narrator === 'lingxian'" in runtime
+
+
+def test_web_tts_manifest_failure_is_visible_and_retryable() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    css = (PROJECT_ROOT / "static" / "styles.css").read_text(encoding="utf-8")
+
+    lifecycle = (PROJECT_ROOT / "static" / "audiobook-lifecycle.js").read_text(encoding="utf-8")
+    assert "toast.className = 'tts-error-toast'" in lifecycle
+    assert "toast.setAttribute('role', 'alert')" in lifecycle
+    assert "tts-error-toast-retry" in lifecycle
+    assert "if (!ttsChapterPlan.length)" in script
+    assert "ttsRebuildActivePlan()" in script
+    assert ".tts-error-toast-retry" in css
+
+
+def test_reader_settings_offer_a_true_audiobook_exit_and_hide_it_when_inactive() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    css = (PROJECT_ROOT / "static" / "styles.css").read_text(encoding="utf-8")
+
+    assert "let ttsExitControl = null" in script
+    assert "class: 'reader-tts-exit'" in script
+    assert "text: '退出听书'" in script
+    assert "if (ttsExitControl) ttsExitControl.hidden = !state.reader.ttsActive" in script
+    exit_start = script.index("ttsExitControl = node('section'")
+    exit_source = script[exit_start:script.index("  const setSettingsVisible", exit_start)]
+    assert "stopTTS()" in exit_source
+    assert "setSettingsVisible(false)" in exit_source
+    assert ".reader-tts-exit[hidden]" in css
+
+
+def test_mobile_paged_modes_use_compact_bottom_spacing_without_changing_vertical_mode() -> None:
+    css = (PROJECT_ROOT / "static" / "styles.css").read_text(encoding="utf-8")
+
+    paged_start = css.index(".reader-stage:not(.reader-mode-vertical) .reader-content")
+    paged = css[paged_start:css.index(".reader-stage.reader-mode-cover .reader-content", paged_start)]
+    assert "max(12px, env(safe-area-inset-bottom))" in paged
+    assert "margin-bottom: .56em" in paged
+    assert "orphans: 1" in paged
+    assert "widows: 1" in paged
 
 
 def test_web_tts_does_not_skip_dialogue_on_audio_error() -> None:
-    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    script = frontend_contract_source(PROJECT_ROOT)
     play_start = script.index("  const ttsPlayItem =")
     play_end = script.index("\n\n  const ttsPrefetchNextChapter", play_start)
     play_source = script[play_start:play_end]
@@ -93,34 +335,52 @@ def test_web_tts_does_not_skip_dialogue_on_audio_error() -> None:
     failure_end = play_source.index("\n    audio.onended =", failure_start)
     failure_source = play_source[failure_start:failure_end]
 
-    assert "音频加载失败，点击重试" in failure_source
+    assert "chapter stream failed; switching to finite segment playback" in failure_source
+    assert "ttsFallbackPlayback.play(fallbackIdx, fallbackOffset)" in failure_source
     assert "ttsPlayItem(idx + 1)" not in failure_source
-    assert "URL.createObjectURL" not in script[script.index("  const ttsCachePrefetch ="):play_start]
+    assert "URL.createObjectURL" not in play_source
 
 
-def test_web_tts_rotates_unlabelled_dialogue_voices() -> None:
-    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
-    plan_start = script.index("  const ttsBuildChapterPlan =")
-    plan_end = script.index("\n\n  const TTS_PREFETCH_AHEAD", plan_start)
-    plan_source = script[plan_start:plan_end]
+def test_web_tts_has_no_frontend_character_or_voice_guessing_fallback() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
 
-    assert "const gender = ttsInferContextGender(line)" in plan_source
-    assert "gender === 'female' ? ttsFemalePool" in plan_source
-    assert "gender === 'male' ? ttsMalePool" in plan_source
-    assert "lastSpeakerVoice" not in plan_source
+    assert "ttsInferContextGender" not in script
+    assert "ttsBuildSpeakerMap" not in script
+    assert "ttsBuildChapterPlan" not in script
 
 
-def test_web_tts_keeps_a_ten_item_sliding_prefetch_window() -> None:
-    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+def test_web_tts_prefetches_only_one_five_segment_next_chapter_batch() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    cache_start = script.index("  const ttsCacheWindow =")
+    cache_source = script[cache_start:script.index("\n  const ttsStopPlayback", cache_start)]
 
-    assert "const TTS_PREFETCH_AHEAD = 10" in script
-    assert "ttsChapterPlan.slice(fromIdx, fromIdx + TTS_PREFETCH_AHEAD)" in script
-    assert "TTS_PREFETCH_AHEAD - windowItems.length" in script
-    assert "if (!keepUrls.has(url)) ttsCache.delete(url)" in script
+    assert "ttsChapterStreamUrl" in cache_source
+    assert "preload=1" in cache_source
+    assert "await response.arrayBuffer()" in cache_source
+    assert "OOHStoryAudiobookCache.prepare" not in cache_source
+    assert "window.OOHStoryAudiobookCache.prepare(" not in script
+    assert "|| ttsContinuousStreamMode" not in cache_source
+    assert "idx >= Math.max(0, ttsChapterPlan.length - 2)" in script
+    assert "TTS_PREFETCH_AHEAD" not in script
+
+
+def test_web_tts_next_chapter_manifest_is_not_blocked_by_prefetch_capacity() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    start = script.index("  const ttsPrefetchNextChapter = async () =>")
+    source = script[start:script.index("\n\n  const ttsQueueServerProgress", start)]
+
+    manifest_fetch = source.index("next?from_chapter_id")
+    plan_assign = source.index("ttsNextChapterPlan = nextPlan")
+    capacity_check = source.index("OOHStoryAudiobookCache.shouldPrefetch")
+    assert manifest_fetch < capacity_check
+    assert plan_assign < capacity_check
+    assert "ttsNextChapterStreamUrl" in source
+    assert "?start=${encodeURIComponent(firstIndex)}&preload=1" in source
+    assert "await preload.arrayBuffer()" in source
 
 
 def test_web_tts_can_detach_and_return_without_stopping_audio() -> None:
-    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    script = frontend_contract_source(PROJECT_ROOT)
     html = (PROJECT_ROOT / "static" / "index.html").read_text(encoding="utf-8")
     css = (PROJECT_ROOT / "static" / "styles.css").read_text(encoding="utf-8")
 
@@ -133,7 +393,7 @@ def test_web_tts_can_detach_and_return_without_stopping_audio() -> None:
 
 
 def test_web_tts_opens_a_dedicated_mobile_player_without_replacing_audio() -> None:
-    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    script = frontend_contract_source(PROJECT_ROOT)
     html = (PROJECT_ROOT / "static" / "index.html").read_text(encoding="utf-8")
     css = (PROJECT_ROOT / "static" / "styles.css").read_text(encoding="utf-8")
 
@@ -144,22 +404,44 @@ def test_web_tts_opens_a_dedicated_mobile_player_without_replacing_audio() -> No
     assert ".tts-player" in css
     assert "bottom: max(82px, calc(env(safe-area-inset-bottom) + 78px));" in css
     assert "function openTtsPlayer()" in script
+    assert "ttsPlayer.scrollTop = 0" in script
     assert "globalTtsReturn?.addEventListener('click', openTtsPlayer)" in script
+    state_bar = script[
+        script.index("(ttsStateBar = node('button'"):
+        script.index("  ].filter(Boolean))", script.index("(ttsStateBar = node('button'"))
+    ]
+    assert "onclick: openTtsPlayer" in state_bar
+    assert "onclick: restartTTSFromChapterStart" not in state_bar
     assert "pause: () =>" in script
     assert "previous: () =>" in script
     assert "next: () =>" in script
     assert "ttsPlayerStop?.addEventListener" in script
     assert script.count("let ttsAudioEl = null") == 1
+    assert script.count("const ttsEnsureAudio = () =>") == 1
+    assert script.index("const ttsEnsureAudio = () =>") < script.index("const startTTS =")
+    assert "const ttsPrimeAudioFromGesture = () =>" in script
+    assert "audio.src = TTS_AUDIO_UNLOCK_SRC" in script
+    assert "ttsPrimeAudioFromGesture()" in script
+    start_source = script[script.index("  const startTTS ="):script.index("\n\n  const ttsResumePlayback")]
+    assert start_source.index("ttsPrimeAudioFromGesture()") < start_source.index("state.reader.ttsActive = true")
+    open_tts = script[
+        script.index("  const restartTTSFromChapterStart = () =>"):
+        script.index("\n\n  desktopProgressFill", script.index("  const restartTTSFromChapterStart = () =>"))
+    ]
+    assert "startTTS(0)" in open_tts
+    assert "openTtsPlayer()" in open_tts
+    assert "console.error('[TTS] player initialization failed', error)" in script
+    assert "'paragraphs:', ttsParagraphs().length" in script
+    assert "'paragraphs:', paragraphs.length" not in script
 
 
 def test_web_tts_supports_auto_and_manual_emotion_modes() -> None:
-    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    script = frontend_contract_source(PROJECT_ROOT)
     html = (PROJECT_ROOT / "static" / "index.html").read_text(encoding="utf-8")
     css = (PROJECT_ROOT / "static" / "styles.css").read_text(encoding="utf-8")
 
     assert script.count("desc: '") >= 13
-    assert "const ttsEmotionForText = text => state.reader.ttsEmotion === 'auto'" in script
-    assert "new URLSearchParams({ text: cleaned, voice, rate, emotion })" in script
+    assert "/api/v1/tts/speak" not in script
     assert "emotion: state.reader.ttsEmotion" in script
     assert "setEmotion: value =>" in script
     assert 'id="tts-player-emotion"' in html
@@ -169,32 +451,41 @@ def test_web_tts_supports_auto_and_manual_emotion_modes() -> None:
 
 
 def test_web_mobile_tts_starts_and_tracks_from_top_visible_line() -> None:
-    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    script = frontend_contract_source(PROJECT_ROOT)
 
     assert "sort((a, b) => a.rect.top - b.rect.top)" in script
     assert "visible[0].paragraph.dataset.ttsIndex" in script
     assert "window.matchMedia('(max-width: 720px)').matches ? 'start' : 'center'" in script
 
 
+def test_web_tts_retries_highlight_when_reader_paragraph_is_not_attached() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+
+    assert "let ttsPendingHighlightIndex = null" in script
+    assert "const ttsScheduleHighlightRetry = index =>" in script
+    assert "requestAnimationFrame(() =>" in script
+    assert "const ttsActiveHighlightPresent = index =>" in script
+    assert "if (!ttsActiveHighlightPresent(item.paraIdx)) ttsHighlight(item.paraIdx)" in script
+
+
 def test_web_tts_discards_stale_prefetch_results_after_rebuild() -> None:
-    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    script = frontend_contract_source(PROJECT_ROOT)
 
-    assert "let ttsCacheEpoch = 0" in script
-    assert "epoch !== ttsCacheEpoch || ttsCachePromises.get(url) !== p" in script
-    assert "ttsCacheEpoch++" in script
+    assert "audiobookAbortController?.abort()" in script
+    assert "window.OOHStoryAudiobookCache?.cancel?.()" in script
+    assert "ttsFallbackPlayback?.release()" in script
 
 
-def test_web_tts_splits_long_paragraphs_without_losing_paragraph_identity() -> None:
-    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+def test_backend_tts_splits_long_paragraphs_without_losing_paragraph_identity() -> None:
+    backend = (PROJECT_ROOT / "app" / "audiobook.py").read_text(encoding="utf-8")
 
-    assert "const TTS_REQUEST_CHAR_LIMIT = 900" in script
-    assert "const ttsSplitForRequest = text =>" in script
-    assert "ttsAppendPlan(plan, line, state.reader.ttsVoice, i)" in script
-    assert "ttsAppendPlan(plan, seg.text, seg.voice, i)" in script
+    assert "def split_tts_text(value: str, limit: int = 450)" in backend
+    assert '"paragraph_index": paragraph_index' in backend
+    assert "for chunk in split_tts_text" in backend
 
 
 def test_web_tts_preserves_unlocked_audio_across_automatic_chapter_route() -> None:
-    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    script = frontend_contract_source(PROJECT_ROOT)
     load_reader = script.index("async function loadReader")
     stop_start = script.index("  const stopTTS =")
     stop_end = script.index("\n\n  const ttsFirstVisibleParagraph", stop_start)
@@ -206,11 +497,12 @@ def test_web_tts_preserves_unlocked_audio_across_automatic_chapter_route() -> No
     assert "ttsAudioEl.onended = null" in stop_source
     assert "ttsAudioEl.onerror = null" in stop_source
     assert "else {\n      ttsStopPlayback()" in stop_source
+    assert "ttsAudioEl = null" not in stop_source
     assert "state.ttsController.stop({ preservePending: true })" in script
 
 
 def test_web_tts_adopts_prefetched_chapter_without_stopping_the_player() -> None:
-    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    script = frontend_contract_source(PROJECT_ROOT)
     chapter_end_start = script.index("  const ttsChapterEnd = async () =>")
     chapter_end_end = script.index("\n\n  const ttsUpdateMediaSession", chapter_end_start)
     chapter_end = script[chapter_end_start:chapter_end_end]

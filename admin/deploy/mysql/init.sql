@@ -13,19 +13,23 @@ ALTER DATABASE `oohstory_library`
     CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 USE `oohstory_library`;
 
-CREATE TEMPORARY TABLE `_oohstory_fresh_schema_guard` (
-    allowed TINYINT NOT NULL,
-    CONSTRAINT `OOHStory init requires a fresh empty database`
-        CHECK (allowed = 1)
-);
-INSERT INTO `_oohstory_fresh_schema_guard` (allowed)
-SELECT IF(EXISTS (
-    SELECT 1
-    FROM information_schema.tables
-    WHERE table_schema = DATABASE()
-    LIMIT 1
-), 0, 1);
-DROP TEMPORARY TABLE `_oohstory_fresh_schema_guard`;
+DELIMITER $$
+CREATE PROCEDURE oohstory_assert_empty_schema()
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = DATABASE()
+        LIMIT 1
+    ) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT =
+                'OOHStory init requires a fresh empty database';
+    END IF;
+END$$
+DELIMITER ;
+CALL oohstory_assert_empty_schema();
+DROP PROCEDURE oohstory_assert_empty_schema;
 
 SOURCE deploy/mysql/001_library_schema.sql;
 INSERT INTO schema_migrations (version, checksum, description)
@@ -119,16 +123,9 @@ VALUES ('022', 'bbf8c42cf07b3cfef18628c69d7ecb278bdf5fb18535aaa1eb50a51f5c4cdb3a
 -- deploy/mysql/runtime-users.sql with server-generated passwords.
 CREATE ROLE IF NOT EXISTS
     'oohstory_library_reader_role'@'%',
-    'oohstory_public_reader_role'@'%',
     'oohstory_library_writer_role'@'%';
 GRANT SELECT ON `oohstory_library`.*
     TO 'oohstory_library_reader_role'@'%';
-GRANT SELECT ON `oohstory_library`.*
-    TO 'oohstory_public_reader_role'@'%';
-GRANT INSERT, UPDATE ON `oohstory_library`.book_public_metrics
-    TO 'oohstory_public_reader_role'@'%';
-GRANT SELECT, INSERT, UPDATE ON `oohstory_library`.book_public_metric_visitors
-    TO 'oohstory_public_reader_role'@'%';
 GRANT SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES
     ON `oohstory_library`.*
     TO 'oohstory_library_writer_role'@'%';

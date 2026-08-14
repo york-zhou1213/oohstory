@@ -7,6 +7,8 @@ operational queue client.
 
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import hashlib
 import json
 import threading
@@ -161,7 +163,7 @@ class RedisHotCache:
             return 0
         try:
             return int(self.client.get(self._key(f"generation:{scope}")) or 0)
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             self._metric("errors")
             return 0
 
@@ -232,7 +234,7 @@ class RedisHotCache:
                 raise ValueError("invalid cached JSON shape")
             self._metric("hits")
             return value
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             self._metric("errors")
             self._metric("misses")
             return None
@@ -266,7 +268,7 @@ class RedisHotCache:
                 raw,
             )
             return True
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             self._metric("errors")
             return False
 
@@ -281,7 +283,7 @@ class RedisHotCache:
                 generations[scope] = int(
                     self.client.incr(self._key(f"generation:{scope}"))
                 )
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 self._metric("errors")
         return generations
 
@@ -335,7 +337,7 @@ class RedisHotCache:
                             ttl_seconds=current_ttl,
                             generation=current_generation,
                         )
-                except Exception:
+                except RECOVERABLE_OPERATION_ERRORS:
                     self._metric("errors")
                 with self._warm_lock:
                     pending = self._warm_pending.pop(token, None)
@@ -349,7 +351,7 @@ class RedisHotCache:
         try:
             self._executor.submit(run)
             return True
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             with self._warm_lock:
                 self._warming.discard(token)
             self._warm_slots.release()
@@ -390,7 +392,7 @@ class RedisHotCache:
                     "maxmemory-policy", ""
                 )
             result["policy"] = str(policy or "")
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             self._metric("errors")
             result["errors"] += 1
         return result

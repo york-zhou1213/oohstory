@@ -24,11 +24,10 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from project_paths import APP_ROOT  # noqa: E402
 BACKEND_ROOT = APP_ROOT / "src"
-DEFAULT_SOURCE = APP_ROOT / "electronic-library" / "txt80" / "catalog.sqlite3"
+DEFAULT_SOURCE = APP_ROOT / "electronic-library" / "catalog.sqlite3"
 DEFAULT_MEMBERSHIP = (
     APP_ROOT
     / "electronic-library"
-    / "txt80"
     / "全局索引"
     / "library_memberships.sqlite3"
 )

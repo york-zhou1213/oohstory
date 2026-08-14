@@ -1,0 +1,1 @@
+oohstory-nas ALL=(root) NOPASSWD: /usr/local/sbin/oohstory-nas-ensure-client *

@@ -14,7 +14,7 @@ from typing import Any
 
 
 from project_paths import APP_ROOT  # noqa: E402
-LIBRARY_ROOT = APP_ROOT / "electronic-library" / "txt80"
+LIBRARY_ROOT = APP_ROOT / "electronic-library"
 RUNTIME_DIR = LIBRARY_ROOT / "全局索引"
 QUEUE_PATH = RUNTIME_DIR / "authorized-postprocess.sqlite3"
 LOCK_PATH = RUNTIME_DIR / "authorized-postprocess.lock"

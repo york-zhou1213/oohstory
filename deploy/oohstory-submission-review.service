@@ -7,7 +7,7 @@ RequiresMountsFor=/srv/oohstory/library
 [Service]
 Type=oneshot
 EnvironmentFile=-/etc/oohstory-reader/submission-review.env
-User=oohstory
+User=root
 Group=oohstory
 WorkingDirectory=/opt/oohstory-reader
 Environment=PYTHONUNBUFFERED=1
@@ -33,5 +33,6 @@ MemoryDenyWriteExecute=false
 LockPersonality=true
 UMask=0007
 ReadOnlyPaths=/opt/oohstory-reader
+ReadWritePaths=/var/lib/openclaw
 ReadWritePaths=/var/lib/oohstory-reader
 ReadWritePaths=/srv/oohstory/library/全局索引/用户投稿队列

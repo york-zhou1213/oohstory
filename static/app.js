@@ -255,10 +255,26 @@ const state = {
 }
 // Keep one media element for the lifetime of the page. Safari/iOS grants
 // autoplay permission to the element that received the user's initial tap;
-// replacing it while routing to the next chapter loses that permission.
+// replacing it while routing or re-entering listening loses that permission.
 let ttsAudioEl = null
+let ttsAudioUnlockPromise = null
+let ttsAudioUnlocked = false
+let ttsAudioUnlockGeneration = 0
+let ttsProgressTimer = null
+const TTS_AUDIO_UNLOCK_SRC = 'data:audio/wav;base64,UklGRrQBAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YZABAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA'
 const TTS_CHECKPOINT_STORAGE_KEY = 'oohstory-tts-checkpoint'
-
+const TTS_STREAM_BATCH_SEGMENTS = 5
+const AUDIOBOOK_CLIENT_STORAGE_KEY = 'oohstory-audiobook-client-id'
+const audiobookClientId = (() => {
+  let value = localStorage.getItem(AUDIOBOOK_CLIENT_STORAGE_KEY) || ''
+  if (!/^[A-Za-z0-9_-]{16,96}$/.test(value)) {
+    const bytes = crypto.getRandomValues(new Uint8Array(18))
+    value = btoa(String.fromCharCode(...bytes)).replace(/[+/=]/g, '')
+    localStorage.setItem(AUDIOBOOK_CLIENT_STORAGE_KEY, value)
+  }
+  return value
+})()
+window.OOHStoryAudiobookClientId = audiobookClientId
 function readTtsCheckpoint(bookId, chapterId) {
   try {
     const checkpoint = JSON.parse(localStorageGet(TTS_CHECKPOINT_STORAGE_KEY) || 'null')
@@ -269,7 +285,6 @@ function readTtsCheckpoint(bookId, chapterId) {
     return null
   }
 }
-
 function saveTtsCheckpoint(session) {
   if (!session?.bookId || !session?.chapterId) return
   localStorageSet(TTS_CHECKPOINT_STORAGE_KEY, JSON.stringify({
@@ -277,12 +292,12 @@ function saveTtsCheckpoint(session) {
     chapterId: String(session.chapterId),
     paragraphIndex: Math.max(0, Number(session.paragraphIndex) || 0),
     itemIndex: Math.max(0, Number(session.itemIndex) || 0),
+    absoluteItemIndex: Math.max(0, Number(session.absoluteItemIndex ?? session.itemIndex) || 0),
     returnPath: String(session.returnPath || ''),
     updatedAt: Date.now()
   }))
 }
 const READER_CHAPTER_CACHE_LIMIT = 8
-
 const ttsPlayerModeLabels = {
   normal: ['普通', '普通演绎'],
   smart: ['智能', '多角色智能演绎'],
@@ -303,15 +318,19 @@ const ttsEmotionModes = {
   solemn: { label: '庄重', desc: '沉稳肃穆、字句清晰' },
   affectionate: { label: '深情', desc: '细腻温暖、情感绵长' },
   humorous: { label: '诙谐', desc: '灵动俏皮、节拍跳跃' },
-  weary: { label: '疲惫', desc: '缓慢虚弱、气息低落' }
+  weary: { label: '疲惫', desc: '缓慢虚弱、气息低落' },
+  surprised: { label: '惊讶', desc: '语调上扬、反应鲜明' },
+  comforting: { label: '安抚', desc: '柔和放慢、给予安全感' },
+  confident: { label: '笃定', desc: '节奏稳健、语气有力' },
+  shy: { label: '羞怯', desc: '轻柔迟疑、情绪内收' },
+  disgusted: { label: '厌恶', desc: '冷硬克制、排斥感突出' },
+  whispering: { label: '低语', desc: '压低声线、贴近耳语' }
 }
-
 function closeTtsEmotionSheet() {
   if (!ttsEmotionSheet) return
   ttsEmotionSheet.hidden = true
   ttsEmotionSheet.setAttribute('aria-hidden', 'true')
 }
-
 function renderTtsEmotionOptions() {
   if (!ttsEmotionOptions || ttsEmotionOptions.childElementCount) return
   Object.entries(ttsEmotionModes).forEach(([key, item]) => {
@@ -330,7 +349,6 @@ function renderTtsEmotionOptions() {
     ttsEmotionOptions.append(button)
   })
 }
-
 function openTtsEmotionSheet() {
   if (!ttsEmotionSheet || !state.ttsSession?.active) return
   renderTtsEmotionOptions()
@@ -339,11 +357,9 @@ function openTtsEmotionSheet() {
   updateTtsPlayer()
   ttsEmotionSheet.querySelector(`[data-emotion="${state.reader.ttsEmotion}"]`)?.focus({ preventScroll: true })
 }
-
 function ttsPlayerIsOpen() {
   return Boolean(ttsPlayer && !ttsPlayer.hidden)
 }
-
 function closeTtsPlayer() {
   if (!ttsPlayer) return
   closeTtsEmotionSheet()
@@ -353,7 +369,6 @@ function closeTtsPlayer() {
   if (state.ttsSession) state.ttsSession.playerOpen = false
   updateGlobalTtsReturn()
 }
-
 function updateTtsPlayer() {
   if (!ttsPlayer) return
   const session = state.ttsSession
@@ -363,16 +378,30 @@ function updateTtsPlayer() {
   }
   const itemIndex = Math.max(0, Number(session.itemIndex) || 0)
   const itemCount = Math.max(1, Number(session.itemCount) || 1)
-  const progress = Math.min(100, ((itemIndex + 1) / itemCount) * 100)
+  const absoluteItemIndex = Math.max(0, Number(session.absoluteItemIndex ?? itemIndex) || 0)
+  const absoluteItemCount = Math.max(1, Number(session.absoluteItemCount ?? itemCount) || 1)
+  // The reader cursor is paragraph-based while smart narration can split one
+  // paragraph into several speaker segments. Showing segment progress beside
+  // a paragraph cursor makes the two appear to drift even when playback is
+  // correct. Keep transcript navigation segment-based, but expose reading
+  // progress through the same paragraph coordinate as the highlighted line.
+  const paragraphIndex = Math.max(0, Number(session.paragraphIndex) || 0)
+  const paragraphCount = Math.max(1, Number(session.paragraphCount) || 1)
+  const progress = Math.min(100, ((paragraphIndex + 1) / paragraphCount) * 100)
   const mode = ttsPlayerModeLabels[state.reader.ttsMode] || ttsPlayerModeLabels.normal
   const selectedEmotion = ttsEmotionModes[state.reader.ttsEmotion] || ttsEmotionModes.auto
   const activeEmotion = ttsEmotionModes[session.currentEmotion] || ttsEmotionModes.neutral
   const isPlaying = ttsSessionIsPlaying()
   const isBlocked = Boolean(session.playbackBlocked)
+  const isConnecting = Boolean(session.playbackConnecting)
   ttsPlayer.classList.toggle('is-playing', isPlaying)
   ttsPlayer.classList.toggle('is-paused', !isPlaying)
   ttsPlayer.classList.toggle('is-blocked', isBlocked)
-  if (ttsPlayerHeading) ttsPlayerHeading.textContent = isBlocked ? '等待继续播放' : isPlaying ? '正在播放' : '已暂停'
+  if (ttsPlayerHeading) ttsPlayerHeading.textContent = isBlocked
+    ? '等待继续播放'
+    : isConnecting
+      ? String(session.playbackStatusText || '正在连接音频')
+      : isPlaying ? '正在播放' : '已暂停'
   if (ttsPlayerBook) ttsPlayerBook.textContent = session.bookTitle || 'OOH Story'
   if (ttsPlayerChapterIndex) {
     const chapterNumber = Math.max(1, Number(session.chapterNumber) || 1)
@@ -405,7 +434,6 @@ function updateTtsPlayer() {
     ttsPlayerLine.textContent = session.currentText || '轻触播放，故事即刻开始。'
   }
   if (ttsPlayerProgressFill) ttsPlayerProgressFill.style.width = `${progress}%`
-  if (ttsPlayerProgressCopy) ttsPlayerProgressCopy.textContent = `第 ${Math.min(itemCount, itemIndex + 1)} / ${itemCount} 段`
   if (ttsPlayerModeCopy) ttsPlayerModeCopy.textContent = `${mode[1]} · ${activeEmotion.label}`
   if (ttsPlayerRate) ttsPlayerRate.querySelector('strong').textContent = `${Number(state.reader.ttsRate || 1).toFixed(1)}×`
   if (ttsPlayerMode) ttsPlayerMode.querySelector('strong').textContent = mode[0]
@@ -416,8 +444,10 @@ function updateTtsPlayer() {
     button.setAttribute('aria-pressed', String(active))
   })
   if (ttsPlayerToggle) ttsPlayerToggle.setAttribute('aria-label', isPlaying ? '暂停听书' : '继续听书')
-  if (ttsPlayerPrevious) ttsPlayerPrevious.disabled = itemIndex <= 0
-  if (ttsPlayerNext) ttsPlayerNext.disabled = itemIndex >= itemCount - 1
+  const ttsCtrl = state.ttsController
+  if (ttsPlayerPrevious) ttsPlayerPrevious.disabled = !ttsCtrl?.hasPreviousChapter?.()
+  if (ttsPlayerNext) ttsPlayerNext.disabled = !ttsCtrl?.hasNextChapter?.()
+  if (ttsPlayerProgressCopy) ttsPlayerProgressCopy.textContent = `第 ${Math.min(paragraphCount, paragraphIndex + 1)} / ${paragraphCount} 段`
   if (ttsPlayerCover && ttsPlayerCoverFallback) {
     const coverUrl = String(session.coverUrl || '')
     if (coverUrl && ttsPlayerCover.dataset.source !== coverUrl) {
@@ -440,6 +470,7 @@ function openTtsPlayer() {
   if (!ttsPlayer || !state.ttsSession?.active) return
   ttsPlayer.hidden = false
   ttsPlayer.setAttribute('aria-hidden', 'false')
+  ttsPlayer.scrollTop = 0
   document.body.classList.add('tts-player-open')
   state.ttsSession.playerOpen = true
   updateTtsPlayer()
@@ -719,1265 +750,6 @@ async function api(path, options = {}) {
   return data
 }
 
-async function accountApi(path, { method = 'GET', body = null, form = null } = {}) {
-  const headers = new Headers({ Accept: 'application/json' })
-  if (!['GET', 'HEAD'].includes(method) && state.csrfToken) headers.set('X-CSRF-Token', state.csrfToken)
-  let requestBody = form
-  if (body !== null) {
-    headers.set('Content-Type', 'application/json')
-    requestBody = JSON.stringify(body)
-  }
-  let response = await fetch(path, { method, headers, body: requestBody, credentials: 'same-origin' })
-  if (response.status === 429 && ['GET', 'HEAD'].includes(method)) {
-    await new Promise(resolve => window.setTimeout(resolve, 450))
-    response = await fetch(path, { method, headers, body: requestBody, credentials: 'same-origin' })
-  }
-  const data = response.status === 204 ? {} : await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(data.detail || `请求失败（${response.status}）`)
-  return data
-}
-
-function localUserContentIssue(value, { identity = false } = {}) {
-  const visible = String(value || '').normalize('NFKC').toLocaleLowerCase()
-    .replace(/[\u200b-\u200f\u202a-\u202e\u2060\ufeff]/g, '')
-  const compact = visible.replace(/[^0-9a-z\u3400-\u9fff]+/g, '')
-  const dotted = visible.replace(/(?:。|．|点|點|丶|句号|小数点|d\W*o\W*t|d\W*i\W*a\W*n)/gi, '.')
-  const domainReady = dotted.replace(/[\s_+\-—·•,，/\\|:：;；'"`~!！?？()（）\[\]{}<>《》]+/g, '')
-  const tld = '(?:com|cn|net|org|xyz|top|vip|io|cc|me|app|site|club|live|shop|online|link|bet|casino)'
-  const separatedAscii = dotted.match(/(?<![a-z0-9])(?:[a-z0-9][\s_+\-·•.,，。．/\\|:：;；]+){5,}[a-z0-9](?![a-z0-9])/gi) || []
-  const splitDomain = separatedAscii.some(item => new RegExp(`[a-z0-9]{3,}${tld}$`, 'i').test(item.replace(/[^a-z0-9]/gi, '')))
-  if (/(?:h\W*[t7]\W*[t7]\W*p|h\W*x\W*x\W*p|ftp)\W*s?\W*[:：]?\W*\/?\W*\/?/i.test(visible) ||
-      /w\W*w\W*w(?:\W|点|點)+/i.test(visible) ||
-      new RegExp(`(?:^|[^a-z0-9])(?:[a-z0-9][a-z0-9-]{1,62}\\.)+${tld}(?:$|[^a-z0-9])`, 'i').test(domainReady) ||
-      splitDomain) {
-    return identity
-      ? '这个昵称暂时无法使用。请去掉联系方式、广告引流或不合适的内容后，再试一个更纯粹的名字。'
-      : '这条评论需要修改。评论里似乎包含网站、联系方式或推广内容，请删除相关内容后再发布，让「字里行间」只留下阅读交流。'
-  }
-  const contact = ['微信', '薇信', '威信', '维信', 'v信', 'vx', 'wx', 'weixin', 'qq', '扣扣', '电报', 'telegram', '飞机群', 'whatsapp', '二维码', '扫码', '群号', '加好友', '私聊我', '私信我', '联系我']
-  const strongContact = ['二维码', '扫码', '群号', '加好友', '私聊我', '私信我', '联系我']
-  const risk = ['傻逼', '脑残', '智障', '色情', '成人视频', '裸聊', '约炮', '刷单', '返利', '跑分', '杀猪盘', '博彩', '赌博', '下注', '玩球', '买球', '赌场', '毒品', '冰毒', '海洛因', '可卡因']
-  const promo = ['赚钱', '网赚', '副业', '兼职', '高薪', '日结', '推广', '引流', '招代理', '开户', '带单', '稳赚', '躺赚']
-  const phone = /(?<!\d)1[3-9](?:[\s_+\-·•()（）]*\d){9}(?!\d)/.test(visible)
-  const contactHandle = contact.some(term => compact.includes(term)) && /[a-z0-9]{4,}/.test(compact)
-  if (phone || strongContact.some(term => compact.includes(term)) || contactHandle || risk.some(term => compact.includes(term)) ||
-      (identity && contact.some(term => compact.includes(term))) ||
-      (identity && promo.some(term => compact.includes(term)))) {
-    return identity
-      ? '这个昵称暂时无法使用。请去掉联系方式、广告引流或不合适的内容后，再试一个更纯粹的名字。'
-      : '这条评论暂时不能发布。内容可能不符合社区交流规范，请调整措辞、去掉不合适的内容后再发布。'
-  }
-  return ''
-}
-
-function isUserContentGuardIssue(message, { identity = false } = {}) {
-  const text = String(message || '')
-  return identity
-    ? /(?:这个昵称暂时无法使用|昵称包含(?:违规|广告引流|联系方式))/.test(text)
-    : /(?:这条评论(?:需要修改|暂时不能发布)|评论包含(?:链接|联系方式|违规|辱骂|涉黄|涉毒|涉诈|博彩))/.test(text)
-}
-
-function userContentNotice(issue, { identity = false } = {}) {
-  if (identity) return {
-    title: '换个昵称吧',
-    message: '这个昵称暂时无法使用。请去掉联系方式、广告引流或不合适的内容后，再试一个更纯粹的名字。',
-    action: '我来修改',
-    kind: 'identity'
-  }
-  const text = String(issue || '')
-  const promotion = /(?:需要修改|网站|链接|联系方式|推广|引流)/.test(text)
-  return promotion ? {
-    title: '这条评论需要修改',
-    message: '评论里似乎包含网站、联系方式或推广内容。请删除相关内容后再发布，让「字里行间」只留下阅读交流。',
-    action: '返回修改',
-    kind: 'promotion'
-  } : {
-    title: '这条评论暂时不能发布',
-    message: '内容可能不符合社区交流规范。请调整措辞、去掉不合适的内容后再发布。',
-    action: '返回修改',
-    kind: 'community'
-  }
-}
-
-function openUserContentNotice(issue, { identity = false, returnFocus = null } = {}) {
-  document.querySelector('.content-notice-overlay')?.remove()
-  const copy = userContentNotice(issue, { identity })
-  const previousFocus = returnFocus instanceof HTMLElement ? returnFocus : document.activeElement
-  const overlay = node('div', { class: 'content-notice-overlay', role: 'presentation' })
-  const titleId = `content-notice-title-${Date.now()}`
-  const dialog = node('section', {
-    class: `content-notice-dialog content-notice-${copy.kind}`,
-    role: 'dialog',
-    'aria-modal': 'true',
-    'aria-labelledby': titleId
-  })
-  const close = () => {
-    document.removeEventListener('keydown', onKeydown)
-    overlay.remove()
-    if (previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus({ preventScroll: true })
-  }
-  const onKeydown = event => { if (event.key === 'Escape') close() }
-  const action = node('button', { class: 'content-notice-action', type: 'button', text: copy.action, onclick: close })
-  dialog.append(
-    node('div', { class: 'content-notice-mark', 'aria-hidden': 'true', text: '✦' }),
-    node('p', { class: 'content-notice-kicker', text: identity ? '昵称提示' : '字里行间 · 友好提醒' }),
-    node('h2', { id: titleId, text: copy.title }),
-    node('p', { class: 'content-notice-message', text: copy.message }),
-    action
-  )
-  overlay.append(dialog)
-  overlay.addEventListener('click', event => { if (event.target === overlay) close() })
-  document.addEventListener('keydown', onKeydown)
-  document.body.append(overlay)
-  queueMicrotask(() => action.focus({ preventScroll: true }))
-}
-
-function showAccountSuccessToast(message) {
-  document.querySelector('.account-success-toast')?.remove()
-  const toast = node('div', {
-    class: 'account-success-toast',
-    role: 'status',
-    'aria-live': 'polite',
-    'aria-atomic': 'true'
-  }, [
-    node('span', { class: 'account-success-toast-icon', 'aria-hidden': 'true', text: '✓' }),
-    node('span', { class: 'account-success-toast-copy', text: message })
-  ])
-  let removed = false
-  const remove = () => {
-    if (removed) return
-    removed = true
-    toast.remove()
-  }
-  toast.addEventListener('animationend', remove, { once: true })
-  document.body.append(toast)
-  window.setTimeout(remove, 3400)
-}
-
-function openRecommendationDialog({
-  title,
-  message,
-  primaryLabel,
-  secondaryLabel = '',
-  confirm = false
-}) {
-  return new Promise(resolve => {
-    const overlay = node('div', { class: 'content-notice-overlay recommendation-donation-overlay', role: 'presentation' })
-    const titleId = `recommendation-dialog-title-${Date.now()}`
-    const dialog = node('section', {
-      class: 'recommendation-donation-dialog',
-      role: 'dialog',
-      'aria-modal': 'true',
-      'aria-labelledby': titleId
-    })
-    let settled = false
-    const close = value => {
-      if (settled) return
-      settled = true
-      document.removeEventListener('keydown', onKeydown)
-      overlay.remove()
-      resolve(Boolean(value))
-    }
-    const onKeydown = event => { if (event.key === 'Escape') close(false) }
-    const primary = node('button', {
-      class: 'recommendation-primary',
-      type: 'button',
-      text: primaryLabel,
-      onclick: () => close(confirm)
-    })
-    const actions = node('div', { class: 'recommendation-dialog-actions' }, [
-      secondaryLabel ? node('button', {
-        class: 'recommendation-secondary',
-        type: 'button',
-        text: secondaryLabel,
-        onclick: () => close(false)
-      }) : null,
-      primary
-    ])
-    dialog.append(
-      node('div', { class: 'recommendation-donation-mark', 'aria-hidden': 'true', text: '✦' }),
-      node('p', { class: 'content-notice-kicker', text: 'READING GIFT' }),
-      node('h2', { id: titleId, text: title }),
-      node('p', { class: 'recommendation-donation-message', text: message }),
-      actions
-    )
-    overlay.append(dialog)
-    overlay.addEventListener('click', event => { if (event.target === overlay) close(false) })
-    document.addEventListener('keydown', onKeydown)
-    document.body.append(overlay)
-    queueMicrotask(() => primary.focus({ preventScroll: true }))
-  })
-}
-
-function accountInitials(user = state.account) {
-  const value = String(user?.display_name || user?.email || '人').trim()
-  return [...value][0] || '人'
-}
-
-function readingRankTier(level) {
-  const value = Number(level || 1)
-  if (value >= 18) return 'mythic'
-  if (value >= 13) return 'astral'
-  if (value >= 7) return 'aurora'
-  return 'silver'
-}
-
-function readingRankLevel(value) {
-  return Math.min(18, Math.max(1, Number.parseInt(String(value || 1), 10) || 1))
-}
-
-function readingRankAsset(level) {
-  return `/reading-level-icons/v13/level-${String(readingRankLevel(level)).padStart(2, '0')}.webp`
-}
-
-function readingRankIcon(reading, { decorative = false } = {}) {
-  const roman = String(reading?.roman || 'Ⅰ')
-  const name = String(reading?.name || '只如初见')
-  const level = readingRankLevel(reading?.level)
-  return node('span', {
-    class: `reading-rank-icon rank-${readingRankTier(level)} rank-level-${String(level).padStart(2, '0')}`,
-    title: `阅读等级 ${roman} · ${name}`,
-    ...(decorative ? { 'aria-hidden': 'true' } : { role: 'img', 'aria-label': `阅读等级 ${roman}，${name}` })
-  }, [node('img', {
-    class: 'rank-art',
-    src: readingRankAsset(level),
-    alt: '',
-    width: '256',
-    height: '256',
-    decoding: 'async'
-  })])
-}
-
-function updateAccountButton() {
-  const label = accountButton.querySelector('.account-label')
-  const icon = accountButton.querySelector('.reading-rank-icon')
-  const art = icon?.querySelector('.rank-art')
-  label.textContent = state.account ? state.account.display_name : '登录'
-  if (state.account && state.accountReading && icon && art) {
-    const level = readingRankLevel(state.accountReading.level)
-    art.src = readingRankAsset(level)
-    icon.className = `reading-rank-icon rank-${readingRankTier(level)} rank-level-${String(level).padStart(2, '0')}`
-    icon.hidden = false
-    icon.title = `阅读等级 ${state.accountReading.roman} · ${state.accountReading.name}`
-    accountButton.setAttribute('aria-label', `${state.account.display_name}，阅读等级 ${state.accountReading.roman} ${state.accountReading.name}，打开个人中心`)
-  } else {
-    if (icon) {
-      icon.hidden = true
-      icon.removeAttribute('title')
-    }
-    accountButton.setAttribute('aria-label', state.account ? `${state.account.display_name}，打开个人中心` : '登录或注册')
-  }
-}
-
-async function loadAccountSession() {
-  try {
-    const data = await accountApi('/api/v1/auth/session')
-    if (!data.user) {
-      state.account = null
-      state.accountProfile = null
-      state.accountReading = null
-      state.csrfToken = ''
-      updateAccountButton()
-      return
-    }
-    state.account = data.user
-    state.csrfToken = data.csrf_token || ''
-    const [, reading] = await Promise.all([
-      refreshCloudState(),
-      accountApi('/api/v1/me/reading-level')
-    ])
-    state.accountReading = reading
-  } catch {
-    state.account = null
-    state.accountProfile = null
-    state.accountReading = null
-    state.csrfToken = ''
-  }
-  updateAccountButton()
-}
-
-async function refreshCloudState() {
-  if (!state.account) return state.cloudState
-  state.cloudState = await accountApi('/api/v1/me/state')
-  return state.cloudState
-}
-
-function readingProgressPercent(value) {
-  return Math.max(0, Math.min(100, Math.round(Number(value || 0) * 100)))
-}
-
-function readingHistoryPresentation(item, { local = false } = {}) {
-  const chapterId = Math.max(1, Number(item?.chapter_id ?? item?.chapterId ?? 1) || 1)
-  const chapterTitle = String(item?.current_chapter || item?.chapterTitle || `第 ${chapterId} 章`)
-  const hasOverallProgress = !local && item?.overall_progress !== undefined && item?.overall_progress !== null
-  const progress = readingProgressPercent(hasOverallProgress ? item.overall_progress : (item?.within ?? item?.progress))
-  return {
-    bookId: String(item?.book_id || item?.bookId || ''),
-    chapterId,
-    title: String(item?.title || '未命名作品'),
-    chapterTitle,
-    progress,
-    context: `${chapterTitle} · ${hasOverallProgress ? '全书进度' : '本章进度'} ${progress}%`
-  }
-}
-
-function latestHomeReading() {
-  if (state.account) {
-    const cloudHistory = Array.isArray(state.cloudState?.history) ? state.cloudState.history : []
-    const latest = cloudHistory
-      .filter(item => item?.book_id && item?.chapter_id)
-      .slice()
-      .sort((left, right) => new Date(right.updated_at || 0).getTime() - new Date(left.updated_at || 0).getTime())[0]
-    return latest ? readingHistoryPresentation(latest) : null
-  }
-  const localEntries = Object.entries(readReadingProgressStore().books)
-    .filter(([, entry]) => entry?.title && entry?.chapterTitle)
-    .sort(([, left], [, right]) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0))
-  if (!localEntries.length) return null
-  const [bookId, entry] = localEntries[0]
-  return readingHistoryPresentation({ ...entry, bookId }, { local: true })
-}
-
-function buildHomeContinueReading() {
-  const recent = latestHomeReading()
-  if (!recent) return null
-  return node('section', { class: 'continue-reading-section' }, [
-    node('a', {
-      class: 'continue-reading-card',
-      href: `/books/${recent.bookId}/chapters/${recent.chapterId}`
-    }, [
-      node('div', { class: 'continue-reading-info' }, [
-        node('span', { class: 'continue-reading-kicker', text: '继续阅读' }),
-        node('strong', { class: 'continue-reading-title', text: recent.title }),
-        node('span', { class: 'continue-reading-chapter', text: recent.context }),
-        node('div', { class: 'continue-reading-progress', role: 'progressbar', 'aria-label': recent.context, 'aria-valuemin': '0', 'aria-valuemax': '100', 'aria-valuenow': String(recent.progress) }, [
-          node('i', { style: `width:${recent.progress}%` })
-        ])
-      ]),
-      node('span', { class: 'continue-reading-action', text: '继续阅读 →' })
-    ])
-  ])
-}
-
-function refreshHomeContinueReading() {
-  const slot = document.querySelector('[data-home-continue-reading]')
-  if (!slot) return
-  const card = buildHomeContinueReading()
-  slot.replaceChildren(...(card ? [card] : []))
-  slot.hidden = !card
-}
-
-function scheduleReadingHistorySync(bookId, entry) {
-  if (!state.account) return
-  clearTimeout(state.cloudSyncTimer)
-  state.cloudSyncTimer = setTimeout(async () => {
-    try {
-      state.cloudState = await accountApi('/api/v1/me/state', {
-        method: 'PUT',
-        body: {
-          history: [{
-            book_id: bookId,
-            chapter_id: entry.chapterId,
-            progress: entry.within,
-            title: entry.title || '',
-            updated_at: new Date(entry.updatedAt).toISOString()
-          }],
-          favorites: [],
-          bookshelf: []
-        }
-      })
-    } catch {
-      // Local progress remains authoritative until the next successful sync.
-    }
-  }, 2500)
-}
-
-async function mergeLocalReadingHistory() {
-  if (!state.account) return
-  const local = readReadingProgressStore().books
-  const history = Object.entries(local).map(([bookId, entry]) => ({
-    book_id: bookId,
-    chapter_id: entry.chapterId,
-    progress: entry.within,
-    title: entry.title || '',
-    updated_at: new Date(entry.updatedAt).toISOString()
-  }))
-  if (!history.length) return refreshCloudState()
-  state.cloudState = await accountApi('/api/v1/me/state', {
-    method: 'PUT',
-    body: { history, favorites: [], bookshelf: [] }
-  })
-}
-
-function cloudHas(kind, bookId) {
-  return (state.cloudState[kind] || []).some(item => item.book_id === bookId)
-}
-
-async function setCloudBook(kind, book, enabled) {
-  if (!state.account) {
-    openAuthDialog('login')
-    return false
-  }
-  if (enabled) {
-    const payload = { history: [], favorites: [], bookshelf: [] }
-    payload[kind] = [{
-      book_id: book.public_id,
-      title: book.title || '',
-      author: book.author || '',
-      cover_url: book.cover_url || '',
-      updated_at: new Date().toISOString()
-    }]
-    state.cloudState = await accountApi('/api/v1/me/state', { method: 'PUT', body: payload })
-  } else {
-    await accountApi(`/api/v1/me/state/${kind}/${book.public_id}`, { method: 'DELETE' })
-    state.cloudState[kind] = (state.cloudState[kind] || []).filter(item => item.book_id !== book.public_id)
-  }
-  return true
-}
-
-function startReadingActivity(bookId) {
-  state.readingActivity?.stop?.(true)
-  if (!state.account || !/^[A-Za-z0-9_-]{22}$/.test(String(bookId || ''))) return
-  let lastSample = performance.now()
-  let lastInteraction = Date.now()
-  let stopped = false
-  let sending = false
-  const markActive = () => { lastInteraction = Date.now() }
-  const isActive = () => ttsSessionIsPlaying(bookId) || (document.visibilityState === 'visible'
-    && (!document.hasFocus || document.hasFocus())
-    && Date.now() - lastInteraction < 90_000)
-  const send = async force => {
-    if (stopped && !force) return
-    const now = performance.now()
-    const elapsed = Math.min(60, Math.floor((now - lastSample) / 1000))
-    lastSample = now
-    if (elapsed < 5 || !isActive() || sending || !state.account) return
-    sending = true
-    try {
-      const reading = await accountApi('/api/v1/me/reading-heartbeat', {
-        method: 'POST',
-        body: {
-          event_id: randomUuidV4(),
-          book_id: bookId,
-          active_seconds: elapsed
-        }
-      })
-      state.accountReading = reading
-      updateAccountButton()
-    } catch {
-      // Reading continues locally; totals only advance after a server acknowledgement.
-    } finally {
-      sending = false
-    }
-  }
-  const timer = window.setInterval(() => { send(false) }, 30_000)
-  ;['pointerdown', 'keydown', 'wheel', 'touchstart'].forEach(type => {
-    window.addEventListener(type, markActive, { passive: true })
-  })
-  state.readingActivity = {
-    bookId,
-    stop(flush = false) {
-      if (stopped) return
-      if (flush) send(true)
-      stopped = true
-      window.clearInterval(timer)
-      ;['pointerdown', 'keydown', 'wheel', 'touchstart'].forEach(type => {
-        window.removeEventListener(type, markActive)
-      })
-      if (state.readingActivity === this) state.readingActivity = null
-    }
-  }
-}
-
-let googleScriptPromise = null
-function loadGoogleIdentityScript() {
-  if (window.google?.accounts?.id) return Promise.resolve()
-  if (googleScriptPromise) return googleScriptPromise
-  googleScriptPromise = new Promise((resolve, reject) => {
-    const script = node('script', { src: 'https://accounts.google.com/gsi/client', async: '', defer: '' })
-    script.addEventListener('load', resolve, { once: true })
-    script.addEventListener('error', () => reject(new Error('Google 登录组件加载失败')), { once: true })
-    document.head.append(script)
-  })
-  return googleScriptPromise
-}
-
-async function renderGoogleButton(slot, { mode = 'login' } = {}) {
-  if (!state.accountConfig) state.accountConfig = await api('/api/v1/auth/config')
-  const googleConfig = state.accountConfig.google || {}
-  if (!googleConfig.web_enabled) {
-    slot.replaceChildren(node('div', { class: 'google-unavailable', text: 'Google 登录将在配置 OAuth 凭据后自动启用' }))
-    return
-  }
-  try {
-    await loadGoogleIdentityScript()
-    window.google.accounts.id.initialize({
-      client_id: googleConfig.web_client_id,
-      auto_select: false,
-      cancel_on_tap_outside: true,
-      ux_mode: 'redirect',
-      login_uri: location.origin
-    })
-    slot.replaceChildren()
-    window.google.accounts.id.renderButton(slot, {
-      type: 'standard',
-      theme: 'outline',
-      size: 'large',
-      shape: 'pill',
-      text: 'continue_with',
-      width: 310,
-      state: mode === 'link' ? 'oohstory-web-link-v1' : 'oohstory-web-redirect-v1'
-    })
-  } catch (error) {
-    slot.replaceChildren(node('div', { class: 'google-unavailable', text: error.message }))
-  }
-}
-
-function openAuthDialog(initialMode = 'login', initialError = '') {
-  let mode = initialMode
-  const overlay = node('div', { class: 'auth-overlay', role: 'presentation' })
-  const dialog = node('section', { class: 'auth-dialog', role: 'dialog', 'aria-modal': 'true', 'aria-label': '登录或注册 OOH Story' })
-  const close = () => overlay.remove()
-  const art = node('aside', { class: 'auth-art' }, [
-    node('img', { class: 'auth-art-mark', src: '/icon-192.png?v=20260730-icon1', alt: 'OOH Story 标志' }),
-    node('h2', { text: '让每一次阅读，都在下一台设备接上。' }),
-    node('p', { text: '同步阅读进度、收藏和私人书架。你的记录只属于你。' })
-  ])
-  const panel = node('div', { class: 'auth-panel' })
-  const closeButton = node('button', { class: 'auth-close', type: 'button', text: '×', 'aria-label': '关闭', onclick: close })
-
-  const render = () => {
-    const isLogin = mode === 'login'
-    const errorText = node('p', { class: 'auth-error', role: 'alert', text: initialError })
-    initialError = ''
-    const form = node('form', { class: 'auth-form' })
-    if (!isLogin) form.append(node('label', { class: 'auth-field' }, [
-      node('span', { text: '昵称' }), node('input', { name: 'display_name', autocomplete: 'nickname', maxlength: '40', placeholder: '怎么称呼你' })
-    ]))
-    if (!isLogin) form.append(node('label', { class: 'auth-field' }, [
-      node('span', { text: '邀请码（选填）' }), node('input', { name: 'invite_code', autocomplete: 'off', minlength: '20', maxlength: '128', placeholder: '有邀请码可在这里填写' })
-    ]))
-    form.append(
-      node('label', { class: 'auth-field' }, [
-        node('span', { text: '邮箱' }), node('input', { name: 'email', type: 'email', autocomplete: 'email', maxlength: '254', required: '', placeholder: 'name@example.com' })
-      ]),
-      node('label', { class: 'auth-field' }, [
-        node('span', { text: '密码' }), node('input', { name: 'password', type: 'password', autocomplete: isLogin ? 'current-password' : 'new-password', minlength: isLogin ? '1' : '12', maxlength: '128', required: '', placeholder: isLogin ? '输入密码' : '至少 12 位，包含三类字符' })
-      ])
-    )
-    const submit = node('button', { class: 'auth-submit', type: 'submit', text: isLogin ? '安全登录' : '创建账户' })
-    form.append(errorText, submit)
-    form.addEventListener('submit', async event => {
-      event.preventDefault()
-      submit.disabled = true
-      errorText.textContent = ''
-      const values = new FormData(form)
-      try {
-        const body = {
-          email: values.get('email'),
-          password: values.get('password'),
-          client: 'web'
-        }
-        if (!isLogin) {
-          body.display_name = values.get('display_name') || ''
-          body.invite_code = values.get('invite_code') || ''
-          const identityIssue = localUserContentIssue(body.display_name, { identity: true })
-          if (identityIssue) {
-            openUserContentNotice(identityIssue, {
-              identity: true,
-              returnFocus: form.querySelector('input[name="display_name"]')
-            })
-            return
-          }
-        }
-        const data = await accountApi(isLogin ? '/api/v1/auth/login' : '/api/v1/auth/register', {
-          method: 'POST',
-          body
-        })
-        state.account = data.user
-        state.accountReading = null
-        state.csrfToken = data.csrf_token
-        updateAccountButton()
-        await mergeLocalReadingHistory()
-        close()
-        location.hash = '#/account'
-      } catch (error) {
-        if (!isLogin && isUserContentGuardIssue(error.message, { identity: true })) {
-          openUserContentNotice(error.message, {
-            identity: true,
-            returnFocus: form.querySelector('input[name="display_name"]')
-          })
-        } else {
-          errorText.textContent = error.message
-        }
-      } finally {
-        submit.disabled = false
-      }
-    })
-    const tabs = node('div', { class: 'auth-tabs' }, [
-      node('button', { class: isLogin ? 'active' : '', type: 'button', text: '登录', onclick: () => { mode = 'login'; render() } }),
-      node('button', { class: isLogin ? '' : 'active', type: 'button', text: '注册', onclick: () => { mode = 'register'; render() } })
-    ])
-    const googleSlot = node('div', { class: 'google-login-slot' }, [
-      node('div', {
-        class: 'google-unavailable',
-        text: isLogin ? '正在检查 Google 登录…' : '注册后请在个人中心绑定 Google 账户'
-      })
-    ])
-    panel.replaceChildren(
-      node('p', { class: 'auth-kicker', text: 'OOH STORY ACCOUNT' }),
-      node('h1', { text: isLogin ? '欢迎回来' : '建立你的阅读宇宙' }),
-      node('p', { class: 'auth-subtitle', text: isLogin ? '登录后继续上次的故事。' : '现在开放注册；邀请码为选填项，一个账户同步三端。' }),
-      tabs, form,
-      ...(isLogin ? [node('div', { class: 'auth-divider', text: '或' })] : []),
-      googleSlot,
-      node('p', { class: 'auth-safety', text: '🔒 密码使用 Argon2id 加密；会话可随时撤销；我们不会保存 Google 密码。' })
-    )
-    if (isLogin) renderGoogleButton(googleSlot).catch(() => {})
-  }
-  render()
-  dialog.append(art, panel, closeButton)
-  overlay.append(dialog)
-  overlay.addEventListener('click', event => { if (event.target === overlay) close() })
-  overlay.addEventListener('keydown', event => { if (event.key === 'Escape') close() })
-  document.body.append(overlay)
-  dialog.tabIndex = -1
-  dialog.focus()
-}
-
-function uploadStatusLabel(status) {
-  return ({ quarantined: '隔离扫描中', clean_queued: '旧版归纳队列', ai_pending: '等待审核', reviewing: '审核中', approved: '已通过·等待入库', completed: '已入库', rejected: '已驳回' })[status] || status
-}
-
-const ACCOUNT_COLLECTIONS = {
-  history: { title: '阅读记录', subtitle: '从上次停下的章节继续', empty: '还没有阅读记录，去书库遇见第一本故事。' },
-  favorites: { title: '收藏记录', subtitle: '你认真标记过的作品', empty: '还没有收藏作品，看到喜欢的故事就点亮收藏。' },
-  bookshelf: { title: '我的书架', subtitle: '跨设备同步的私人书架', empty: '书架还是空的，把正在追的作品加入这里吧。' }
-}
-
-function accountNavigation(active = 'overview') {
-  const items = [
-    ['overview', '#/account', '个人中心'],
-    ['history', '#/account/history', '阅读记录'],
-    ['favorites', '#/account/favorites', '收藏'],
-    ['bookshelf', '#/account/bookshelf', '书架'],
-    ['submissions', '#/account/submissions', '我的投稿'],
-    ['notifications', '#/account/notifications', `消息${state.notificationsUnread ? ` · ${state.notificationsUnread}` : ''}`],
-    ['profile', '#/account/profile', '资料与安全']
-  ]
-  return node('nav', { class: 'account-nav', 'aria-label': '用户中心导航' },
-    items.map(([key, href, label]) => node('a', {
-      class: key === active ? 'active' : '', href, text: label
-    }))
-  )
-}
-
-function accountAvatar(profile, className = 'account-hero-avatar') {
-  const wrap = node('div', { class: className })
-  if (profile?.avatar_url) {
-    const img = node('img', { src: profile.avatar_url, alt: `${profile.display_name || '用户'}的头像` })
-    img.addEventListener('error', () => wrap.replaceChildren(node('span', { text: accountInitials() })))
-    wrap.append(img)
-  } else {
-    wrap.append(node('span', { text: accountInitials() }))
-  }
-  return wrap
-}
-
-function readingIdentity(reading, compact = false) {
-  const percent = Math.max(0, Math.min(100, Number(reading?.progress || 0) * 100))
-  const next = reading?.is_max
-    ? '已达最高等级'
-    : `距下一级还需 ${formatReadingDuration(reading?.seconds_to_next, { remaining: true })}`
-  return node('section', { class: `reading-identity${compact ? ' compact' : ''}` }, [
-    node('div', { class: 'reading-level-seal' }, [readingRankIcon(reading)]),
-    node('div', { class: 'reading-level-copy' }, [
-      node('span', { class: 'eyebrow', text: 'READING IDENTITY' }),
-      node('h2', { text: reading?.name || '只如初见' }),
-      node('p', { text: `当前可用阅读时长 ${formatReadingDuration(reading?.active_seconds)} · ${next}` }),
-      node('div', { class: 'reading-level-progress', role: 'progressbar', 'aria-valuenow': String(Math.round(percent)), 'aria-valuemin': '0', 'aria-valuemax': '100' }, [
-        node('i', { style: `width:${percent}%` })
-      ])
-    ])
-  ])
-}
-
-async function loadAccountCollection(kind) {
-  const config = ACCOUNT_COLLECTIONS[kind]
-  if (!state.account || !config) {
-    if (!state.account) openAuthDialog('login')
-    location.hash = '#/'
-    return
-  }
-  setSeo({ title: `${config.title}｜OOH Story`, description: config.subtitle, canonicalPath: '/', robots: 'noindex, nofollow' })
-  const cloud = await refreshCloudState()
-  const items = cloud[kind] || []
-  const pageSize = 10
-  const query = new URLSearchParams((location.hash.split('?')[1] || ''))
-  const requestedPage = Math.max(1, Number.parseInt(query.get('page') || '1', 10) || 1)
-  const pageCount = Math.max(1, Math.ceil(items.length / pageSize))
-  const currentPage = Math.min(requestedPage, pageCount)
-  const pageHref = page => `#/account/${kind}?page=${Math.min(Math.max(Number(page) || 1, 1), pageCount)}`
-  if (requestedPage !== currentPage) window.history.replaceState(null, '', pageHref(currentPage))
-  const visibleItems = items.slice((currentPage - 1) * pageSize, currentPage * pageSize)
-  const list = node('div', { class: 'account-book-grid' })
-  for (const item of visibleItems) {
-    const historyPresentation = kind === 'history' ? readingHistoryPresentation(item) : null
-    const cover = node('div', { class: 'account-book-cover record-cover' })
-    if (item.cover_url) {
-      const image = node('img', { alt: item.title || '作品封面' })
-      coverLoader.observe(image, item.cover_url)
-      cover.append(image)
-    } else cover.append(node('span', { text: 'OOH' }))
-    const destination = kind === 'history'
-      ? `/books/${historyPresentation.bookId}/chapters/${historyPresentation.chapterId}`
-      : `/books/${item.book_id}`
-    const remove = node('button', { class: 'account-book-remove', type: 'button', text: '移除', onclick: async event => {
-      event.preventDefault()
-      const button = event.currentTarget
-      button.disabled = true
-      try {
-        await accountApi(`/api/v1/me/state/${kind}/${item.book_id}`, { method: 'DELETE' })
-        state.cloudState[kind] = (state.cloudState[kind] || []).filter(value => value.book_id !== item.book_id)
-        await loadAccountCollection(kind)
-      } catch (error) {
-        button.disabled = false
-        button.textContent = error.message
-      }
-    } })
-    list.append(node('article', { class: 'account-book-card' }, [
-      node('a', { class: 'account-book-link', href: destination }, [
-        cover,
-        node('div', { class: 'account-book-copy record-copy' }, [
-          node('div', { class: 'account-book-title-row' }, [
-            node('h2', { text: item.title || '未命名作品' }),
-            node('span', { class: `account-history-status ${item.serialization_status || 'ongoing'}`, text: item.serialization_status === 'finished' ? '已完结' : '连载中' }),
-            node('time', {
-              class: 'account-reading-time',
-              datetime: item.updated_at || '',
-              title: item.updated_at ? new Date(item.updated_at).toLocaleString('zh-CN') : '',
-              text: item.updated_at ? new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(item.updated_at)) : ''
-            })
-          ]),
-          node('p', { text: item.author || '作者待补充' }),
-          kind === 'history' && item.serialization_status !== 'finished'
-            ? node('small', { class: 'account-latest-chapter', text: `当前最新：${item.latest_chapter || '等待目录同步'}` })
-            : null,
-          kind === 'history'
-            ? node('span', { class: 'account-book-context', text: historyPresentation.context })
-            : kind === 'bookshelf' && item.note
-              ? node('span', { class: 'account-book-context', text: item.note })
-              : kind === 'favorites'
-                ? node('span', { class: 'account-book-context subtle', text: '已同步到云端收藏' })
-                : kind === 'bookshelf'
-                  ? node('span', { class: 'account-book-context subtle', text: '已同步到私人书架' })
-              : null,
-          kind === 'history'
-            ? node('div', { class: 'account-read-progress' }, [node('i', { style: `width:${historyPresentation.progress}%` })])
-            : null
-        ])
-      ].filter(Boolean)),
-      remove
-    ]))
-  }
-  if (!items.length) list.append(node('div', { class: 'account-empty' }, [
-    node('span', { text: '✦' }), node('h2', { text: config.empty }), node('a', { class: 'primary-button', href: '/library', text: '去书库看看' })
-  ]))
-  let pagination = null
-  if (items.length) {
-    const firstVisible = Math.max(1, Math.min(currentPage - 2, pageCount - 4))
-    const lastVisible = Math.min(pageCount, firstVisible + 4)
-    const pageNumbers = []
-    for (let page = firstVisible; page <= lastVisible; page += 1) {
-      pageNumbers.push(node('a', {
-        class: `page-number${page === currentPage ? ' active' : ''}`,
-        href: pageHref(page),
-        text: String(page),
-        'aria-current': page === currentPage ? 'page' : null,
-        'aria-label': `第 ${page} 页`
-      }))
-    }
-    const action = (label, target, enabled, ariaLabel) => enabled
-      ? node('a', { class: 'page-action', href: pageHref(target), text: label, 'aria-label': ariaLabel })
-      : node('span', { class: 'page-action disabled', text: label, 'aria-hidden': 'true' })
-    const jumpInput = node('input', {
-      type: 'number', min: '1', max: String(pageCount), inputmode: 'numeric',
-      placeholder: '自定义页数', 'aria-label': `输入 1 到 ${pageCount} 页`
-    })
-    const jump = () => {
-      const page = Number.parseInt(jumpInput.value, 10)
-      if (!Number.isFinite(page)) { jumpInput.focus(); return }
-      location.hash = pageHref(page).slice(1)
-    }
-    jumpInput.addEventListener('keydown', event => {
-      if (event.key === 'Enter') { event.preventDefault(); jump() }
-    })
-    const jumpControl = node('div', { class: 'page-jump' }, [
-      jumpInput, node('button', { type: 'button', text: '跳转', onclick: jump })
-    ])
-    pagination = node('nav', { class: 'pagination account-pagination', 'aria-label': `${config.title}分页` }, [
-      action('首页', 1, currentPage > 1, '返回首页'),
-      action('<', currentPage - 1, currentPage > 1, '上一页'),
-      node('div', { class: 'page-numbers' }, pageNumbers),
-      action('>', currentPage + 1, currentPage < pageCount, '下一页'),
-      jumpControl,
-      action('尾页', pageCount, currentPage < pageCount, '前往尾页')
-    ])
-  }
-  app.replaceChildren(node('div', { class: 'account-page' }, [
-    accountNavigation(kind),
-    node('header', { class: 'account-page-heading' }, [
-      node('span', { class: 'eyebrow', text: 'MY OOH STORY' }), node('h1', { text: config.title }), node('p', { text: config.subtitle })
-    ]),
-    items.length ? node('p', { class: 'account-page-count', text: `共 ${items.length} 条记录 · 第 ${currentPage} / ${pageCount} 页` }) : null,
-    list,
-    pagination
-  ].filter(Boolean)))
-}
-
-async function loadProfilePage() {
-  if (!state.account) {
-    openAuthDialog('login')
-    location.hash = '#/'
-    return
-  }
-  setSeo({ title: '资料与安全｜OOH Story', description: '管理个人资料、头像、密码和阅读身份。', canonicalPath: '/', robots: 'noindex, nofollow' })
-  const data = await accountApi('/api/v1/me/profile')
-  state.accountProfile = data.profile
-  state.accountReading = data.reading
-  updateAccountButton()
-  const notice = node('p', { class: 'profile-feedback', role: 'status' })
-  let avatarPreview = accountAvatar(data.profile, 'profile-avatar-preview')
-  const avatarInput = node('input', { type: 'file', accept: 'image/jpeg,image/png,image/webp' })
-  const uploadAvatar = node('button', { class: 'primary-button', type: 'button', text: '上传新头像', onclick: async event => {
-    if (!avatarInput.files?.[0]) { notice.textContent = '请先选择图片'; return }
-    const button = event.currentTarget
-    button.disabled = true
-    const form = new FormData(); form.append('file', avatarInput.files[0])
-    try {
-      const result = await accountApi('/api/v1/me/avatar', { method: 'POST', form })
-      data.profile.avatar_url = result.avatar_url
-      const nextPreview = accountAvatar(data.profile, 'profile-avatar-preview')
-      avatarPreview.replaceWith(nextPreview)
-      avatarPreview = nextPreview
-      notice.textContent = result.message
-    } catch (error) { notice.textContent = error.message }
-    finally { button.disabled = false }
-  } })
-  const removeAvatar = node('button', { class: 'ghost-button', type: 'button', text: '移除头像', onclick: async event => {
-    const button = event.currentTarget
-    button.disabled = true
-    try {
-      await accountApi('/api/v1/me/avatar', { method: 'DELETE' })
-      data.profile.avatar_url = null
-      const nextPreview = accountAvatar(data.profile, 'profile-avatar-preview')
-      avatarPreview.replaceWith(nextPreview)
-      avatarPreview = nextPreview
-      notice.textContent = '头像已移除'
-    } catch (error) { notice.textContent = error.message }
-    finally { button.disabled = false }
-  } })
-  const profileForm = node('form', { class: 'profile-form' })
-  const gender = node('select', { name: 'gender' }, [
-    node('option', { value: '', text: '不填写' }), node('option', { value: 'female', text: '女' }), node('option', { value: 'male', text: '男' }),
-    node('option', { value: 'nonbinary', text: '非二元 / 其他' }), node('option', { value: 'prefer_not_say', text: '不愿透露' })
-  ])
-  gender.value = data.profile.gender || ''
-  profileForm.append(
-    node('label', { class: 'profile-field' }, [node('span', { text: '显示昵称' }), node('input', { name: 'display_name', value: data.profile.display_name || '', maxlength: '40', required: '', autocomplete: 'nickname' })]),
-    node('label', { class: 'profile-field profile-field-wide' }, [node('span', { text: '个人简介' }), node('textarea', { name: 'bio', maxlength: '500', rows: '4', text: data.profile.bio || '', placeholder: '写下你喜欢的故事、作者或阅读偏好' })]),
-    node('label', { class: 'profile-field' }, [node('span', { text: '性别（可选）' }), gender]),
-    node('label', { class: 'profile-field' }, [node('span', { text: '生日（可选）' }), node('input', { name: 'birthday', type: 'date', value: data.profile.birthday || '', min: '1900-01-01', max: new Date().toISOString().slice(0, 10) })]),
-    node('label', { class: 'profile-field profile-field-wide' }, [node('span', { text: '所在地（可选）' }), node('input', { name: 'location', value: data.profile.location || '', maxlength: '80', placeholder: '城市 / 地区' })]),
-    node('button', { class: 'primary-button profile-submit', type: 'submit', text: '保存个人资料' })
-  )
-  profileForm.addEventListener('submit', async event => {
-    event.preventDefault()
-    const button = profileForm.querySelector('button[type="submit"]'); button.disabled = true
-    const values = new FormData(profileForm)
-    try {
-      const profileBody = Object.fromEntries(values.entries())
-      const identityIssue = localUserContentIssue(profileBody.display_name, { identity: true })
-      if (identityIssue) {
-        openUserContentNotice(identityIssue, {
-          identity: true,
-          returnFocus: profileForm.querySelector('input[name="display_name"]')
-        })
-        return
-      }
-      const result = await accountApi('/api/v1/me/profile', { method: 'PUT', body: profileBody })
-      state.account.display_name = result.profile.display_name
-      state.accountProfile = result.profile
-      updateAccountButton()
-      notice.textContent = ''
-      showAccountSuccessToast('个人资料保存成功')
-    } catch (error) {
-      if (isUserContentGuardIssue(error.message, { identity: true })) {
-        openUserContentNotice(error.message, {
-          identity: true,
-          returnFocus: profileForm.querySelector('input[name="display_name"]')
-        })
-      } else {
-        notice.textContent = error.message
-      }
-    }
-    finally { button.disabled = false }
-  })
-  const passwordForm = node('form', { class: 'password-form' }, [
-    node('label', { class: 'profile-field' }, [node('span', { text: '当前密码' }), node('input', { name: 'current_password', type: 'password', autocomplete: 'current-password', maxlength: '128', required: '' })]),
-    node('label', { class: 'profile-field' }, [node('span', { text: '新密码' }), node('input', { name: 'new_password', type: 'password', autocomplete: 'new-password', minlength: '12', maxlength: '128', required: '', placeholder: '至少 12 位，包含三类字符' })]),
-    node('label', { class: 'profile-field' }, [node('span', { text: '确认新密码' }), node('input', { name: 'confirm_password', type: 'password', autocomplete: 'new-password', minlength: '12', maxlength: '128', required: '' })]),
-    node('button', { class: 'primary-button', type: 'submit', text: '修改密码' })
-  ])
-  passwordForm.addEventListener('submit', async event => {
-    event.preventDefault()
-    const values = new FormData(passwordForm)
-    if (values.get('new_password') !== values.get('confirm_password')) { notice.textContent = '两次输入的新密码不一致'; return }
-    const button = passwordForm.querySelector('button'); button.disabled = true
-    try {
-      const result = await accountApi('/api/v1/me/password', { method: 'POST', body: { current_password: values.get('current_password'), new_password: values.get('new_password') } })
-      passwordForm.reset(); notice.textContent = ''; showAccountSuccessToast('密码修改成功')
-    } catch (error) { notice.textContent = error.message }
-    finally { button.disabled = false }
-  })
-  const levels = [
-    ['Ⅰ','只如初见','0'],['Ⅱ','此去经年','30'],['Ⅲ','素心相赠','100'],['Ⅳ','犹故人归','250'],['Ⅴ','踏歌寻醉','500'],['Ⅵ','冷暖自知','1,000'],
-    ['Ⅶ','青青子衿','1,800'],['Ⅷ','似水流年','3,000'],['Ⅸ','不诉离殇','5,000'],['Ⅹ','近月侵衣','8,000'],['Ⅺ','对酒当歌','12,000'],['Ⅻ','长风万里','18,000'],
-    ['ⅩⅢ','知与谁同','26,000'],['ⅩⅣ','扶摇九霄','36,000'],['ⅩⅤ','凌云绝顶','48,000'],['ⅩⅥ','摘星揽月','62,000'],['ⅩⅦ','天人合一','80,000'],['ⅩⅧ','水月镜花','100,000']
-  ]
-  app.replaceChildren(node('div', { class: 'account-page' }, [
-    accountNavigation('profile'),
-    notice,
-    readingIdentity(data.reading),
-    node('section', { class: 'account-section profile-avatar-section' }, [
-      node('div', { class: 'profile-avatar-row' }, [avatarPreview, node('div', {}, [node('h2', { text: '个人头像' }), node('p', { text: '支持 JPEG、PNG、WebP；系统会安全解码、去除元数据并统一保存。' }), avatarInput, node('div', { class: 'profile-inline-actions' }, [uploadAvatar, removeAvatar])])])
-    ]),
-    node('section', { class: 'account-section' }, [node('h2', { text: '详细个人信息' }), node('p', { text: '这些资料仅用于你的个人中心，不公开邮箱或私密信息。' }), profileForm]),
-    node('section', { class: 'account-section' }, [node('h2', { text: '账户安全' }), node('p', { text: '修改成功后，其他设备会退出登录，当前设备保持在线。' }), passwordForm]),
-    node('section', { class: 'account-section' }, [node('h2', { text: '阅读等级图鉴' }), node('p', { text: '仅在页面可见且有真实互动时积累；每次助力推荐会捐赠 1 小时阅读经验时长。' }), node('div', { class: 'reading-level-map' }, levels.map(([roman,name,hours], index) => node('div', { class: index + 1 === data.reading.level ? 'current' : '' }, [readingRankIcon({ level: index + 1, roman, name }, { decorative: true }), node('span', { text: name }), node('small', { text: `${hours} 小时` })])))])
-  ]))
-}
-
-function submissionRecord(item, type) {
-  const structure = item.structure_report
-  const missing = structure?.missing_files || item.review_result?.missing_files || []
-  return node('article', { class: 'submission-record' }, [
-    node('div', {}, [
-      node('span', { class: 'eyebrow', text: type === 'novel' ? '小说投稿' : '拆书文' }),
-      node('h3', { text: item.title || item.original_filename || '未命名投稿' }),
-      node('p', { text: item.author ? `${item.author} · ${item.category || '未分类'}` : `${structure?.profile === 'long' ? '长篇' : '短篇'}结构 · ${Number(structure?.file_count || 0)} 个文件` }),
-      ...(missing.length ? [node('small', { class: 'submission-reason', text: `缺少：${missing.join('、')}` })] : []),
-      ...(item.rejection_reason ? [node('small', { class: 'submission-reason', text: item.rejection_reason })] : [])
-    ]),
-    node('span', { class: `submission-status status-${item.status}`, text: uploadStatusLabel(item.status) })
-  ])
-}
-
-async function loadSubmissionPage() {
-  if (!state.account) { openAuthDialog('login'); location.hash = '#/'; return }
-  setSeo({ title: '我的投稿｜OOH Story', description: '安全上传拆书结构或小说正文并查看审核结果。', canonicalPath: '/', robots: 'noindex, nofollow' })
-  const [deconstructions, novels, categoryData] = await Promise.all([
-    accountApi('/api/v1/me/uploads'),
-    accountApi('/api/v1/me/novel-submissions'),
-    state.categories.length ? Promise.resolve({ items: state.categories }) : api('/api/v1/categories')
-  ])
-  state.categories = (categoryData.items || []).filter(item => item?.name)
-  const feedback = node('p', { class: 'profile-feedback', role: 'status' })
-  const reviewRules = () => node('aside', { class: 'submission-review-rules' }, [
-    node('strong', { text: '审核范围' }),
-    node('ul', {}, [
-      node('li', { text: '覆盖 TXT 全文、EPUB 内部章节及拆书结构内全部文本，不只检查标题、封面或开头。' }),
-      node('li', { text: '标题、简介、报告与正文主题必须一致；伪装成正常书籍的广告或违法内容会被驳回。' }),
-      node('li', { text: '禁止涉黄、涉毒、涉赌、诈骗、违法交易、广告引流、网址、邮箱、联系方式及二维码。' })
-    ])
-  ])
-
-  const deconstructionInput = node('input', { type: 'file', accept: '.zip,application/zip', required: '' })
-  const deconstructionButton = node('button', { class: 'primary-button', type: 'submit', text: '上传并开始审核' })
-  const deconstructionForm = node('form', { class: 'upload-box submission-upload-box' }, [deconstructionInput, deconstructionButton])
-  deconstructionForm.addEventListener('submit', async event => {
-    event.preventDefault()
-    if (!deconstructionInput.files?.[0]) return
-    deconstructionButton.disabled = true
-    feedback.textContent = '正在安全解压、验毒并识别长/短篇结构…'
-    const form = new FormData(); form.append('file', deconstructionInput.files[0])
-    try {
-      const result = await accountApi('/api/v1/me/uploads', { method: 'POST', form })
-      feedback.textContent = result.message
-      await loadSubmissionPage()
-    } catch (error) { feedback.textContent = error.message }
-    finally { deconstructionButton.disabled = false }
-  })
-
-  const novelForm = node('form', { class: 'novel-submission-form' })
-  const steps = [
-    node('fieldset', { class: 'submission-step' }, [
-      node('legend', { text: '01 · 作品资料' }),
-      node('label', { class: 'profile-field' }, [node('span', { text: '书名' }), node('input', { name: 'title', maxlength: '160', required: '' })]),
-      node('label', { class: 'profile-field' }, [node('span', { text: '作者' }), node('input', { name: 'author', maxlength: '100', required: '' })]),
-      node('label', { class: 'profile-field' }, [
-        node('span', { text: '分类' }),
-        node('select', { name: 'category', required: '' }, [
-          node('option', { value: '', text: '请选择系统分类', disabled: '', selected: '' }),
-          ...state.categories.map(item => node('option', { value: item.name, text: item.name }))
-        ])
-      ]),
-      node('label', { class: 'profile-field' }, [node('span', { text: '连载状态' }), node('select', { name: 'serialization_status' }, [node('option', { value: 'ongoing', text: '连载中' }), node('option', { value: 'finished', text: '已完结' })])]),
-      node('label', { class: 'profile-field profile-field-wide' }, [node('span', { text: '作品简介' }), node('textarea', { name: 'summary', minlength: '20', maxlength: '4000', rows: '6', required: '' })])
-    ]),
-    node('fieldset', { class: 'submission-step', hidden: '' }, [
-      node('legend', { text: '02 · 文件与封面' }),
-      node('label', { class: 'profile-field profile-field-wide' }, [node('span', { text: '正文 TXT / EPUB' }), node('input', { name: 'manuscript', type: 'file', accept: '.txt,.epub,text/plain,application/epub+zip', required: '' })]),
-      node('label', { class: 'profile-field profile-field-wide' }, [node('span', { text: '书籍封面 JPEG / PNG / WebP' }), node('input', { name: 'cover', type: 'file', accept: 'image/jpeg,image/png,image/webp', required: '' })])
-    ]),
-    node('fieldset', { class: 'submission-step', hidden: '' }, [
-      node('legend', { text: '03 · 来源与授权' }),
-      node('label', { class: 'profile-field profile-field-wide' }, [node('span', { text: '作品来源' }), node('input', { name: 'source', maxlength: '500', placeholder: '原创 / 开源地址 / 授权方', required: '' })]),
-      node('label', { class: 'profile-field profile-field-wide' }, [node('span', { text: '版权或授权说明' }), node('textarea', { name: 'authorization', minlength: '10', maxlength: '2000', rows: '5', required: '', placeholder: '请说明你有权上传并允许我站展示的依据' })]),
-      node('p', { class: 'page-subtitle', text: '提交后会先进入隔离沙箱、ClamAV 验毒与审核；未通过不会写入书库。' })
-    ])
-  ]
-  let currentStep = 0
-  const stepLabel = node('strong', { text: '1 / 3' })
-  const previous = node('button', { class: 'ghost-button', type: 'button', text: '上一步', disabled: '' })
-  const next = node('button', { class: 'primary-button', type: 'button', text: '下一步' })
-  const submit = node('button', { class: 'primary-button', type: 'submit', text: '提交审核', hidden: '' })
-  const showStep = index => {
-    currentStep = Math.max(0, Math.min(2, index))
-    steps.forEach((step, position) => { step.hidden = position !== currentStep })
-    previous.disabled = currentStep === 0; next.hidden = currentStep === 2; submit.hidden = currentStep !== 2
-    stepLabel.textContent = `${currentStep + 1} / 3`
-  }
-  previous.addEventListener('click', () => showStep(currentStep - 1))
-  next.addEventListener('click', () => {
-    const controls = [...steps[currentStep].querySelectorAll('input,textarea,select')]
-    if (controls.some(control => !control.reportValidity())) return
-    showStep(currentStep + 1)
-  })
-  novelForm.append(node('ol', { class: 'submission-stepper' }, [node('li', { text: '作品资料' }), node('li', { text: '正文与封面' }), node('li', { text: '授权确认' })]), ...steps,
-    node('div', { class: 'submission-wizard-actions' }, [previous, stepLabel, next, submit]))
-  novelForm.addEventListener('submit', async event => {
-    event.preventDefault(); submit.disabled = true; feedback.textContent = '正在隔离沙箱扫描正文与封面…'
-    const values = new FormData(novelForm)
-    const metadata = Object.fromEntries(['title','author','category','serialization_status','summary','source','authorization'].map(key => [key, values.get(key)]))
-    const form = new FormData(); form.append('metadata', JSON.stringify(metadata)); form.append('manuscript', values.get('manuscript')); form.append('cover', values.get('cover'))
-    try {
-      const result = await accountApi('/api/v1/me/novel-submissions', { method: 'POST', form })
-      feedback.textContent = result.message; await loadSubmissionPage()
-    } catch (error) { feedback.textContent = error.message }
-    finally { submit.disabled = false }
-  })
-
-  const records = node('div', { class: 'submission-records' }, [
-    ...(novels.items || []).map(item => submissionRecord(item, 'novel')),
-    ...(deconstructions.items || []).map(item => submissionRecord(item, 'deconstruction'))
-  ])
-  if (!records.childElementCount) records.append(node('p', { class: 'page-subtitle', text: '还没有投稿记录。' }))
-  app.replaceChildren(node('div', { class: 'account-page' }, [
-    accountNavigation('submissions'), feedback,
-    node('header', { class: 'account-page-heading' }, [node('span', { class: 'eyebrow', text: 'CONTRIBUTOR STUDIO' }), node('h1', { text: '我的投稿' }), node('p', { text: '每一份文件都会安全隔离、识别结构并完成审核，通过后才交给入库流程。' })]),
-    node('section', { class: 'account-section submission-panel' }, [node('h2', { text: '上传我的拆书文' }), node('p', {}, [document.createTextNode('注意：我站目前仅接受上传来自开源项目《oh-story-claudecode》的拆书结构。'), node('a', { href: 'https://github.com/worldwonderer/oh-story-claudecode', target: '_blank', rel: 'noopener noreferrer', text: '查看开源项目 ↗' })]), reviewRules(), deconstructionForm]),
-    node('section', { class: 'account-section submission-panel' }, [node('h2', { text: '上传小说' }), node('p', { text: '按作品资料、正文封面、版权授权三步提交。' }), reviewRules(), novelForm]),
-    node('section', { class: 'account-section' }, [node('h2', { text: '审核与入库记录' }), records])
-  ]))
-}
-
-async function loadNotificationsPage() {
-  if (!state.account) { openAuthDialog('login'); location.hash = '#/'; return }
-  setSeo({ title: '消息中心｜OOH Story', description: '查看投稿审核与入库通知。', canonicalPath: '/', robots: 'noindex, nofollow' })
-  const data = await accountApi('/api/v1/me/notifications')
-  state.notificationsUnread = Number(data.unread_count || 0)
-  const notificationView = item => {
-    const searchable = `${item.title || ''} ${item.message || ''}`
-    const rejected = /驳回|未通过|失败|缺少/.test(searchable)
-    if (rejected) return { tone: 'danger', icon: '!', label: '需要处理' }
-    if (item.kind === 'submission_ingestion') return { tone: 'success', icon: '✓', label: '入库进度' }
-    return { tone: 'review', icon: '◇', label: '审核动态' }
-  }
-  const list = node('div', { class: 'notification-list', role: 'list' }, (data.items || []).map(item => {
-    const view = notificationView(item)
-    const actions = node('div', { class: 'notification-actions' }, [
-      ...(item.action_url ? [node('a', { class: 'notification-action-link', href: item.action_url, text: '查看投稿 →' })] : []),
-      ...(!item.read_at ? [node('button', { class: 'notification-read-button', type: 'button', text: '标记已读', onclick: async () => { await accountApi(`/api/v1/me/notifications/${item.id}/read`, { method: 'POST' }); await loadNotificationsPage() } })] : [])
-    ])
-    return node('article', { class: `notification-card tone-${view.tone}${item.read_at ? '' : ' unread'}`, role: 'listitem' }, [
-      node('div', { class: 'notification-icon', 'aria-hidden': 'true' }, [node('span', { text: view.icon })]),
-      node('div', { class: 'notification-content' }, [
-        node('div', { class: 'notification-card-topline' }, [
-          node('span', { class: `notification-kind tone-${view.tone}`, text: view.label }),
-          ...(!item.read_at ? [node('span', { class: 'notification-unread', role: 'status', text: '未读' })] : [node('span', { class: 'notification-read', text: '已读' })])
-        ]),
-        node('h2', { text: item.title }),
-        node('p', { text: item.message }),
-        node('footer', { class: 'notification-footer' }, [
-          node('time', { datetime: item.created_at, text: new Date(item.created_at).toLocaleString('zh-CN') }),
-          actions
-        ])
-      ])
-    ])
-  }))
-  if (!list.childElementCount) list.append(node('div', { class: 'account-empty notification-empty' }, [
-    node('span', { class: 'notification-empty-icon', text: '◇' }),
-    node('h2', { text: '收件箱很安静' }),
-    node('p', { text: '投稿审核、缺失文件和正式入库结果会第一时间出现在这里。' }),
-    node('a', { class: 'primary-button', href: '#/account/submissions', text: '前往投稿中心' })
-  ]))
-  const markAll = node('button', { class: 'notification-mark-all', type: 'button', text: '全部标记已读', disabled: state.notificationsUnread ? null : '', onclick: async () => { await accountApi('/api/v1/me/notifications/read', { method: 'POST' }); await loadNotificationsPage() } })
-  app.replaceChildren(node('div', { class: 'account-page notification-page' }, [
-    accountNavigation('notifications'),
-    node('header', { class: 'notification-hero' }, [
-      node('div', { class: 'notification-hero-copy' }, [
-        node('span', { class: 'eyebrow', text: 'MESSAGE CENTER' }),
-        node('h1', { text: '消息中心' }),
-        node('p', { text: '审核进展、入库结果与需要补充的资料，都集中在这里。' })
-      ]),
-      node('div', { class: 'notification-summary' }, [
-        node('span', { text: '未读消息' }),
-        node('strong', { text: String(state.notificationsUnread) }),
-        markAll
-      ])
-    ]),
-    list
-  ]))
-}
-
-async function loadAccountPage() {
-  if (!state.account) {
-    openAuthDialog('login')
-    location.hash = '#/'
-    return
-  }
-  setSeo({ title: '个人中心｜OOH Story', description: '管理私人阅读记录、收藏、书架与上传历史。', canonicalPath: '/', robots: 'noindex, nofollow' })
-  if (!state.accountConfig) state.accountConfig = await api('/api/v1/auth/config')
-  const [cloud, uploads, userInfo, notifications] = await Promise.all([
-    refreshCloudState(),
-    accountApi('/api/v1/me/uploads'),
-    accountApi('/api/v1/me/profile'),
-    accountApi('/api/v1/me/notifications?limit=1')
-  ])
-  state.notificationsUnread = Number(notifications.unread_count || 0)
-  state.accountProfile = userInfo.profile
-  state.accountReading = userInfo.reading
-  updateAccountButton()
-  const uploadList = node('div', { class: 'upload-list' },
-    (uploads.items || []).map(item => node('div', { class: 'upload-item' }, [
-      node('div', {}, [
-        node('strong', { text: item.original_filename }),
-        node('small', { text: `${formatBytes(item.bytes)} · ${new Date(item.created_at).toLocaleString('zh-CN')}${item.rejection_reason ? ` · ${item.rejection_reason}` : ''}` })
-      ]),
-      node('span', { class: 'upload-status', text: uploadStatusLabel(item.status) })
-    ]))
-  )
-  if (!(uploads.items || []).length) uploadList.append(node('p', { class: 'page-subtitle', text: '还没有上传记录。' }))
-  const fileInput = node('input', { type: 'file', accept: '.zip,application/zip', required: '' })
-  const uploadButton = node('button', { class: 'primary-button', type: 'submit', text: '隔离扫描并上传' })
-  const uploadMessage = node('p', { class: 'auth-error', role: 'status' })
-  const uploadForm = node('form', { class: 'upload-box' }, [fileInput, uploadButton])
-  uploadForm.addEventListener('submit', async event => {
-    event.preventDefault()
-    if (!fileInput.files?.[0]) return
-    uploadButton.disabled = true
-    uploadMessage.textContent = '正在隔离、检查文件结构并执行病毒扫描…'
-    const form = new FormData()
-    form.append('file', fileInput.files[0])
-    try {
-      const result = await accountApi('/api/v1/me/uploads', { method: 'POST', form })
-      uploadMessage.textContent = result.message
-      await loadAccountPage()
-    } catch (error) {
-      uploadMessage.textContent = error.message
-    } finally {
-      uploadButton.disabled = false
-    }
-  })
-  const logout = node('button', { class: 'ghost-button', type: 'button', text: '退出登录', onclick: async () => {
-    await accountApi('/api/v1/auth/logout', { method: 'POST' })
-    state.account = null
-    state.accountProfile = null
-    state.accountReading = null
-    state.csrfToken = ''
-    state.cloudState = { history: [], favorites: [], bookshelf: [] }
-    updateAccountButton()
-    location.hash = '#/'
-  } })
-  const resend = !state.account.email_verified && state.accountConfig.email_verification_delivery
-    ? node('button', { class: 'ghost-button', type: 'button', text: '重发验证邮件', onclick: async event => {
-        event.currentTarget.disabled = true
-        try {
-          const result = await accountApi('/api/v1/auth/resend-verification', { method: 'POST' })
-          state.accountNotice = result.message
-        } catch (error) {
-          state.accountNotice = error.message
-        }
-        await loadAccountPage()
-      } })
-    : null
-  const googleSlot = node('div', { class: 'google-login-slot' }, state.account.google_linked ? [] : [
-    node('button', { class: 'ghost-button', type: 'button', text: '绑定 Google 账户', onclick: async event => {
-      event.currentTarget.disabled = true
-      try {
-        await accountApi('/api/v1/auth/google/link/start', { method: 'POST' })
-        await renderGoogleButton(googleSlot, { mode: 'link' })
-      } catch (error) {
-        googleSlot.replaceChildren(node('div', { class: 'google-unavailable', text: error.message }))
-      }
-    } })
-  ])
-  const googleMessage = node('p', {
-    class: 'google-link-message',
-    text: state.account.google_linked
-      ? '已绑定 Google。今后 Web、Android 和 iOS 均可直接使用此 Google 账户登录。'
-      : '绑定时请选择与注册邮箱一致的 Google 账户。绑定完成后，无需再次输入密码。'
-  })
-  app.replaceChildren(node('div', { class: 'account-page' }, [
-    accountNavigation('overview'),
-    ...(state.accountNotice ? [node('p', { class: 'account-notice', text: state.accountNotice, role: 'status' })] : []),
-    node('section', { class: 'account-hero' }, [
-      accountAvatar(userInfo.profile),
-      node('div', {}, [
-        node('div', { class: 'account-name-row' }, [
-          node('h1', { text: state.account.display_name }),
-          readingRankIcon(userInfo.reading)
-        ]),
-        node('p', { text: `${state.account.email}${state.account.email_verified ? ' · 已验证' : ' · 待验证，上传功能暂不可用'}` }),
-        node('span', { class: 'account-level-badge', text: `${userInfo.reading.roman} · ${userInfo.reading.name}` })
-      ]),
-      ...(resend ? [node('div', { class: 'account-hero-actions' }, [resend])] : [])
-    ]),
-    node('div', { class: 'account-grid' }, [
-      node('a', { class: 'account-stat', href: '#/account/history' }, [node('strong', { text: String(cloud.history.length) }), node('span', { text: '阅读记录' })]),
-      node('a', { class: 'account-stat', href: '#/account/favorites' }, [node('strong', { text: String(cloud.favorites.length) }), node('span', { text: '收藏作品' })]),
-      node('a', { class: 'account-stat', href: '#/account/bookshelf' }, [node('strong', { text: String(cloud.bookshelf.length) }), node('span', { text: '私人书架' })]),
-      node('a', { class: 'account-stat', href: '#/account/notifications' }, [node('strong', { text: String(state.notificationsUnread) }), node('span', { text: '未读消息' })])
-    ]),
-    readingIdentity(userInfo.reading, true),
-    node('section', { class: 'account-section account-profile-shortcut' }, [
-      node('div', {}, [node('h2', { text: '资料与账户安全' }), node('p', { text: '上传头像、完善个人信息或修改密码。' })]),
-      node('a', { class: 'ghost-button', href: '#/account/profile', text: '打开设置 →' })
-    ]),
-    node('section', { class: 'account-section google-link-card' }, [
-      node('div', { class: 'google-link-copy' }, [
-        node('h2', { text: 'Google 账户绑定' }),
-        googleMessage
-      ]),
-      state.account.google_linked
-        ? node('span', { class: 'google-link-status', text: '✓ 已绑定' })
-        : googleSlot
-    ]),
-    node('section', { class: 'account-section' }, [
-      node('h2', { text: '上传我的拆书文' }),
-      node('p', {}, [
-        document.createTextNode('注意：我站目前仅接受上传来自开源项目《oh-story-claudecode》的拆书结构。'),
-        node('a', { href: 'https://github.com/worldwonderer/oh-story-claudecode', target: '_blank', rel: 'noopener noreferrer', text: '查看项目结构 ↗' })
-      ]),
-      node('p', { text: '请上传 ZIP。我们会长/短篇结构审核与内容复核完后，并通过消息中心告知您上传结果。' }),
-      uploadForm, uploadMessage, uploadList,
-      node('a', { class: 'ghost-button', href: '#/account/submissions', text: '打开完整投稿中心 →' })
-    ]),
-    node('div', { class: 'account-logout-zone' }, [logout])
-  ]))
-}
-
 let ephemeralMetricVisitorId = null
 
 function isUuidV4(value) {
@@ -2060,8 +832,7 @@ async function getReaderCatalog(bookId) {
   } catch {
     sessionStorage.removeItem(readerCatalogCacheKey(bookId))
   }
-  const savedAt = Number(sessionStorage.getItem(`${readerCatalogCacheKey(bookId)}:saved-at`) || 0)
-  if (Date.now() - savedAt < 5 * 60 * 1000 && validReaderCatalog(stored, bookId)) {
+  if (validReaderCatalog(stored, bookId)) {
     state.readerCatalogs.set(key, stored)
     return stored
   }
@@ -2070,7 +841,6 @@ async function getReaderCatalog(bookId) {
     state.readerCatalogs.set(key, data)
     try {
       sessionStorage.setItem(readerCatalogCacheKey(bookId), JSON.stringify(data))
-      sessionStorage.setItem(`${readerCatalogCacheKey(bookId)}:saved-at`, String(Date.now()))
     } catch {
       // A very large catalog may exceed session storage. Memory cache still works.
     }
@@ -2158,6 +928,14 @@ function formatChineseChapterNumber(value) {
   return convert(number)
 }
 
+function isFrontMatterChapter(chapter) {
+  return chapter?.is_front_matter === true
+    || (
+      String(chapter?.label || '').trim() === '序'
+      && String(chapter?.title || '').trim() === '作品信息'
+    )
+}
+
 function chapterPresentation(chapter, position = null) {
   const label = String(chapter?.label || '').trim()
   const title = String(chapter?.title || '').trim()
@@ -2169,12 +947,19 @@ function chapterPresentation(chapter, position = null) {
   const isMissingTitle = value => !value
     || value === '原文未标注章名'
     || /^正文片段\s*\d+$/u.test(value)
+  const isNumberedChapterLabel = value =>
+    /^第?\s*[零〇一二三四五六七八九十百千万两\d]+\s*[章节回卷篇部集]$/u.test(value)
   const isGenericLabel = value => !value
     || value === '正文'
-    || /^第?\s*[零〇一二三四五六七八九十百千万两\d]+\s*[章节回卷篇部集]$/u.test(value)
+    || isNumberedChapterLabel(value)
 
   if (!isMissingTitle(title) && title !== label) {
     return { label: label || fallback, title }
+  }
+  // Preserve an explicit source ordinal. Front matter may occupy an earlier
+  // section slot, so the array position is not necessarily the chapter number.
+  if (!isMissingTitle(label) && isNumberedChapterLabel(label)) {
+    return { label: '', title: label }
   }
   if (!isMissingTitle(label) && !isGenericLabel(label)) {
     return { label: '', title: label }
@@ -3058,7 +1843,7 @@ async function loadLibrary() {
     pageAction('尾页', data.page_count, currentPage < data.page_count, '前往尾页')
   ])
   app.replaceChildren(
-    pageHeading('THE LIBRARY', '全局书库', '海量正版小说免费阅读，输入书名或作者即可搜索。'),
+    pageHeading('THE LIBRARY', '全局书库', '海量收录小说免费阅读，输入书名或作者即可搜索。'),
     filterPanel,
     toolbar,
     node('p', { class: 'result-meta', text: `找到 ${formatNumber(data.total)} 本可读作品` }),
@@ -3071,13 +1856,14 @@ async function loadLibrary() {
 async function loadBook(bookId) {
   const libraryReturnPath = safeLibraryReturnPath(paramsFromHash().get('from'))
   const contextualHref = path => withLibraryReturn(path, libraryReturnPath)
-  const [book, catalog, metrics, recommendationState] = await Promise.all([
+  const [book, catalog, metrics, recommendationState, initialBookComments] = await Promise.all([
     api(`/api/v1/books/${bookId}`),
     api(`/api/v1/books/${bookId}/chapters`),
     api(`/api/v1/books/${bookId}/metrics`, { cache: 'no-store' }),
     state.account
       ? accountApi(`/api/v1/books/${bookId}/recommendation`).catch(() => null)
-      : Promise.resolve(null)
+      : Promise.resolve(null),
+    accountApi(`/api/v1/books/${bookId}/comments`).catch(() => ({ comments: [], comment_count: 0 }))
   ])
   const tags = [...new Set([
     book.category,
@@ -3090,17 +1876,21 @@ async function loadBook(bookId) {
   const hasVolumes = Boolean(catalog.volumes && catalog.volumes.length > 0)
   if (hasVolumes) {
     const volGrid = node('div', { class: 'vol-cover-grid' })
-    catalog.volumes.forEach(vol => {
+    const eagerVolumeCoverCount = window.matchMedia('(max-width: 720px)').matches ? 3 : 6
+    catalog.volumes.forEach((vol, volumeIndex) => {
       const coverEl = node('div', { class: 'vol-cover-wrap' })
       if (vol.cover_path) {
         const img = node('img', { alt: vol.title })
         img.addEventListener('error', () => img.remove())
-        coverLoader.observe(img, `/api/v1/books/${bookId}/illustrations/${encodeURI(vol.cover_path)}`)
+        const coverUrl = `/api/v1/books/${bookId}/illustrations/${encodeURI(vol.cover_path)}`
+        if (volumeIndex < eagerVolumeCoverCount) coverLoader.loadNow(img, coverUrl)
+        else coverLoader.observe(img, coverUrl)
         coverEl.append(img)
       } else if (Number(vol.id) === 1 && book.cover_url && !book.cover_is_default) {
         const img = node('img', { alt: `${book.title} 封面` })
         img.addEventListener('error', () => img.remove())
-        coverLoader.observe(img, book.cover_url)
+        if (volumeIndex < eagerVolumeCoverCount) coverLoader.loadNow(img, book.cover_url)
+        else coverLoader.observe(img, book.cover_url)
         coverEl.append(img)
       } else {
         coverEl.append(node('span', { class: 'vol-cover-placeholder' }, [
@@ -3126,6 +1916,42 @@ async function loadBook(bookId) {
       ]))
     })
   }
+  let chaptersAscending = true
+  const sortBtn = node('button', { class: 'chapter-sort-btn', type: 'button' })
+  sortBtn.textContent = '正序 ↓'
+  sortBtn.addEventListener('click', () => {
+    chaptersAscending = !chaptersAscending
+    sortBtn.textContent = chaptersAscending ? '正序 ↓' : '倒序 ↑'
+    const displayChapters = chaptersAscending
+      ? [...catalog.chapters]
+      : [...catalog.chapters].reverse()
+    chapterList.replaceChildren()
+    displayChapters.forEach((chapter) => {
+      const origIndex = catalog.chapters.indexOf(chapter)
+      const presentation = chapterPresentation(chapter, origIndex)
+      chapterList.append(node('a', { class: 'chapter-link', href: contextualHref(`/books/${bookId}/chapters/${chapter.id}`) }, [
+        presentation.label ? node('span', { text: presentation.label }) : null,
+        node('strong', { text: presentation.title })
+      ]))
+    })
+  })
+  const chapterPanel = node('section', { class: `chapter-panel${hasVolumes ? ' volume-gallery-panel' : ''}` }, [
+    node('div', { class: 'chapter-panel-head' }, [
+      node('div', {}, [
+        hasVolumes ? node('span', { class: 'eyebrow', text: 'VOLUME GALLERY' }) : null,
+        node('h2', { text: hasVolumes ? '分卷封面与目录' : '章节目录' })
+      ]),
+      node('div', { class: 'chapter-panel-head-right' }, [
+        !hasVolumes ? sortBtn : null,
+        node('span', { class: 'tag', text: hasVolumes
+          ? `共 ${catalog.volumes.length} 卷 · ${formatNumber(catalog.chapter_count)} 章`
+          : `${formatNumber(catalog.chapter_count)} 章`
+        })
+      ])
+    ]),
+    chapterList
+  ])
+  const volumeCoverPreview = null
   const summary = book.summary || '暂无结构化简介，可以从章节目录直接进入故事。'
   const bookCanonical = publicUrl(`/books/${encodeURIComponent(book.public_id || bookId)}`)
   const bookImage = publicUrl(book.cover_url || SITE_DEFAULT_IMAGE, SITE_DEFAULT_IMAGE)
@@ -3144,10 +1970,15 @@ async function loadBook(bookId) {
     entity: bookSeoEntity(book, bookCanonical, bookDescription, bookImage)
   })
   const savedProgress = getReadingProgress(book.public_id || bookId)
-  const resumeChapter = savedProgress
+  const resumeCandidate = savedProgress
     ? catalog.chapters.find(chapter => Number(chapter.id) === Number(savedProgress.chapterId))
     : null
-  const firstChapter = catalog.chapters[0]
+  const resumeChapter = resumeCandidate && !isFrontMatterChapter(resumeCandidate)
+    ? resumeCandidate
+    : null
+  const firstChapter = catalog.chapters.find(chapter =>
+    Number(chapter.id) === Number(catalog.first_chapter_id)
+  ) || catalog.chapters.find(chapter => !isFrontMatterChapter(chapter)) || catalog.chapters[0]
   const readingChapter = resumeChapter || firstChapter
   const recommendCountEl = node('span', { text: formatNumber(metrics.recommend_count || 0) })
   const favoriteCountEl = node('span', { text: formatNumber(metrics.favorite_count || 0) })
@@ -3283,8 +2114,97 @@ async function loadBook(bookId) {
           })
       }
     }),
-    book.has_deconstruction ? node('a', { class: 'ghost-button', href: '/deconstructions', text: '查看拆书档案' }) : null
+    book.deconstruction_slug ? node('a', {
+      class: 'ghost-button',
+      href: `/deconstructions/${encodeURIComponent(book.deconstruction_slug)}`,
+      text: '拆书档案'
+    }) : null
   ])
+  const sourcePanel = null
+  let bookCommentState = initialBookComments || { comments: [], comment_count: 0 }
+  const bookCommentSection = node('section', { class: 'book-comment-panel' })
+  const renderBookComments = () => {
+    const comments = Array.isArray(bookCommentState.comments) ? bookCommentState.comments : []
+    const list = node('div', { class: 'book-comment-list' })
+    if (!comments.length) {
+      list.append(node('div', { class: 'book-comment-empty' }, [
+        node('span', { text: '💬' }), node('strong', { text: '还没有书评' }),
+        node('p', { text: '读完简介或章节后，留下第一条阅读感受。' })
+      ]))
+    } else comments.forEach(comment => {
+      const author = comment.author || {}
+      const reading = author.reading || {}
+      const viewerLikes = Math.max(0, Math.min(3, Number(comment.viewer_like_count || 0)))
+      const totalLikes = Number(comment.like_count ?? comment.thanks_count ?? 0)
+      const likeButton = node('button', {
+        class: `interline-like${viewerLikes ? ' active' : ''}${viewerLikes >= 3 ? ' maxed' : ''}`,
+        type: 'button',
+        disabled: comment.is_own || viewerLikes >= 3 ? '' : null,
+        text: comment.is_own ? `收到点赞 · ${totalLikes}` : viewerLikes >= 3
+          ? `已点满 3/3 · ${totalLikes}` : viewerLikes
+            ? `再赞一次 ${viewerLikes}/3 · ${totalLikes}` : `♡ 点赞 · ${totalLikes}`
+      })
+      if (!comment.is_own && viewerLikes < 3) likeButton.onclick = async () => {
+        if (!state.account) { openAuthDialog('login', '登录后才能为书评点赞。'); return }
+        likeButton.disabled = true
+        try {
+          await accountApi(`/api/v1/comments/${comment.id}/likes`, { method: 'POST' })
+          bookCommentState = await accountApi(`/api/v1/books/${bookId}/comments`)
+          renderBookComments()
+        } catch (error) {
+          window.alert(error.message || '暂时无法点赞')
+          likeButton.disabled = false
+        }
+      }
+      list.append(node('article', { class: 'book-comment-card' }, [
+        node('header', {}, [
+          node('div', { class: 'book-comment-author' }, [
+            node('span', { class: 'book-comment-avatar', text: accountInitials(author) }),
+            node('div', {}, [node('strong', { text: author.display_name || '读者' }),
+              node('span', { class: 'book-comment-rank' }, [
+                readingRankIcon(reading, { decorative: true }),
+                node('span', { text: `${reading.roman || 'Ⅰ'} · ${reading.name || '只如初见'}` })
+              ])])
+          ]),
+          node('time', { datetime: comment.created_at || '', text: comment.created_at ? new Date(comment.created_at).toLocaleString('zh-CN') : '' })
+        ]),
+        node('p', { text: comment.content || '' }),
+        node('footer', {}, [likeButton])
+      ]))
+    })
+    const composer = node('div', { class: 'book-comment-composer' })
+    if (!state.account) {
+      composer.append(node('button', { class: 'ghost-button', type: 'button', text: '登录后发表评论', onclick: () => openAuthDialog('login') }))
+    } else {
+      const textarea = node('textarea', { maxlength: '500', rows: '3', placeholder: '写下你对这本书的感受…', 'aria-label': '书籍评论内容' })
+      const counter = node('span', { text: '0 / 500' })
+      const submit = node('button', { class: 'primary-button', type: 'button', text: '发布评论' })
+      textarea.addEventListener('input', () => { counter.textContent = `${[...textarea.value].length} / 500` })
+      submit.onclick = async () => {
+        const content = textarea.value.trim()
+        if (!content) return
+        const issue = localUserContentIssue(content)
+        if (issue) { openUserContentNotice(issue, { returnFocus: textarea }); return }
+        submit.disabled = true
+        try {
+          bookCommentState = await accountApi(`/api/v1/books/${bookId}/comments`, { method: 'POST', body: { content } })
+          renderBookComments()
+        } catch (error) {
+          if (isUserContentGuardIssue(error.message)) openUserContentNotice(error.message, { returnFocus: textarea })
+          else window.alert(error.message || '评论无法发布')
+          submit.disabled = false
+        }
+      }
+      composer.append(textarea, node('div', { class: 'book-comment-composer-actions' }, [counter, submit]))
+    }
+    bookCommentSection.replaceChildren(
+      node('div', { class: 'book-comment-head' }, [
+        node('div', {}, [node('span', { class: 'eyebrow', text: 'BOOK DISCUSSION' }), node('h2', { text: '读者评论' })]),
+        node('span', { class: 'tag', text: `${comments.length} 条` })
+      ]), list, composer
+    )
+  }
+  renderBookComments()
   app.replaceChildren(node('div', { class: 'detail-page' }, [
     node('div', { class: 'detail-backbar' }, [
       node('a', { class: 'detail-back', href: libraryReturnPath, text: '← 返回书库' })
@@ -3295,8 +2215,11 @@ async function loadBook(bookId) {
         node('span', { class: 'eyebrow', text: 'BOOK PROFILE' }),
         node('h1', { text: book.title }),
         node('p', { class: 'detail-author', text: `作者 · ${book.author}` }),
+        volumeCoverPreview,
         node('div', { class: 'tag-row' }, tags.map(tag => node('span', { class: 'tag', text: tag }))),
         actionRow,
+        sourcePanel,
+        hasVolumes ? chapterPanel : null,
         metricSummary,
         node('div', { class: 'fact-grid' }, [
           node('div', { class: 'fact' }, [node('strong', { text: formatNumber(book.approx_word_count) }), node('span', { text: '估算字数' })]),
@@ -3320,16 +2243,8 @@ async function loadBook(bookId) {
           })
           return node('div', { class: 'detail-summary-wrapper' }, [summaryEl, toggleBtn])
         })(),
-        node('section', { class: 'chapter-panel' }, [
-          node('div', { class: 'chapter-panel-head' }, [
-            node('h2', { text: hasVolumes ? '分卷目录' : '章节目录' }),
-            node('span', { class: 'tag', text: hasVolumes
-              ? `共 ${catalog.volumes.length} 卷 · ${formatNumber(catalog.chapter_count)} 章`
-              : `${formatNumber(catalog.chapter_count)} 章`
-            })
-          ]),
-          chapterList
-        ])
+        hasVolumes ? null : chapterPanel,
+        bookCommentSection
       ])
     ])
   ]))
@@ -3641,8 +2556,11 @@ async function loadReader(bookId, chapterId) {
   let autoState = null
   let autoButton = null
   let ttsButton = null
+  let ttsExitButton = null
   let ttsStateBar = null
+  let ttsExitControl = null
   let ttsParagraphIndex = -1
+  let ttsPendingHighlightIndex = null, ttsHighlightRetryFrame = null, ttsHighlightRetryAttempts = 0
   let currentParagraphHint = -1
   let interlineAction = null
   let chapterComments = initialChapterComments
@@ -3655,6 +2573,61 @@ async function loadReader(bookId, chapterId) {
   let fontSizeDisplay = null
   let fontSizeInput = null
   let fontSizeOutput = null
+
+  const readerParagraphIndex = paragraph => {
+    const value = Number(paragraph?.dataset?.ttsIndex ?? paragraph?.dataset?.paragraphIndex)
+    return Number.isFinite(value) ? Math.max(0, value) : -1
+  }
+
+  const readerParagraphFromPoint = (clientX, clientY, fallbackParagraph = null) => {
+    if (!readerContent) return null
+    const x = Number(clientX)
+    const y = Number(clientY)
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null
+    const insideReader = paragraph => (
+      paragraph && readerContent.contains(paragraph) ? paragraph : null
+    )
+    const directParagraph = document.elementsFromPoint?.(x, y)
+      ?.map(element => element.closest?.('.reader-paragraph'))
+      .find(insideReader)
+    if (directParagraph) return directParagraph
+    const caretNode = document.caretPositionFromPoint?.(x, y)?.offsetNode
+      || document.caretRangeFromPoint?.(x, y)?.startContainer
+    const caretElement = caretNode?.nodeType === Node.TEXT_NODE
+      ? caretNode.parentElement
+      : caretNode
+    const caretParagraph = insideReader(caretElement?.closest?.('.reader-paragraph'))
+    if (caretParagraph) return caretParagraph
+    const fallback = insideReader(fallbackParagraph)
+    if (fallback) {
+      const rect = fallback.getBoundingClientRect()
+      if (x >= rect.left - 8 && x <= rect.right + 8 && y >= rect.top - 8 && y <= rect.bottom + 8) {
+        return fallback
+      }
+    }
+    let nearest = null
+    let nearestDistance = Infinity
+    readerContent.querySelectorAll('.reader-paragraph').forEach(paragraph => {
+      const rect = paragraph.getBoundingClientRect()
+      if (rect.width <= 0 || rect.height <= 0) return
+      const xDistance = x < rect.left ? rect.left - x : x > rect.right ? x - rect.right : 0
+      if (xDistance > Math.max(48, rect.width * 0.25)) return
+      const yDistance = y < rect.top ? rect.top - y : y > rect.bottom ? y - rect.bottom : 0
+      const distance = yDistance + xDistance * 0.15
+      if (distance < nearestDistance) {
+        nearestDistance = distance
+        nearest = paragraph
+      }
+    })
+    return nearestDistance <= 96 ? nearest : null
+  }
+
+  const updateCurrentParagraphFromPoint = (clientX, clientY, fallbackParagraph = null) => {
+    const paragraph = readerParagraphFromPoint(clientX, clientY, fallbackParagraph)
+    const index = readerParagraphIndex(paragraph)
+    if (index >= 0) currentParagraphHint = index
+    return paragraph
+  }
 
   const ingestChapterComments = data => {
     chapterComments = data && typeof data === 'object' ? data : { paragraphs: {}, comment_count: 0 }
@@ -3724,12 +2697,24 @@ async function loadReader(bookId, chapterId) {
     readerContent.dataset.direction = direction || 'none'
     const x = -pageIndex * (stage?.clientWidth || 0)
     readerContent.style.setProperty('--reader-page-x', `${x}px`)
-    if (state.reader.mode === 'simulation' && direction !== 'none') {
+    if (state.reader.mode === 'cover' && direction !== 'none') {
+      readerContent.style.transition = 'none'
+      readerContent.style.transform = `translate3d(${x}px,0,0)`
+      readerContent.style.clipPath = direction === 'next'
+        ? 'inset(0 0 0 100%)' : 'inset(0 100% 0 0)'
+      void readerContent.offsetWidth
+      readerContent.style.transition = 'clip-path 0.34s cubic-bezier(0.16, 0, 0.1, 1)'
+      readerContent.style.clipPath = 'inset(0)'
+      pageAnimationTimer = window.setTimeout(() => {
+        readerContent.style.clipPath = ''
+        readerContent.style.transition = ''
+      }, 380)
+    } else if (state.reader.mode === 'simulation' && direction !== 'none') {
       readerContent.style.transformOrigin = direction === 'next' ? 'right center' : 'left center'
-      readerContent.style.transform = `translate3d(${x}px,0,0) rotateY(${direction === 'next' ? '-4deg' : '4deg'})`
+      readerContent.style.transform = `translate3d(${x}px,0,0) rotateY(${direction === 'next' ? '-20deg' : '20deg'})`
       pageAnimationTimer = window.setTimeout(() => {
         readerContent.style.transform = `translate3d(${x}px,0,0) rotateY(0deg)`
-      }, 430)
+      }, 500)
     } else {
       readerContent.style.transform = `translate3d(${x}px,0,0)`
     }
@@ -3837,13 +2822,10 @@ async function loadReader(bookId, chapterId) {
 
   const toggleAutoReading = () => state.reader.autoReading ? stopAutoReading() : startAutoReading()
 
-  const ttsMandarinPool = ['nuanxi', 'lingxian', 'shuanger', 'yanzhi', 'kuangyun', 'qingyan', 'tongzhen', 'mocheng']
-  const ttsFemalePool = ['nuanxi', 'lingxian', 'shuanger', 'yanzhi']
-  const ttsMalePool = ['kuangyun', 'qingyan', 'tongzhen', 'mocheng']
-  const ttsCantonesePool = ['wanqing', 'muyao', 'yueming']
-  const ttsHokkienPool = ['qianyu', 'ruoxi', 'hanfeng']
-  const ttsCache = new Map()
-  const ttsCachePromises = new Map()
+  const ttsVoicePolicyPromise = window.oohstoryTtsVoicePolicyPromise || (window.oohstoryTtsVoicePolicyPromise = fetch('/api/v1/tts/voices', { credentials: 'same-origin' }).then(response => {
+    if (!response.ok) throw new Error(`voice registry ${response.status}`)
+    return response.json()
+  }))
   let ttsChapterPlan = []
   let ttsPlanIndex = 0
   let ttsNextChapterPlan = []
@@ -3853,15 +2835,30 @@ async function loadReader(bookId, chapterId) {
   let ttsNextChapterTitle = ''
   let ttsFollowingChapterId = nextId
   let ttsNextChapterCached = false
-  let ttsPrevUrls = new Set()
   let ttsHeartbeat = null
   let ttsPlanGeneration = 0
   let ttsRebuildTimer = null
   let ttsRebuildRequested = false
-  let ttsPlaybackBlocked = false
-  let ttsPlaybackNotice = ''
-  let ttsCacheEpoch = 0
+  const ttsLifecycle = window.OOHStoryAudiobookLifecycle.create()
+  let ttsFailureToast = null
   const ttsOwner = {}
+  let audiobookServerSessionId = ''
+  let audiobookAbortController = null
+  let audiobookManifestHash = ''
+  let ttsChapterStreamUrl = ''
+  let ttsNextChapterStreamUrl = '', ttsContinuousStreamMode = false
+  let ttsStreamStartPlanIndex = 0
+  let ttsStreamResumeBaseSeconds = 0
+  let ttsTimelineLoadedThrough = -1
+  let ttsActiveStreamId = '', ttsStreamEnding = false
+  let ttsResumeOffsetSeconds = 0
+  let ttsLastTimelineRefresh = 0
+  let ttsTimelinePromise = null
+  let ttsLastProgressAt = 0
+  let ttsSegmentFallbackMode = false
+  let ttsFallbackPlayback = null
+  let ttsBatchPreloadKey = '', ttsBatchPreloadPromise = null
+  let ttsLastStreamCurrentTimeSeconds = 0, ttsTrustedPlanIndex = 0, ttsTrustedItemOffsetSeconds = 0, ttsReplayRecoveryPromise = null
 
   const ttsIllustLine = /^\[illustration:.+\]$/
   const ttsParagraphs = () => {
@@ -3871,450 +2868,70 @@ async function loadReader(bookId, chapterId) {
       .filter(Boolean)
   }
 
+  const ttsScheduleHighlightRetry = index => {
+    ttsPendingHighlightIndex = Number(index); if (ttsHighlightRetryFrame) return
+    ttsHighlightRetryFrame = requestAnimationFrame(() => { ttsHighlightRetryFrame = null; const pending = ttsPendingHighlightIndex; if (pending == null || ttsHighlightRetryAttempts >= 12) { ttsPendingHighlightIndex = null; ttsHighlightRetryAttempts = 0; return } ttsHighlightRetryAttempts++; ttsHighlight(pending) })
+  }
   const ttsHighlight = index => {
-    if (!readerContent) return
-    ttsClearHighlight()
-    const paragraph = readerContent.querySelector(`.reader-paragraph[data-tts-index="${Number(index)}"]`)
-    if (!paragraph) return
+    const paragraph = readerContent?.querySelector?.(`.reader-paragraph[data-tts-index="${Number(index)}"]`)
+    if (!paragraph) { ttsScheduleHighlightRetry(index); return }
+    ttsPendingHighlightIndex = null; ttsHighlightRetryAttempts = 0; ttsClearHighlight()
     paragraph.classList.add('tts-active-line')
-    paragraph.scrollIntoView({
-      behavior: 'smooth',
-      block: window.matchMedia('(max-width: 720px)').matches ? 'start' : 'center'
-    })
+    paragraph.scrollIntoView({ behavior: 'smooth', block: window.matchMedia('(max-width: 720px)').matches ? 'start' : 'center' })
   }
-
-  const ttsClearHighlight = () => {
-    if (!readerContent) return
-    readerContent.querySelectorAll('.tts-active-line').forEach(el => el.classList.remove('tts-active-line'))
-  }
-
-  const ttsDetectEmotion = (text) => {
-    const E = (pitch, rate) => {
-      if (/亲爱|宝贝|甜蜜|深情|挂念|想念|思念|牵挂|柔情|眷恋|缠绵|爱你|喜欢你|在乎你|舍不得/.test(text)) return 'affectionate'
-      if (/温柔|亲切|和蔼|慈祥|和善|慈爱|柔和|暖意|关切|心疼|怜惜|疼爱|宠溺|轻声|低语|耳语|呢喃/.test(text)) return 'gentle'
-      if (/冷笑|嗤|鄙夷|不屑|嘲讽|讥|阴阳怪气|挖苦|讽刺|揶揄|滑稽|逗趣/.test(text)) return 'humorous'
-      if (/神秘|诡异|幽暗|迷雾|悄悄|压低.*声|别出声|阴冷|未知|谜/.test(text)) return 'mysterious'
-      if (/严肃|认真|郑重|正色|凝重|肃穆|庄严|命令|必须|记住/.test(text)) return 'solemn'
-      if (/希望|期待|期盼|盼望|憧憬|太好了|好极了|开心|高兴|欢喜|欣喜/.test(text)) return 'joyful'
-      if (/疲惫|疲倦|累|乏|困|没力气|精疲力竭|筋疲力尽|有气无力|虚弱/.test(text)) return 'weary'
-      if (/紧张|忐忑|催促|赶紧|来不及|快跑|屏住呼吸|手心出汗/.test(text)) return 'tense'
-      const profiles = {
-        '+8Hz:15': 'excited', '+6Hz:15': 'excited', '+4Hz:18': 'tense',
-        '+6Hz:10': 'angry', '+4Hz:12': 'fearful', '+3Hz:8': 'fearful',
-        '-5Hz:-18': 'sad', '+4Hz:10': 'joyful', '+3Hz:5': 'humorous',
-        '-2Hz:-5': 'mysterious', '-4Hz:-15': 'weary', '-3Hz:-10': 'sad',
-        '-2Hz:-8': 'gentle', '-5Hz:-20': 'mysterious', '-2Hz:-10': 'affectionate',
-        '+1Hz:-5': 'solemn', '-1Hz:-8': 'neutral', '+3Hz:-5': 'solemn',
-        '-3Hz:-15': 'weary', '+2Hz:8': 'tense', '+2Hz:5': 'excited',
-        '+3Hz:3': 'tense', '+0Hz:0': 'neutral'
-      }
-      return profiles[`${pitch}:${rate}`] || 'neutral'
-    }
-    if (/大喊|大叫|嘶吼|嘶喊|声嘶力竭|扯着嗓子|放声|吼叫|嚎叫|尖叫|撕心裂肺.*喊|拼命.*喊|冲.*吼/.test(text))
-      return E('+8Hz', 15)
-    if (/吼|怒|骂|咆哮|暴怒|斥|喝道|呵斥|怒吼|怒骂|怒喝|大骂|厉声|咬牙切齿|气急败坏|火冒三丈|暴跳如雷|拍桌|摔|怒视|怒斥|恼怒|震怒|盛怒|狂怒|激怒|愤怒|愤然|忿忿|恨恨|咬牙|握拳|一拳|砸|踢|踹|掀|怒目|瞪|暴起|炸了|妈的|他妈|混蛋|王八|滚|去死|找死|狗东西|畜生/.test(text) || /[！!]{2,}/.test(text))
-      return E('+6Hz', 10)
-    if (/魂飞魄散|吓死|死定了|完了完了|救命|不要过来|求你|饶命|跪|恐惧到.*说不出|瘫倒|瘫软|石化|呆住|魂不附体|三魂七魄/.test(text))
-      return E('+4Hz', 12)
-    if (/害怕|恐惧|颤抖|发抖|哆嗦|战栗|惊恐|吓|心惊|胆寒|毛骨悚然|不寒而栗|瑟缩|骇|慌张|慌乱|惊慌|心虚|提心吊胆|惶恐|汗毛竖|头皮发麻|脊背发凉|冷汗|浑身僵|腿软|血液凝固|窒息|喘不上|不敢动|不敢看|不敢说/.test(text))
-      return E('+3Hz', 8)
-    if (/哭|泪|悲伤|痛哭|呜咽|抽泣|啜泣|哽咽|泣不成声|潸然泪下|眼眶.*红|红了眼|鼻酸|酸楚|凄凉|心碎|难过|伤心|悲痛|含泪|流泪|泪水|眼泪|湿润|模糊.*眼|哭泣|恸|痛心|心痛|揪心|撕心裂肺|肝肠寸断|悲恸/.test(text))
-      return E('-5Hz', -18)
-    if (/哈哈|笑|嘻嘻|呵呵|开心|高兴|乐|欢喜|兴奋|激动|欣喜|得意|畅快|愉悦|雀跃|喜出望外|眉开眼笑|笑逐颜开|太好了|好极了|真棒|哇|帅|厉害|牛|爽|痛快|过瘾|漂亮|精彩|妙/.test(text) && !/冷笑|苦笑|惨笑|嘲笑|讪笑|皮笑肉不笑|假笑|干笑/.test(text))
-      return E('+4Hz', 10)
-    if (/嫉妒|眼红|羡慕|酸|凭什么|为什么是.*不是|不公平|偏心|吃醋|红了眼/.test(text) && !/嗤|鄙夷/.test(text))
-      return E('+2Hz', 5)
-    if (/冷笑|嗤|鄙夷|不屑|嘲讽|讥|嘲笑|讪笑|皮笑肉不笑|阴阳怪气|撇嘴|哼|嗤之以鼻|挖苦|讽刺|奚落|揶揄|轻蔑|看不起|呸|切|哟|可笑|笑话|蠢|白痴|废物|垃圾|也配/.test(text))
-      return E('+3Hz', 5)
-    if (/冷冷|冰冷|寒声|阴沉|阴冷|冷淡|疏离|漠然|淡漠|无情|绝情|狠心|心如铁石|别碍事|少管|与你无关|关你什么事|懒得|不稀罕|爱谁谁/.test(text))
-      return E('-2Hz', -5)
-    if (/尴尬|羞|窘|脸红|不好意思|难为情|局促|手足无措|面红耳赤|赧然|忸怩|臊|羞赧|涨红|害臊|别看我|别说了|讨厌|人家|哎呀/.test(text))
-      return E('+2Hz', 5)
-    if (/叹息|无奈|沮丧|颓然|失落|叹气|苦笑|惆怅|萧索|落寞|意兴阑珊|垂头丧气|心灰意冷|黯然|怅然|郁郁|算了|罢了|认命|没办法|也只能|有什么办法|能怎样|唉|哎/.test(text))
-      return E('-4Hz', -15)
-    if (/抱歉|对不起|惭愧|内疚|愧疚|过意不去|自责|悔恨|懊悔|歉意|亏欠|都怪我|是我的错|我不该|后悔|早知道/.test(text))
-      return E('-3Hz', -10)
-    if (/理解|懂你|辛苦了|不容易|受苦了|心疼你|感同身受|能体会|可以理解|别难过|会好的|在这里|陪着你|有我在/.test(text))
-      return E('-2Hz', -8)
-    if (/轻声|低语|悄悄|耳语|私语|喃喃|呢喃|嘟囔|咕哝|小声|附耳|贴着耳朵|凑近|压低.*声|嘘|别出声|安静/.test(text) || /[轻低柔温]声/.test(text))
-      return E('-5Hz', -20)
-    if (/温柔|亲切|和蔼|慈祥|和善|和气|慈爱|柔和|暖意|关切|心疼|怜惜|疼爱|宠溺|摸.*头|拍.*肩|搂|拥|抱|牵.*手|握.*手|替.*擦/.test(text))
-      return E('-2Hz', -10)
-    if (/严肃|认真|郑重|正色|凝重|肃穆|庄严|一本正经|严厉|端正|正经|肃然|不准|禁止|不许|不要|住手|够了|闭嘴|给我|命令|必须|听清楚|记住/.test(text))
-      return E('+1Hz', -5)
-    if (/平静|冷静|从容|淡定|镇定|不动声色|波澜不惊|若无其事|泰然|沉着|坦然|安然|无所谓|随便|都行|没关系|不要紧/.test(text))
-      return E('-1Hz', -8)
-    if (/亲爱|宝贝|甜蜜|深情|挂念|想念|思念|牵挂|恋恋不舍|柔情|情深|眷恋|缠绵|爱你|喜欢你|在乎你|等你|陪你|舍不得|不要走|别离开/.test(text))
-      return E('-2Hz', -10)
-    if (/希望|期待|期盼|盼望|憧憬|指望|终于.*了|就快|马上就|有希望|有救|有机会|来得及|还不晚|一定能|一定会|相信|我们能/.test(text))
-      return E('+3Hz', 5)
-    if (/惊讶|诧异|愕然|目瞪口呆|瞠目|吃惊|震惊|瞪大|难以置信|不敢相信|万万没想到|怎么可能|竟然|不会吧|你说什么|真的假的|什么|啊[？?!！]/.test(text))
-      return E('+6Hz', 15)
-    if (/催促|快点|赶紧|急|来不及|快跑|快走|抓紧|紧迫|火急|十万火急|跑|逃|快|冲|别磨蹭|再不.*就/.test(text))
-      return E('+4Hz', 18)
-    if (/得意|嘚瑟|傲|不可一世|高高在上|居高临下|洋洋|沾沾自喜|自信|胸有成竹|十拿九稳|笃定|把握|拿下/.test(text))
-      return E('+3Hz', -5)
-    if (/疲惫|疲倦|累|乏|困|没力气|精疲力竭|筋疲力尽|有气无力|虚弱|勉强|撑.*不住/.test(text))
-      return E('-3Hz', -15)
-    if (/紧张|忐忑|七上八下|心跳加速|手心出汗|屏住呼吸|大气不敢出|绷|攥|捏|死死/.test(text))
-      return E('+2Hz', 8)
-    if (/[！!]/.test(text))
-      return E('+2Hz', 5)
-    if (/[？?]/.test(text))
-      return E('+3Hz', 3)
-    return E('+0Hz', 0)
-  }
-
-  const ttsEmotionForText = text => state.reader.ttsEmotion === 'auto'
-    ? ttsDetectEmotion(text)
-    : state.reader.ttsEmotion
-
-  const ttsBuildUrl = (text, voice, emotion = ttsEmotionForText(text)) => {
-    const cleaned = text.replace(/[——]+/g, '，').replace(/[“”"「」『』【】\[\]［］]/g, '')
-    const baseRatePct = Math.round((state.reader.ttsRate - 1) * 100)
-    const rate = baseRatePct >= 0 ? `+${baseRatePct}%` : `${baseRatePct}%`
-    const params = new URLSearchParams({ text: cleaned, voice, rate, emotion })
-    return `/api/v1/tts/speak?${params}`
-  }
-
+  const ttsClearHighlight = () => readerContent?.querySelectorAll('.tts-active-line').forEach(el => el.classList.remove('tts-active-line'))
+  const ttsActiveHighlightPresent = index => Boolean(readerContent?.querySelector?.(`.reader-paragraph.tts-active-line[data-tts-index="${Number(index)}"]`))
+  // Keep one Audio instance for the lifetime of the page. Mobile Safari grants
+  // playback permission to the element created from the user's tap, so chapter
+  // changes and player re-renders must reuse this instance.
   const ttsEnsureAudio = () => {
     if (!ttsAudioEl) {
       ttsAudioEl = new Audio()
       ttsAudioEl.preload = 'auto'
+      ttsAudioEl.playsInline = true
+      ttsAudioEl.muted = false
+      ttsAudioEl.volume = 1
     }
     return ttsAudioEl
   }
 
-  const ttsCachePrefetch = url => {
-    if (ttsCache.has(url) || ttsCachePromises.has(url)) return
-    const epoch = ttsCacheEpoch
-    const p = fetch(url, { cache: 'force-cache' })
-      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer() })
-      .then(() => {
-        if (epoch !== ttsCacheEpoch || ttsCachePromises.get(url) !== p) return null
-        ttsCache.set(url, true)
-        ttsCachePromises.delete(url)
+  // Creating an Audio element during a tap is not enough on Safari/iOS. A
+  // real play() call must happen in the same user-activation stack; otherwise
+  // the asynchronously generated first segment is accepted but remains
+  // inaudible until a second tap. Prime the long-lived element with 50 ms of
+  // PCM silence, then reuse that exact element for the active session.
+  const ttsPrimeAudioFromGesture = () => {
+    const audio = ttsEnsureAudio()
+    if (ttsAudioUnlocked || (!audio.paused && !audio.ended)) return Promise.resolve(true)
+    if (ttsAudioUnlockPromise) return ttsAudioUnlockPromise
+    const unlockGeneration = ++ttsAudioUnlockGeneration
+    audio.muted = false
+    audio.volume = 1
+    audio.src = TTS_AUDIO_UNLOCK_SRC
+    try {
+      const unlockPromise = Promise.resolve(audio.play()).then(() => {
+        if (unlockGeneration !== ttsAudioUnlockGeneration || audio !== ttsAudioEl) return false
+        ttsAudioUnlocked = true
         return true
+      }).catch(error => {
+        if (unlockGeneration === ttsAudioUnlockGeneration && audio === ttsAudioEl) {
+          console.warn('[TTS] initial audio unlock deferred', error)
+        }
+        return false
       })
-      .catch(e => {
-        if (epoch === ttsCacheEpoch && ttsCachePromises.get(url) === p) {
-          console.error('[TTS] cache fail:', url.substring(0, 80), e)
-          ttsCachePromises.delete(url)
-          ttsCache.set(url, null)
-        }
-        return null
+      ttsAudioUnlockPromise = unlockPromise
+      unlockPromise.finally(() => {
+        if (ttsAudioUnlockPromise === unlockPromise) ttsAudioUnlockPromise = null
       })
-    ttsCachePromises.set(url, p)
-  }
-
-  const ttsClearCache = urlSet => {
-    ttsCacheEpoch++
-    ttsCachePromises.clear()
-    if (urlSet) {
-      for (const url of urlSet) ttsCache.delete(url)
-    } else {
-      ttsCache.clear()
-    }
-  }
-
-  const ttsAllQuoteRe = /“[^”]*”|"[^"]*"|「[^」]*」|『[^』]*』|【[^】]*】|\[[^\]]*\]|［[^］]*］/g
-
-  const ttsRoleColonIndex = line => {
-    const match = line.match(/^\s*[^，。！？；：:\[\]［］【】“”「」『』]{1,15}[：:]\s*\S{2,}/)
-    if (!match) return -1
-    const chinese = line.indexOf('：')
-    const ascii = line.indexOf(':')
-    if (chinese < 0) return ascii
-    if (ascii < 0) return chinese
-    return Math.min(chinese, ascii)
-  }
-
-  const ttsIsDialogueLine = line => {
-    if (new RegExp(ttsAllQuoteRe.source).test(line)) return true
-    return ttsRoleColonIndex(line) > 0
-  }
-
-  const ttsNonNameWords = new Set([
-    '不过', '但是', '然而', '可是', '只是', '于是', '因此', '所以', '如果', '虽然',
-    '忽然', '突然', '接着', '随后', '此时', '这时', '那时', '一时', '顿时', '刹那',
-    '其实', '果然', '毕竟', '几乎', '似乎', '仿佛', '大概', '或许', '也许', '同时',
-    '他们', '她们', '我们', '你们', '大家', '众人', '所有', '一切', '这些', '那些',
-    '一个', '两个', '一些', '一声', '一句', '一段', '什么', '怎么', '哪里', '那边',
-    '说道', '笑道', '喊道', '叫道', '吼道', '骂道', '问道', '答道', '叹道', '嚷道',
-    '哼道', '喝道', '嗤道', '怒道', '冷道', '淡道', '轻道', '急道', '忙道', '苦道',
-    '低声', '高声', '冷笑', '苦笑', '大声', '轻声', '转头', '回头', '抬头', '低头',
-    '看到', '听到', '想到', '见到', '看见', '不禁', '只见', '赫然', '猛然', '忽而',
-    '对方', '那人', '这人', '此人', '旁边', '身边', '前方', '后方', '眼前', '身后',
-    '已经', '正在', '依然', '仍然', '居然', '竟然', '终于', '马上', '立刻', '当即',
-    '开始', '继续', '停止', '结束', '完成', '准备', '发现', '感觉', '知道', '明白',
-    '一边', '另一', '每个', '没有', '只有', '就是', '不是', '还是', '而是', '正是',
-    '心想', '暗想', '心道', '暗道', '自言', '自语', '不由', '不免', '不觉',
-    '摇头', '点头', '皱眉', '挑眉', '眯眼', '瞪眼', '张嘴', '闭嘴', '咬牙',
-    '当时', '今日', '此刻', '那天', '昨天', '今天', '明天', '方才', '刚才', '先前',
-    '面对', '看着', '望着', '盯着', '瞥见', '觑见', '听见', '遇见', '碰见', '撞见',
-    '清寒', '最美', '活脱', '自嘲', '近前', '近旁', '颔首', '勾唇', '并肩', '上辈',
-    '笑吟', '瓮声', '进饭', '口中', '以指', '虽说', '后头', '都得', '见他', '这六',
-    '说起', '脱口', '可此', '祖母', '今日', '但不', '对此', '小吏', '会这', '她忍',
-    '这一', '则是', '两人', '三年', '哪怕', '尽管', '无论', '不论', '凡是', '除了',
-    '如今', '后来', '至少', '因为', '关于', '有些', '走到', '旋即', '语毕', '明明',
-    '不知', '不见', '不想', '不能', '不会', '不行', '不去', '不来', '不让', '不敢',
-    '余光', '余下', '见状', '正好', '恰好', '来到', '说完', '想来', '看来', '起来',
-    '本来', '原来', '出来', '过来', '下来', '上来', '回来', '进来', '起身', '出去',
-    '原本', '果真', '难怪', '难道', '莫非', '可见', '竟是', '倒是', '显然', '若非',
-    '随即', '继而', '进而', '尔后', '之后', '以后', '之前', '以前', '之间', '期间',
-  ])
-  const ttsNonNameEndChars = new Set('递恭的了着过得地么吗呢吧啊呀哦嗯噢唉哎嘛喽呗罢将而且及或又也都还再就便即却仍已曾于自从向往对为与和跟同比像按城州院府驿庠县镇村寺殿宫楼阁堂山河湖海道路街巷门窗桥亭')
-  const ttsNonNameStartChars = new Set('当那面会此可她他这我你谁哪每又也都就还却便乃若既虽且更最仍但而已将要把被让给从向往在到过经由以为与和跟同比像按如至因走余见有后关旋语原不明岂难莫')
-
-  const ttsExtractCandidates = line => {
-    const candidates = new Set()
-    const narration = line.replace(ttsAllQuoteRe, '')
-    const segments = []
-    const re = new RegExp(ttsAllQuoteRe.source, 'g')
-    let lastIdx = 0, m
-    while ((m = re.exec(line)) !== null) {
-      if (m.index > lastIdx) segments.push(line.substring(lastIdx, m.index))
-      lastIdx = re.lastIndex
-    }
-    if (lastIdx < line.length) segments.push(line.substring(lastIdx))
-    for (const seg of segments) {
-      const trimmed = seg.replace(/^[，。！？、；：\s…—·“”"「」『』【】\[\]［］]+/, '')
-      if (!trimmed) continue
-      const m2 = trimmed.match(/^([一-鿿]{2})/)
-      const m3 = trimmed.match(/^([一-鿿]{3})/)
-      if (m2 && !ttsNonNameWords.has(m2[1]) && !ttsNonNameStartChars.has(m2[1][0]) && !ttsNonNameEndChars.has(m2[1][1])) candidates.add(m2[1])
-      if (m3 && !ttsNonNameWords.has(m3[1]) && !ttsNonNameWords.has(m3[1].substring(0, 2))
-          && !ttsNonNameEndChars.has(m3[1][2]) && !ttsNonNameStartChars.has(m3[1][0])) candidates.add(m3[1])
-    }
-    const verbPat = /([一-鿿]{2,8})[说道喊叫嚷吼骂笑哼嗤叹问答斥喝呵嘟囔呢喃嘀咕嘶嚎吟冷轻苦怒惊感嘲叱]+[道说]?/g
-    let vm
-    while ((vm = verbPat.exec(narration)) !== null) {
-      const raw = vm[1]
-      const c2 = raw.substring(0, 2)
-      if (!ttsNonNameWords.has(c2) && !ttsNonNameStartChars.has(c2[0]) && !ttsNonNameEndChars.has(c2[1])) candidates.add(c2)
-      if (raw.length >= 3) {
-        const c3 = raw.substring(0, 3)
-        if (!ttsNonNameWords.has(c3) && !ttsNonNameWords.has(c3.substring(0, 2))
-            && !ttsNonNameEndChars.has(c3[2]) && !ttsNonNameStartChars.has(c3[0])) candidates.add(c3)
+    } catch (error) {
+      if (unlockGeneration === ttsAudioUnlockGeneration && audio === ttsAudioEl) {
+        ttsAudioUnlockPromise = null
+        console.warn('[TTS] initial audio unlock deferred', error)
       }
+      return Promise.resolve(false)
     }
-    return [...candidates]
+    return ttsAudioUnlockPromise
   }
-
-  const ttsFindSpeaker = (line, speakerMap, nameAliases) => {
-    const narration = line.replace(ttsAllQuoteRe, '')
-    const names = Object.keys(speakerMap).filter(k => k !== '_aliases').sort((a, b) => b.length - a.length)
-    for (const name of names) {
-      if (narration.includes(name)) return name
-    }
-    if (nameAliases) {
-      for (const [short, long] of nameAliases) {
-        if (narration.includes(short) && speakerMap[long]) return long
-      }
-    }
-    return null
-  }
-
-  const ttsFemaleNameChars = '芳兰梅莲莉花玉凤雪月云霞丽美婷娟娜燕清静秀琴琳瑶薇颖慧蝶蓉萍雯珊妮媛莹冰虹蕊珍柔漪婉姝妍茹菲灵纤黛绮韵语欣悠萱瑾璇思依怡晴彤馨曦嫣儿蕾珂雅岚姗琪瑗瑜璐蓓苒珺琬蓁嫚姿妤婕瑄彩翠巧素贞惠淑媚荷苓茉蔓葵棠樱桃杏梨棉绣缨缇绫罗绢纱锦鹃莺燕鸳鸯蝴蝶凰鸾鹂'
-  const ttsMaleNameChars = '强伟刚军明龙虎飞志勇杰磊鹏波超涛辰翔宇峰浩亮华昊天锋剑武威壮坤鸿博轩逸远哲铭泽阳诚毅恒煜旭霆骏凯斌彬松柏森权桐栋梁钧钢锐钦铮磐石岩崇琛卓晟烨熠焱麒麟霖瀚渊澈潇骁驰征战戍戎猛彪狄豹鲲鹰隼雄烽铁铜钟锤镇雷霄奉卿怀廷仁义德信礼谦耀荣盛裕邦坚昂尧禹舜'
-
-  const ttsFemaleNameWeight = {
-    '婷': 3, '娟': 3, '燕': 3, '莲': 3, '芳': 3, '梅': 3, '凤': 3, '娜': 3, '妍': 3, '姝': 3,
-    '嫣': 3, '媛': 3, '妤': 3, '婕': 3, '姗': 3, '蕊': 3, '珺': 3, '瑗': 3, '蓓': 3,
-    '莺': 3, '鸾': 3, '凰': 3, '绣': 3, '缨': 3, '鹃': 3, '嫚': 3, '苓': 3,
-    '雪': 2, '霞': 2, '丽': 2, '秀': 2, '琴': 2, '瑶': 2, '薇': 2, '颖': 2,
-    '漪': 2, '婉': 2, '茹': 2, '菲': 2, '黛': 2, '韵': 2, '馨': 2, '曦': 2,
-    '萱': 2, '瑾': 2, '璇': 2, '蕾': 2, '琪': 2, '璐': 2, '荷': 2, '茉': 2, '棠': 2,
-    '樱': 2, '锦': 2, '绫': 2, '缇': 2, '纱': 2, '蝶': 2, '莹': 2, '珊': 2,
-    '清': 1, '静': 1, '冰': 1, '柔': 1, '欣': 1, '怡': 1, '晴': 1, '彤': 1, '语': 1,
-    '悠': 1, '思': 1, '依': 1, '月': 1, '云': 1, '灵': 1, '岚': 1, '雅': 1, '珂': 1
-  }
-  const ttsMaleNameWeight = {
-    '刚': 3, '军': 3, '虎': 3, '龙': 3, '武': 3, '壮': 3, '钢': 3, '铮': 3, '骁': 3, '麟': 3,
-    '猛': 3, '彪': 3, '豹': 3, '雄': 3, '铁': 3, '征': 3, '戎': 3, '鹰': 3, '隼': 3,
-    '强': 2, '伟': 2, '勇': 2, '磊': 2, '鹏': 2, '峰': 2, '锋': 2, '剑': 2, '威': 2, '霆': 2, '骏': 2,
-    '飞': 2, '超': 2, '涛': 2, '翔': 2, '浩': 2, '博': 2, '毅': 2, '煜': 2, '烨': 2,
-    '雷': 2, '霄': 2, '鲲': 2, '烽': 2, '锤': 2, '镇': 2, '战': 2, '戍': 2, '狄': 2,
-    '宇': 1, '辰': 1, '轩': 1, '逸': 1, '远': 1, '哲': 1, '铭': 1, '泽': 1, '阳': 1,
-    '晟': 1, '明': 1, '天': 1, '华': 1, '昊': 1, '恒': 1, '凯': 1, '斌': 1, '彬': 1,
-    '奉': 1, '卿': 1, '怀': 1, '廷': 1, '仁': 1, '义': 1, '德': 1, '信': 1, '礼': 1,
-    '谦': 1, '耀': 1, '荣': 1, '盛': 1, '裕': 1, '邦': 1, '坚': 1, '尧': 1, '禹': 1
-  }
-
-  const ttsGuessGender = name => {
-    let f = 0, m = 0
-    for (const ch of name) {
-      f += ttsFemaleNameWeight[ch] || (ttsFemaleNameChars.includes(ch) ? 1 : 0)
-      m += ttsMaleNameWeight[ch] || (ttsMaleNameChars.includes(ch) ? 1 : 0)
-    }
-    if (f > m) return 'female'
-    if (m > f) return 'male'
-    return null
-  }
-
-  const ttsInferContextGender = line => {
-    const narration = String(line || '').replace(ttsAllQuoteRe, '')
-    if (/她|女孩|女生|女子|女人|少女|姑娘|母亲|妈妈|姐姐|妹妹|妻子|夫人|奶奶|阿姨|女声|女儿|公主|王后|皇后|妃子/.test(narration)) return 'female'
-    if (/他|男孩|男生|男子|男人|少年|青年|大汉|父亲|爸爸|哥哥|弟弟|丈夫|先生|爷爷|叔叔|男声|儿子|王子|皇帝/.test(narration)) return 'male'
-    return null
-  }
-
-  const ttsGenderScore = name => {
-    let f = 0, m = 0
-    for (const ch of name) {
-      f += ttsFemaleNameWeight[ch] || (ttsFemaleNameChars.includes(ch) ? 1 : 0)
-      m += ttsMaleNameWeight[ch] || (ttsMaleNameChars.includes(ch) ? 1 : 0)
-    }
-    return Math.abs(f - m)
-  }
-
-  const ttsBuildSpeakerMap = paragraphs => {
-    const narrator = state.reader.ttsNarrator || 'mocheng'
-    const nameCounts = new Map()
-    for (const line of paragraphs) {
-      if (!ttsIsDialogueLine(line)) continue
-      for (const name of ttsExtractCandidates(line)) {
-        nameCounts.set(name, (nameCounts.get(name) || 0) + 1)
-      }
-    }
-    const confirmed = new Set()
-    for (const [name, count] of nameCounts) {
-      if (count >= 2) confirmed.add(name)
-      else if (ttsGuessGender(name) !== null && ttsGenderScore(name) >= 2) confirmed.add(name)
-    }
-    const nameAliases = new Map()
-    const toRemove = new Set()
-    const sorted = [...confirmed].sort((a, b) => b.length - a.length)
-    for (const long of sorted) {
-      if (long.length !== 3) continue
-      for (const short of sorted) {
-        if (short.length !== 2 || toRemove.has(short)) continue
-        if (long.startsWith(short) || long.endsWith(short)) {
-          nameAliases.set(short, long)
-          toRemove.add(short)
-        }
-      }
-    }
-    for (const name of toRemove) confirmed.delete(name)
-    const map = {}
-    let fIdx = 0, mIdx = 0, uIdx = 0
-    const fPool = ttsFemalePool.filter(v => v !== narrator)
-    const mPool = ttsMalePool.filter(v => v !== narrator)
-    for (const name of confirmed) {
-      const gender = ttsGuessGender(name)
-      if (gender === 'female') map[name] = fPool[fIdx++ % fPool.length]
-      else if (gender === 'male') map[name] = mPool[mIdx++ % mPool.length]
-      else {
-        map[name] = (uIdx % 2 === 0 ? mPool : fPool)[Math.floor(uIdx / 2) % (uIdx % 2 === 0 ? mPool : fPool).length]
-        uIdx++
-      }
-    }
-    map._aliases = nameAliases
-    return map
-  }
-
-  const TTS_REQUEST_CHAR_LIMIT = 900
-  const ttsSplitForRequest = text => {
-    let remaining = String(text || '').trim()
-    const chunks = []
-    while (remaining.length > TTS_REQUEST_CHAR_LIMIT) {
-      const windowText = remaining.slice(0, TTS_REQUEST_CHAR_LIMIT)
-      let cut = Math.max(
-        windowText.lastIndexOf('。'), windowText.lastIndexOf('！'), windowText.lastIndexOf('？'),
-        windowText.lastIndexOf('；'), windowText.lastIndexOf('，'), windowText.lastIndexOf(','),
-        windowText.lastIndexOf('!'), windowText.lastIndexOf('?')
-      ) + 1
-      if (cut < Math.floor(TTS_REQUEST_CHAR_LIMIT * .42)) {
-        cut = Math.max(windowText.lastIndexOf(' '), windowText.lastIndexOf('　'))
-      }
-      if (cut < Math.floor(TTS_REQUEST_CHAR_LIMIT * .42)) cut = TTS_REQUEST_CHAR_LIMIT
-      chunks.push(remaining.slice(0, cut).trim())
-      remaining = remaining.slice(cut).trim()
-    }
-    if (remaining) chunks.push(remaining)
-    return chunks.filter(Boolean)
-  }
-
-  const ttsAppendPlan = (plan, text, voice, paraIdx) => {
-    for (const chunk of ttsSplitForRequest(text)) {
-      const emotion = ttsEmotionForText(chunk)
-      plan.push({ url: ttsBuildUrl(chunk, voice, emotion), paraIdx, text: chunk, voice, emotion })
-    }
-  }
-
-  const ttsBuildChapterPlan = (paragraphs, startIdx = 0) => {
-    const mode = state.reader.ttsMode
-    const isSmart = mode === 'smart'
-    const narrator = state.reader.ttsNarrator || 'mocheng'
-    const speakerMap = isSmart ? ttsBuildSpeakerMap(paragraphs) : {}
-    const dialoguePool = ttsMandarinPool.filter(v => v !== narrator)
-    let unknownIdx = 0
-    const plan = []
-    for (let i = startIdx; i < paragraphs.length; i++) {
-      const line = paragraphs[i]
-      if (!isSmart) {
-        ttsAppendPlan(plan, line, state.reader.ttsVoice, i)
-        continue
-      }
-      const isDialogue = ttsIsDialogueLine(line)
-      let speakerVoice = narrator
-      if (isDialogue) {
-        const speaker = ttsFindSpeaker(line, speakerMap, speakerMap._aliases)
-        if (speaker && speakerMap[speaker]) {
-          speakerVoice = speakerMap[speaker]
-        } else {
-          const gender = ttsInferContextGender(line)
-          const pool = gender === 'female' ? ttsFemalePool.filter(v => v !== narrator)
-            : gender === 'male' ? ttsMalePool.filter(v => v !== narrator)
-              : dialoguePool
-          speakerVoice = pool[unknownIdx++ % pool.length]
-        }
-      }
-      const cleanLine = line.replace(/[\s　]+/g, '').replace(/[——…、，。！？；：“”"「」『』【】\[\]［］（）\-]+/g, '')
-      if (!cleanLine) continue
-      if (!isDialogue) {
-        ttsAppendPlan(plan, line, narrator, i)
-        continue
-      }
-      const hasQuotes = new RegExp(ttsAllQuoteRe.source).test(line)
-      const segs = []
-      if (hasQuotes) {
-        const qre = new RegExp('(' + ttsAllQuoteRe.source + ')', 'g')
-        let last = 0, match
-        while ((match = qre.exec(line)) !== null) {
-          if (match.index > last) {
-            const before = line.substring(last, match.index).trim()
-            if (before && before.replace(/[，。！？、；：\s…—·“”"「」『』【】\[\]［］]+/g, '')) segs.push({ text: before, voice: narrator })
-          }
-          const inside = match[1].slice(1, -1)
-          if (inside.trim() && inside.replace(/[，。！？、；：\s…—·“”"「」『』【】\[\]［］]+/g, '')) segs.push({ text: inside, voice: speakerVoice })
-          last = qre.lastIndex
-        }
-        if (last < line.length) {
-          const after = line.substring(last).trim()
-          if (after && after.replace(/[，。！？、；：\s…—·“”"「」『』【】\[\]［］]+/g, '')) segs.push({ text: after, voice: narrator })
-        }
-      } else {
-        const colonIdx = ttsRoleColonIndex(line)
-        if (colonIdx > 0) {
-          const before = line.substring(0, colonIdx).trim()
-          const after = line.substring(colonIdx + 1).trim()
-          if (before) segs.push({ text: before, voice: narrator })
-          if (after) segs.push({ text: after, voice: speakerVoice })
-        }
-      }
-      if (!segs.length) segs.push({ text: line, voice: speakerVoice })
-      for (const seg of segs) {
-        ttsAppendPlan(plan, seg.text, seg.voice, i)
-      }
-    }
-    const voices = {}
-    for (const p of plan) { const v = new URLSearchParams(p.url.split('?')[1]).get('voice'); voices[v] = (voices[v] || 0) + 1 }
-    console.log('[TTS] plan built:', plan.length, 'items. speakerMap:', JSON.stringify(speakerMap), 'voices:', JSON.stringify(voices))
-    return plan
-  }
-
-  const TTS_PREFETCH_AHEAD = 10
 
   const ttsSettingsSignature = () => JSON.stringify({
     mode: state.reader.ttsMode,
@@ -4324,61 +2941,194 @@ async function loadReader(bookId, chapterId) {
     emotion: state.reader.ttsEmotion
   })
 
-  const ttsCacheWindow = fromIdx => {
-    const windowItems = ttsChapterPlan.slice(fromIdx, fromIdx + TTS_PREFETCH_AHEAD)
-    if (windowItems.length < TTS_PREFETCH_AHEAD && ttsNextChapterPlan.length) {
-      windowItems.push(...ttsNextChapterPlan.slice(0, TTS_PREFETCH_AHEAD - windowItems.length))
+  const audiobookHeaders = () => ({ 'Content-Type': 'application/json', 'X-Audiobook-Client': audiobookClientId })
+
+  const ttsBackendResponseError = window.OOHStoryAudiobookLifecycle.responseError
+  const ttsBackendFailureNotice = window.OOHStoryAudiobookLifecycle.failureNotice
+
+  const ttsBackendManifest = async (startParagraph, allowServerResume = true) => {
+    audiobookAbortController?.abort()
+    audiobookAbortController = new AbortController()
+    const generation = ttsPlanGeneration
+    const requestedNarrator = String(state.reader.ttsNarrator || 'mocheng')
+    const requestedVoice = String(state.reader.ttsVoice || 'nuanxi')
+    const requestedSettings = {
+      mode: state.reader.ttsMode,
+      narrator: requestedNarrator,
+      voice: requestedVoice,
+      emotion: state.reader.ttsEmotion,
+      rate: Number(state.reader.ttsRate || 1)
     }
-    const keepUrls = new Set(windowItems.map(item => item.url))
-    for (const url of ttsCache.keys()) {
-      if (!keepUrls.has(url)) ttsCache.delete(url)
+    const response = await fetch('/api/v1/audiobook/sessions', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: audiobookHeaders(),
+      signal: audiobookAbortController.signal,
+      body: JSON.stringify({
+        book_id: String(requestedBookId),
+        chapter_id: Number(requestedChapterId),
+        client_id: audiobookClientId,
+        ...requestedSettings,
+        resume: Boolean(allowServerResume),
+        start_paragraph_index: Math.max(0, Number(startParagraph) || 0)
+      })
+    })
+    if (!response.ok) throw await ttsBackendResponseError(response)
+    const payload = await response.json()
+    if (!state.reader.ttsActive || generation !== ttsPlanGeneration) {
+      if (payload.session_id) fetch(`/api/v1/audiobook/sessions/${payload.session_id}`, {
+        method: 'DELETE', credentials: 'same-origin', keepalive: true,
+        headers: { 'X-Audiobook-Client': audiobookClientId }
+      }).catch(() => {})
+      return
     }
-    for (const url of ttsCachePromises.keys()) {
-      if (!keepUrls.has(url)) ttsCachePromises.delete(url)
+    const responseRequestedNarrator = String(payload.current?.requested_narrator || requestedNarrator)
+    const effectiveNarrator = String(payload.current?.effective_narrator || responseRequestedNarrator)
+    if (requestedSettings.mode === 'smart'
+        && (responseRequestedNarrator !== requestedNarrator || effectiveNarrator !== requestedNarrator)) {
+      if (payload.session_id) {
+        fetch(`/api/v1/audiobook/sessions/${payload.session_id}`, {
+          method: 'DELETE', credentials: 'same-origin', keepalive: true,
+          headers: { 'X-Audiobook-Client': audiobookClientId }
+        }).catch(() => {})
+      }
+      const error = new Error(`旁白音色未按选择生效（选择 ${requestedNarrator}，实际 ${effectiveNarrator}）`)
+      error.code = 'narrator_voice_mismatch'
+      throw error
     }
-    for (const item of windowItems) {
-      ttsCachePrefetch(item.url)
+    audiobookServerSessionId = payload.session_id
+    audiobookManifestHash = payload.current.manifest_hash
+    ttsChapterStreamUrl = payload.current.stream_endpoint || ''; ttsContinuousStreamMode = true
+    ttsBatchPreloadKey = ''; ttsBatchPreloadPromise = null
+    const effectiveChapterId = String(payload.current.chapter_id || requestedChapterId)
+    const resumesCurrent = allowServerResume && String(payload.resume?.chapter_id || '') === effectiveChapterId
+    const resumeParagraph = resumesCurrent ? Number(payload.resume?.paragraph_index || 0) : 0
+    const resumeItemIndex = resumesCurrent ? Number(payload.resume?.item_index || 0) : 0
+    const startInfo = payload.start && typeof payload.start === 'object' ? payload.start : null
+    const resolvedStartParagraph = Number(startInfo?.paragraph_index ?? startInfo?.requested_paragraph_index ?? startParagraph)
+    const startItemIndex = startInfo ? Number(startInfo.item_index) : NaN
+    const minParagraph = Math.max(0, resumesCurrent ? resumeParagraph : resolvedStartParagraph || 0)
+    let selected = payload.current.segments.filter(item => resumesCurrent
+      ? Number(item.index) >= resumeItemIndex
+      : (Number.isFinite(startItemIndex) ? Number(item.index) >= startItemIndex : Number(item.paragraph_index) >= minParagraph))
+    const resumeSelectionValid = selected.length > 0
+    if (!selected.length) selected = payload.current.segments.filter(item => Number(item.paragraph_index) >= minParagraph)
+    const plan = selected.map(item => ({
+      ...item,
+      paraIdx: Number(item.paragraph_index),
+      url: '',
+      text: item.text || ''
+    }))
+    ttsChapterPlan = plan
+    ttsFollowingChapterId = payload.current.next_chapter_id
+    ttsResumeOffsetSeconds = resumesCurrent && resumeSelectionValid
+      ? Math.max(0, Number(payload.resume?.audio_offset_ms || 0) / 1000)
+      : 0
+    if (state.ttsSession?.active) {
+      state.ttsSession.chapterId = effectiveChapterId
+      state.ttsSession.chapterTitle = payload.current.title || state.ttsSession.chapterTitle
+      state.ttsSession.paragraphIndex = Math.max(0, Number(plan[0]?.paraIdx ?? minParagraph) || 0)
+      state.ttsSession.paragraphCount = ttsPlanParagraphCount(plan)
+      state.ttsSession.absoluteItemIndex = Math.max(0, Number(plan[0]?.index || 0))
+      state.ttsSession.absoluteItemCount = payload.current.segments.length
+      const metrics = ttsChapterMetrics(effectiveChapterId)
+      state.ttsSession.chapterNumber = metrics.number
+      state.ttsSession.chapterCount = metrics.count
+      state.ttsSession.returnPath = contextualHref(`/books/${requestedBookId}/chapters/${effectiveChapterId}`)
+      state.ttsSession.requestedNarrator = requestedNarrator
+      state.ttsSession.effectiveNarrator = effectiveNarrator
+    }
+    state.ttsSession.contextItems = plan.map(item => item.text)
+    state.ttsSession.itemCount = plan.length
+    if (!ttsChapterStreamUrl || !plan.length) throw new Error('audiobook stream unavailable')
+    if (!ttsLifecycle.isPausedByUser()) ttsPlayItem(0)
+    else ttsUpdateControls()
+    if (effectiveChapterId !== String(requestedChapterId)) {
+      requestAnimationFrame(() => navigateInApp(
+        contextualHref(`/books/${requestedBookId}/chapters/${effectiveChapterId}`),
+        { replace: true }
+      ))
     }
   }
 
+  const ttsCacheWindow = (planStartIndex = 0) => {
+    if (!state.reader.ttsActive || !audiobookServerSessionId || !audiobookManifestHash || !ttsChapterStreamUrl) return null
+    const start = Math.max(0, Number(planStartIndex) || 0); const batch = ttsChapterPlan.slice(start, start + TTS_STREAM_BATCH_SEGMENTS)
+    if (start >= ttsChapterPlan.length || !batch.length) return null
+    const batchStart = Number(batch[0].index); const key = `${ttsPlanGeneration}:${audiobookManifestHash}:stream:${batchStart}`
+    if (ttsBatchPreloadKey === key && ttsBatchPreloadPromise) return ttsBatchPreloadPromise
+    const url = `${ttsChapterStreamUrl}?start=${encodeURIComponent(batchStart)}&preload=1`
+    ttsBatchPreloadKey = key; return (ttsBatchPreloadPromise = fetch(url, { method: 'GET', credentials: 'same-origin', cache: 'no-store', headers: { 'X-Audiobook-Client': audiobookClientId }, signal: audiobookAbortController?.signal })
+      .then(async response => { if (!response.ok) throw await ttsBackendResponseError(response); await response.arrayBuffer(); return true })
+      .catch(error => { if (error?.name !== 'AbortError') console.warn('[TTS] next five-segment stream preload unavailable', error); return null }).finally(() => { if (ttsBatchPreloadKey === key) ttsBatchPreloadPromise = null }))
+  }
   const ttsStopPlayback = () => {
-    if (ttsAudioEl) {
-      ttsAudioEl.onended = null
-      ttsAudioEl.onerror = null
-      ttsAudioEl.pause()
-      ttsAudioEl.removeAttribute('src')
-      ttsAudioEl.load()
+    const audio = ttsAudioEl
+    ttsFallbackPlayback?.release()
+    ttsSegmentFallbackMode = false
+    ttsBatchPreloadKey = ''; ttsBatchPreloadPromise = null; ttsStreamEnding = false
+    ttsAudioUnlockGeneration++
+    ttsAudioUnlockPromise = null
+    if (audio) {
+      // Playback permission is attached to the media element on Safari/iOS.
+      // Keep the one page-lifetime Audio instance across explicit exits so a
+      // rapid stop/start sequence cannot strand a fresh unlock promise and
+      // prevent the real chapter stream from ever being requested.
+      audio.onended = null
+      audio.onerror = null
+      audio.ontimeupdate = null
+      audio.onloadedmetadata = null
+      audio.onplaying = null
+      audio.pause()
+      audio.removeAttribute('src')
+      audio.load()
     }
   }
 
   const ttsModeLabel = () => {
-    if (ttsPlaybackBlocked) return ttsPlaybackNotice || (state.reader.ttsMode === 'smart' ? '点击继续智能听书' : '点击继续听书')
+    if (ttsLifecycle.isBlocked()) return ttsLifecycle.snapshot().notice || (state.reader.ttsMode === 'smart' ? '点击继续智能听书' : '点击继续听书')
     const labels = { smart: '停止智能听书', cantonese: '停止粤语听书', hokkien: '停止闽南语听书' }
     return labels[state.reader.ttsMode] || `停止听书 · ${state.reader.ttsRate}x`
   }
 
   const ttsUpdateControls = () => {
+    const playback = ttsLifecycle.snapshot()
+    const playbackBlocked = ttsLifecycle.isBlocked()
+    if (!playbackBlocked && ttsFailureToast) {
+      ttsFailureToast.remove()
+      ttsFailureToast = null
+    }
     if (ttsButton) {
       ttsButton.classList.toggle('active', state.reader.ttsActive)
-      ttsButton.textContent = !state.reader.ttsActive ? '听书' : (ttsPlaybackBlocked ? '继续听书' : '听书播放页')
+      ttsButton.textContent = !state.reader.ttsActive ? '听书' : '从头听书'
     }
     if (ttsStateBar) {
       ttsStateBar.hidden = !state.reader.ttsActive
-      if (state.reader.ttsActive) ttsStateBar.textContent = ttsPlaybackBlocked
+      if (state.reader.ttsActive) ttsStateBar.textContent = playbackBlocked
         ? ttsModeLabel()
         : `正在听 · ${Number(state.reader.ttsRate || 1).toFixed(1)}x · 打开播放页`
     }
+    if (ttsExitButton) ttsExitButton.hidden = !state.reader.ttsActive
+    if (ttsExitControl) ttsExitControl.hidden = !state.reader.ttsActive
     mobileNav?.classList.toggle('tts-active', state.reader.ttsActive)
-    if (state.ttsSession?.active) state.ttsSession.playbackBlocked = ttsPlaybackBlocked
+    if (state.ttsSession?.active) state.ttsSession.playbackBlocked = playbackBlocked
+    if (state.ttsSession?.active) state.ttsSession.playbackConnecting = ttsLifecycle.isConnecting()
+    if (state.ttsSession?.active) state.ttsSession.playbackState = playback.state
     updateTtsPlayer()
   }
 
   const ttsIsPlaybackPolicyError = error => ['NotAllowedError', 'AbortError'].includes(String(error?.name || ''))
 
+  const ttsShowFailure = notice => {
+    ttsFailureToast = window.OOHStoryAudiobookLifecycle.showFailure(
+      ttsFailureToast, notice, ttsResumePlayback
+    )
+  }
+
   const ttsMarkPlaybackBlocked = (error, notice = '') => {
-    ttsPlaybackBlocked = true
-    ttsPlaybackNotice = notice
+    ttsLifecycle.block(notice)
     ttsUpdateControls()
+    ttsShowFailure(notice)
     console.warn('[TTS] playback paused for retry:', error)
   }
 
@@ -4390,6 +3140,29 @@ async function loadReader(bookId, chapterId) {
     return pending
   }
 
+  const ttsChapterMetrics = chapterId => {
+    const readableChapters = catalog.chapters.filter(item => !isFrontMatterChapter(item))
+    const position = readableChapters.findIndex(item => String(item.id) === String(chapterId))
+    const exactCount = Number(catalog.chapter_count)
+    return {
+      number: position >= 0 ? position + 1 : 1,
+      count: exactCount > 0 ? exactCount : Math.max(1, readableChapters.length)
+    }
+  }
+
+  const ttsActivateChapter = async chapterId => {
+    if (!audiobookServerSessionId) return
+    const response = await fetch(
+      `/api/v1/audiobook/sessions/${audiobookServerSessionId}/chapters/${encodeURIComponent(chapterId)}/activate`,
+      {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'X-Audiobook-Client': audiobookClientId },
+        signal: audiobookAbortController?.signal
+      }
+    )
+    if (!response.ok) throw new Error(`activate chapter ${response.status}`)
+  }
+
   const ttsChapterEnd = async () => {
     if (state.reader.ttsActive && ttsFollowingChapterId) {
       const keepReaderInSync = Boolean(state.ttsSession?.active && !state.ttsSession.detached)
@@ -4397,36 +3170,50 @@ async function loadReader(bookId, chapterId) {
         await ttsPrefetchNextChapter()
       }
       if (!state.reader.ttsActive || !ttsNextChapterPlan.length) {
-        ttsMarkPlaybackBlocked(new Error('next chapter unavailable'), '下一章加载失败，点击重试')
+        ttsStreamEnding = false; ttsMarkPlaybackBlocked(new Error('next chapter unavailable'), '下一章加载失败，点击重试')
         return
       }
       const enteringChapterId = String(ttsNextChapterId)
-      ttsPrevUrls = new Set(ttsChapterPlan.map(item => item.url))
+      try {
+        await ttsActivateChapter(enteringChapterId)
+      } catch (error) {
+        if (error?.name !== 'AbortError') {
+          ttsStreamEnding = false; ttsMarkPlaybackBlocked(error, '章节切换失败，仍停留在当前章，点击重试')
+        }
+        return
+      }
       ttsChapterPlan = ttsNextChapterPlan
+      ttsChapterStreamUrl = ttsNextChapterStreamUrl; ttsContinuousStreamMode = true
+      audiobookManifestHash = ttsNextChapterSignature
+      ttsBatchPreloadKey = ''; ttsBatchPreloadPromise = null
       ttsPlanIndex = 0
       ttsFollowingChapterId = ttsNextChapterFollowingId
       state.ttsSession.chapterId = enteringChapterId
       state.ttsSession.chapterTitle = ttsNextChapterTitle
-      const nextPosition = catalog.chapters.findIndex(item => String(item.id) === enteringChapterId)
-      state.ttsSession.chapterNumber = nextPosition >= 0 ? nextPosition + 1 : state.ttsSession.chapterNumber + 1
-      state.ttsSession.chapterCount = catalog.chapters.length
+      const chapterMetrics = ttsChapterMetrics(enteringChapterId)
+      state.ttsSession.chapterNumber = chapterMetrics.number
+      state.ttsSession.chapterCount = chapterMetrics.count
       state.ttsSession.contextItems = ttsChapterPlan.map(item => item.text || '')
       state.ttsSession.paragraphIndex = 0
+      state.ttsSession.paragraphCount = ttsPlanParagraphCount(ttsChapterPlan)
       state.ttsSession.itemIndex = 0
+      state.ttsSession.absoluteItemIndex = Math.max(0, Number(ttsChapterPlan[0]?.index || 0))
+      state.ttsSession.absoluteItemCount = ttsChapterPlan.length
+      state.ttsSession.itemCount = ttsChapterPlan.length
+      ttsParagraphIndex = -1
       state.ttsSession.returnPath = contextualHref(`/books/${requestedBookId}/chapters/${enteringChapterId}`)
       ttsNextChapterPlan = []
       ttsNextChapterSignature = ''
       ttsNextChapterId = null
       ttsNextChapterFollowingId = null
       ttsNextChapterTitle = ''
+      ttsNextChapterStreamUrl = ''
       ttsNextChapterCached = false
       state.ttsPendingPlan = null
       state.ttsContinueOnLoad = false
       saveTtsCheckpoint(state.ttsSession)
       updateGlobalTtsReturn()
-      ttsCacheWindow(1)
       ttsPlayItem(0)
-      ttsPrefetchNextChapter()
       if (keepReaderInSync) {
         requestAnimationFrame(() => navigateInApp(contextualHref(`/books/${requestedBookId}/chapters/${enteringChapterId}`)))
       }
@@ -4439,11 +3226,8 @@ async function loadReader(bookId, chapterId) {
     if (!('mediaSession' in navigator)) return
     const title = state.ttsSession?.chapterTitle || chapter?.title || '听书'
     const bookTitle = state.ttsSession?.bookTitle || chapter?.book?.title || ''
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: title,
-      artist: bookTitle,
-      album: 'OOHStory 听书',
-    })
+    const cover = state.ttsSession?.mediaCoverUrl || `/api/v1/books/${requestedBookId}/cover?variant=media-art`
+    navigator.mediaSession.metadata = new MediaMetadata({ title: title, artist: bookTitle, album: 'OOHStory 听书', artwork: [{ src: cover }] })
     navigator.mediaSession.setActionHandler('play', () => ttsResumePlayback())
     navigator.mediaSession.setActionHandler('pause', () => {
       if (ttsAudioEl) ttsAudioEl.pause()
@@ -4458,25 +3242,125 @@ async function loadReader(bookId, chapterId) {
     })
   }
 
-  const ttsPlayItem = (idx, retryCount = 0) => {
-    if (!state.reader.ttsActive || idx >= ttsChapterPlan.length) {
-      if (idx >= ttsChapterPlan.length) ttsChapterEnd()
-      return
+  const ttsEstimatedDuration = item => {
+    const measured = Number(item?.durationSeconds || item?.duration_seconds)
+    if (Number.isFinite(measured) && measured > 0) return measured
+    const text = Array.from(String(item?.text || ''))
+    const punctuation = text.filter(char => /[，。！？；：,.!?;:…—]/.test(char)).length
+    const rate = Math.max(0.5, Math.min(Number(item?.rate || state.reader.ttsRate || 1), 3))
+    return Math.max(0.8, ((text.length / 4.45) + (punctuation * 0.12)) / rate)
+  }
+  const ttsPlanParagraphCount = plan => Math.max(
+    1,
+    ...((Array.isArray(plan) ? plan : []).map(item => Math.max(0, Number(item?.paraIdx) || 0) + 1))
+  )
+  const ttsStreamSegmentPlayedSeconds = planIdx => Math.max(0.05, ttsEstimatedDuration(ttsChapterPlan[planIdx]) - (planIdx === ttsStreamStartPlanIndex ? ttsStreamResumeBaseSeconds : 0))
+  const ttsResolvedStreamPlanIndex = () => {
+    const audio = ttsAudioEl
+    if (!audio || !ttsChapterPlan.length) return Math.max(0, ttsPlanIndex)
+    const currentTime = Math.max(0, Number(audio.currentTime) || 0); let elapsed = 0
+    let candidate = Math.max(0, Math.min(ttsStreamStartPlanIndex, ttsChapterPlan.length - 1))
+    const streamEndPlanIndex = ttsContinuousStreamMode
+      ? ttsChapterPlan.length
+      : Math.min(ttsChapterPlan.length, ttsStreamStartPlanIndex + TTS_STREAM_BATCH_SEGMENTS)
+    for (let idx = candidate; idx < streamEndPlanIndex; idx++) {
+      if (!ttsChapterPlan[idx]?.durationExact) {
+        candidate = idx
+        break
+      }
+      const duration = ttsStreamSegmentPlayedSeconds(idx)
+      candidate = idx
+      if (currentTime < elapsed + duration) break; elapsed += duration
     }
-    const generation = ttsPlanGeneration
+    return candidate
+  }
+  const ttsRememberTrustedPosition = (planIndex = ttsPlanIndex) => { if (!ttsChapterPlan.length) return; const target = Math.max(0, Math.min(Number(planIndex) || 0, ttsChapterPlan.length - 1)); ttsTrustedPlanIndex = target; ttsTrustedItemOffsetSeconds = Math.max(0, Number(ttsCurrentItemOffsetSeconds(target)) || 0) }
+  const ttsRecoverFromStreamReplay = () => {
+    if (ttsReplayRecoveryPromise || !state.reader.ttsActive || !ttsChapterPlan.length) return true
+    const generation = ttsPlanGeneration, streamId = ttsActiveStreamId, target = Math.max(0, Math.min(Math.max(ttsTrustedPlanIndex, ttsPlanIndex), ttsChapterPlan.length - 1)), offset = target === ttsTrustedPlanIndex ? ttsTrustedItemOffsetSeconds : ttsCurrentItemOffsetSeconds(target)
+    console.warn('[TTS] media stream replayed from the beginning; reopening at trusted position', target, offset)
+    ttsReplayRecoveryPromise = Promise.resolve().then(() => { if (!state.reader.ttsActive || generation !== ttsPlanGeneration || ttsActiveStreamId !== streamId) return; const audio = ttsAudioEl; if (audio) { audio.pause(); audio.removeAttribute('src'); audio.load() } ttsPlayItem(target, offset) }).finally(() => { ttsReplayRecoveryPromise = null })
+    return true
+  }
+  const ttsRejectStreamReplay = () => { const audio = ttsAudioEl; if (!audio || !ttsContinuousStreamMode || ttsStreamEnding || !ttsChapterPlan.length) return false; const currentTime = Math.max(0, Number(audio.currentTime) || 0); if (ttsLastStreamCurrentTimeSeconds > 8 && currentTime < Math.max(1, ttsLastStreamCurrentTimeSeconds - 3)) { ttsRecoverFromStreamReplay(); return true } if (currentTime >= ttsLastStreamCurrentTimeSeconds || ttsLastStreamCurrentTimeSeconds - currentTime < 1) ttsLastStreamCurrentTimeSeconds = Math.max(ttsLastStreamCurrentTimeSeconds, currentTime); return false }
+  const ttsRefreshTimeline = async (force = false) => {
+    if (!audiobookServerSessionId || !audiobookManifestHash || !ttsChapterPlan.length) return
+    const now = Date.now()
+    if (!force && now - ttsLastTimelineRefresh < 1000) return ttsTimelinePromise
+    if (ttsTimelinePromise) return ttsTimelinePromise
+    ttsLastTimelineRefresh = now
+    const firstAbsolute = Number(ttsChapterPlan[ttsStreamStartPlanIndex]?.index || 0)
+    const lastAbsolute = Number(ttsChapterPlan.at(-1)?.index ?? firstAbsolute)
+    const timelineStart = Math.max(firstAbsolute, ttsTimelineLoadedThrough + 1)
+    if (timelineStart > lastAbsolute) return true
+    ttsTimelinePromise = fetch(
+      `/api/v1/audiobook/sessions/${audiobookServerSessionId}/chapters/${audiobookManifestHash}/timeline?start=${timelineStart}&limit=${TTS_STREAM_BATCH_SEGMENTS}`,
+      {
+        method: 'GET', credentials: 'same-origin', cache: 'no-store',
+        headers: { 'X-Audiobook-Client': audiobookClientId },
+        signal: audiobookAbortController?.signal
+      }
+    ).then(async response => {
+      if (!response.ok) throw new Error(`chapter timeline ${response.status}`)
+      const payload = await response.json()
+      const durations = new Map((payload.segments || []).map(item => [Number(item.index), Number(item.duration_ms || 0)]))
+      for (const item of ttsChapterPlan) {
+        const durationMs = durations.get(Number(item.index)) || 0
+        if (durationMs > 0) {
+          item.durationSeconds = durationMs / 1000
+          item.durationExact = true
+        }
+      }
+      let loaded = timelineStart - 1
+      for (const item of payload.segments || []) {
+        if (Number(item.index) !== loaded + 1 || Number(item.duration_ms || 0) <= 0) break
+        loaded = Number(item.index)
+      }
+      ttsTimelineLoadedThrough = Math.max(ttsTimelineLoadedThrough, loaded)
+      return payload.complete === true
+    }).catch(error => {
+      if (error?.name !== 'AbortError') console.warn('[TTS] exact timeline unavailable', error)
+      return false
+    }).finally(() => { ttsTimelinePromise = null })
+    return ttsTimelinePromise
+  }
+  const ttsNewStreamId = () => {
+    const bytes = new Uint8Array(16); if (globalThis.crypto?.getRandomValues) { globalThis.crypto.getRandomValues(bytes); return Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('') }
+    return Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
+  }
+  const ttsConfirmStreamComplete = async (streamId, generation) => {
+    const statusBase = ttsChapterStreamUrl.replace(/\/stream\.mp3$/, '')
+    if (!statusBase || statusBase === ttsChapterStreamUrl) return false
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const response = await fetch(`${statusBase}/streams/${encodeURIComponent(streamId)}`, {
+        method: 'GET', credentials: 'same-origin',
+        headers: { 'X-Audiobook-Client': audiobookClientId },
+        signal: audiobookAbortController?.signal
+      })
+      if (!response.ok) throw new Error(`chapter stream status ${response.status}`)
+      const result = await response.json()
+      if (result.complete === true) return true
+      if (!state.reader.ttsActive || generation !== ttsPlanGeneration) return false
+      if (attempt < 2) await new Promise(resolve => window.setTimeout(resolve, 120))
+    }
+    return false
+  }
+  const ttsSetActiveItem = idx => {
     const item = ttsChapterPlan[idx]
-    const audio = ttsEnsureAudio()
-    ttsCacheWindow(idx + 1)
-    if (!ttsNextChapterCached && idx > ttsChapterPlan.length * 0.5 && ttsFollowingChapterId) {
-      ttsNextChapterCached = true
-      ttsPrefetchNextChapter()
-    }
+    if (!item) return
+    if (idx === ttsPlanIndex && ttsParagraphIndex === item.paraIdx) { if (!ttsActiveHighlightPresent(item.paraIdx)) ttsHighlight(item.paraIdx); return }
     ttsParagraphIndex = item.paraIdx
     ttsHighlight(item.paraIdx)
     ttsPlanIndex = idx
+    if (!ttsNextChapterCached && !ttsNextChapterPlan.length
+        && idx >= Math.max(0, ttsChapterPlan.length - 2) && ttsFollowingChapterId) {
+        ttsNextChapterCached = true
+      ttsPrefetchNextChapter()
+    }
     if (state.ttsSession?.active) {
       state.ttsSession.paragraphIndex = item.paraIdx
       state.ttsSession.itemIndex = idx
+      state.ttsSession.absoluteItemIndex = Math.max(0, Number(item.index ?? idx) || 0)
       state.ttsSession.itemCount = ttsChapterPlan.length
       state.ttsSession.currentText = item.text || ''
       state.ttsSession.contextItems = ttsChapterPlan.map(planItem => planItem.text || '')
@@ -4485,13 +3369,83 @@ async function loadReader(bookId, chapterId) {
       state.ttsSession.returnPath = contextualHref(`/books/${requestedBookId}/chapters/${state.ttsSession.chapterId}`)
       state.ttsSession.onParagraph?.(item.paraIdx)
       saveTtsCheckpoint(state.ttsSession)
+      ttsQueueServerProgress()
       updateGlobalTtsReturn()
       updateTtsPlayer()
     }
     ttsUpdateMediaSession(item.paraIdx)
-    // Keep media on a same-origin URL. Safari PWA may reject object URLs for
-    // sequential audio, while this endpoint is already HTTP-cached for one hour.
-    audio.src = item.url
+  }
+  const ttsSyncStreamPosition = () => { const audio = ttsAudioEl; if (!audio || !ttsChapterPlan.length || ttsRejectStreamReplay()) return; const candidate = ttsResolvedStreamPlanIndex(); if (candidate !== ttsPlanIndex) ttsSetActiveItem(candidate); ttsRememberTrustedPosition(candidate); ttsRefreshTimeline().catch(() => {}); if (Date.now() - ttsLastProgressAt >= 5000) { ttsLastProgressAt = Date.now(); ttsQueueServerProgress() } }
+  const ttsCurrentItemOffsetSeconds = (planIndex = ttsPlanIndex) => {
+    const boundedPlanIndex = Math.max(0, Math.min(Number(planIndex) || 0, ttsChapterPlan.length - 1))
+    let elapsedBeforeItem = 0
+    for (let planIdx = ttsStreamStartPlanIndex; planIdx < boundedPlanIndex; planIdx++) elapsedBeforeItem += ttsStreamSegmentPlayedSeconds(planIdx)
+    const relative = Math.max(0, Number(ttsAudioEl?.currentTime || 0) - elapsedBeforeItem)
+    const rawOffset = boundedPlanIndex === ttsStreamStartPlanIndex ? ttsStreamResumeBaseSeconds + relative : relative
+    const duration = Number(ttsChapterPlan[boundedPlanIndex]?.durationSeconds || ttsChapterPlan[boundedPlanIndex]?.duration_seconds)
+    if (Number.isFinite(duration) && duration > 0.1) return Math.max(0, Math.min(rawOffset, duration - 0.05))
+    return rawOffset
+  }
+  ttsFallbackPlayback = window.OOHStoryAudiobookFallback.create({
+    clientId: audiobookClientId, responseError: ttsBackendResponseError,
+    failureNotice: ttsBackendFailureNotice,
+    timeoutMs: Number(window.OOHStoryAudiobookConnectTimeoutMs || 8000),
+    isActive: () => state.reader.ttsActive, isPaused: () => ttsLifecycle.isPausedByUser(),
+    isPolicyError: ttsIsPlaybackPolicyError, generation: () => ttsPlanGeneration,
+    signal: () => audiobookAbortController?.signal, audio: ttsEnsureAudio,
+    items: () => ttsChapterPlan, offset: ttsCurrentItemOffsetSeconds,
+    begin: (idx, token, offset) => {
+      ttsSegmentFallbackMode = true; ttsActiveStreamId = token; ttsStreamStartPlanIndex = idx
+      ttsStreamResumeBaseSeconds = Math.max(0, Number(offset) || 0); ttsSetActiveItem(idx)
+      ttsLifecycle.connect(); if (state.ttsSession?.active) state.ttsSession.playbackStatusText = '正在生成当前片段'; ttsUpdateControls()
+    },
+    playing: () => { if (state.ttsSession?.active) state.ttsSession.playbackStatusText = ''; if (ttsLifecycle.isConnecting()) ttsLifecycle.playing(); ttsUpdateControls() },
+    timeupdate: idx => { ttsSetActiveItem(idx); if (Date.now() - ttsLastProgressAt >= 5000) { ttsLastProgressAt = Date.now(); ttsQueueServerProgress() } },
+    progress: force => ttsQueueServerProgress(force), finish: () => ttsChapterEnd(),
+    fail: ttsMarkPlaybackBlocked
+  })
+
+  const ttsPlayItem = (idx, resumeOverrideSeconds = null) => {
+    if (!state.reader.ttsActive || idx >= ttsChapterPlan.length) { if (idx >= ttsChapterPlan.length) ttsChapterEnd(); return }
+    if (ttsLifecycle.isPausedByUser()) return
+    const generation = ttsPlanGeneration
+    const item = ttsChapterPlan[idx]
+    if (!item || !ttsChapterStreamUrl) {
+      ttsMarkPlaybackBlocked(new Error('chapter stream unavailable'), '章节音频流不可用，点击重试')
+      return
+    }
+    const audio = ttsEnsureAudio()
+    ttsFallbackPlayback.clearWatchdog()
+    ttsSegmentFallbackMode = false; ttsStreamEnding = false
+    ttsFallbackPlayback.release()
+    ttsStreamStartPlanIndex = idx
+    ttsSetActiveItem(idx)
+    const streamId = ttsNewStreamId()
+    ttsActiveStreamId = streamId
+    const overrideOffset = Number(resumeOverrideSeconds)
+    const resumeOffset = Number.isFinite(overrideOffset) && overrideOffset > 0
+      ? overrideOffset
+      : (idx === 0 ? ttsResumeOffsetSeconds : 0)
+    ttsStreamResumeBaseSeconds = resumeOffset
+    ttsTimelineLoadedThrough = Number(item.index || 0) - 1
+    ttsResumeOffsetSeconds = 0
+    ttsLastStreamCurrentTimeSeconds = 0; ttsTrustedPlanIndex = idx; ttsTrustedItemOffsetSeconds = resumeOffset
+    ttsLifecycle.connect()
+    if (state.ttsSession?.active) state.ttsSession.playbackStatusText = '正在准备本组5段音频'
+    ttsUpdateControls()
+    audio.src = `${ttsChapterStreamUrl}?start=${encodeURIComponent(item.index)}&offset_ms=${encodeURIComponent(Math.round(resumeOffset * 1000))}&stream_id=${encodeURIComponent(streamId)}&continuous=1&full_chapter=1`
+    audio.onloadedmetadata = () => ttsRefreshTimeline(true).catch(() => {})
+    const markActuallyPlaying = () => {
+      if (!state.reader.ttsActive || generation !== ttsPlanGeneration || ttsActiveStreamId !== streamId) return
+      if (ttsLifecycle.isPausedByUser()) { audio.pause(); return }
+      ttsAudioUnlocked = true
+      ttsFallbackPlayback.clearWatchdog()
+      if (state.ttsSession?.active) state.ttsSession.playbackStatusText = ''
+      if (ttsLifecycle.snapshot().state === 'connecting') ttsLifecycle.playing()
+      ttsUpdateControls()
+      ttsPrefetchNextChapter().catch(() => {})
+    }
+    audio.onplaying = markActuallyPlaying
     let failed = false
     const advanceAfterFailure = error => {
       if (failed || !state.reader.ttsActive || generation !== ttsPlanGeneration) return
@@ -4500,37 +3454,51 @@ async function loadReader(bookId, chapterId) {
         ttsMarkPlaybackBlocked(error)
         return
       }
-      if (retryCount < 6) {
-        console.warn('[TTS] transient audio failure, retrying same item', idx, retryCount + 1)
-        window.setTimeout(() => {
-          if (state.reader.ttsActive && generation === ttsPlanGeneration) ttsPlayItem(idx, retryCount + 1)
-        }, Math.min(5000, 400 * (2 ** retryCount)))
-        return
-      }
-      console.warn('[TTS] audio failed at', idx, error)
-      ttsMarkPlaybackBlocked(error, '音频加载失败，点击重试')
+      const fallbackIdx = Math.max(idx, ttsPlanIndex, ttsTrustedPlanIndex)
+      const fallbackOffset = fallbackIdx === ttsTrustedPlanIndex ? ttsTrustedItemOffsetSeconds : ttsCurrentItemOffsetSeconds(fallbackIdx)
+      console.warn('[TTS] chapter stream failed; switching to finite segment playback', fallbackIdx, error)
+      audio.pause()
+      audio.removeAttribute('src')
+      audio.load()
+      ttsFallbackPlayback.play(fallbackIdx, fallbackOffset)
     }
-    audio.onended = () => {
-      if (!state.reader.ttsActive || generation !== ttsPlanGeneration) return
-      if (ttsRebuildRequested) {
-        const following = ttsChapterPlan[idx + 1]
-        const resumeIdx = following?.paraIdx === item.paraIdx ? item.paraIdx : item.paraIdx + 1
-        ttsRebuildActivePlan(resumeIdx)
+    audio.ontimeupdate = ttsSyncStreamPosition
+    audio.onended = async () => {
+      if (!state.reader.ttsActive || generation !== ttsPlanGeneration || ttsActiveStreamId !== streamId) return
+      if (failed) return
+      failed = true
+      ttsStreamEnding = true
+      let streamCompleted = false
+      try {
+        streamCompleted = await ttsConfirmStreamComplete(streamId, generation)
+      } catch (error) {
+        if (error?.name === 'AbortError') return
+        console.warn('[TTS] chapter stream completion check failed', error)
+      }
+      if (!state.reader.ttsActive || generation !== ttsPlanGeneration || ttsActiveStreamId !== streamId) return
+      if (!streamCompleted) {
+        ttsStreamEnding = false
+        ttsMarkPlaybackBlocked(new Error('audio batch ended before its final segment'), '本组音频流中断，已停在当前段，点击重试')
         return
       }
-      const nextIdx = idx + 1
-      if (nextIdx >= ttsChapterPlan.length) { ttsChapterEnd(); return }
-      ttsPlayItem(nextIdx)
+      const finalPlanIndex = Math.max(idx, ttsChapterPlan.length - 1)
+      ttsSetActiveItem(finalPlanIndex)
+      ttsQueueServerProgress(true)
+      ttsStreamEnding = false
+      ttsChapterEnd()
     }
     audio.onerror = () => advanceAfterFailure(new Error('audio element error'))
+    ttsFallbackPlayback.guard(
+      () => state.reader.ttsActive && generation === ttsPlanGeneration && ttsActiveStreamId === streamId && ttsLifecycle.isConnecting(),
+      () => {
+        const fallbackIdx = Math.max(idx, ttsPlanIndex, ttsTrustedPlanIndex); console.warn('[TTS] chapter stream connection stalled; switching to finite segment playback', fallbackIdx)
+        audio.pause(); audio.removeAttribute('src')
+        ttsFallbackPlayback.play(fallbackIdx, fallbackIdx === ttsTrustedPlanIndex ? ttsTrustedItemOffsetSeconds : ttsCurrentItemOffsetSeconds(fallbackIdx))
+      }
+    )
     try {
       const playPromise = audio.play()
-      Promise.resolve(playPromise).then(() => {
-        if (!state.reader.ttsActive || generation !== ttsPlanGeneration) return
-        ttsPlaybackBlocked = false
-        ttsPlaybackNotice = ''
-        ttsUpdateControls()
-      }).catch(advanceAfterFailure)
+      Promise.resolve(playPromise).then(markActuallyPlaying).catch(advanceAfterFailure)
     } catch (error) {
       advanceAfterFailure(error)
     }
@@ -4538,30 +3506,121 @@ async function loadReader(bookId, chapterId) {
   }
 
   const ttsPrefetchNextChapter = async () => {
-    const chapterId = ttsFollowingChapterId
-    if (!chapterId) return
-    const signature = ttsSettingsSignature()
-    try {
-      const data = await api(`/api/v1/books/${requestedBookId}/chapters/${chapterId}`)
-      if (!data?.content || !state.reader.ttsActive || signature !== ttsSettingsSignature()) return
-      const text = (data.content || '').replace(/\r\n/g, '\n')
-      const ilRe = /^\[illustration:.+\]$/
-      const paras = text.split('\n').filter(l => l.trim().length > 0 && !ilRe.test(l))
-      ttsNextChapterPlan = ttsBuildChapterPlan(paras, 0)
-      ttsNextChapterSignature = signature
-      ttsNextChapterId = chapterId
-      ttsNextChapterFollowingId = data.next_id ?? null
-      ttsNextChapterTitle = data.title || data.display_title || '下一章'
-      ttsCacheWindow(ttsPlanIndex + 1)
-    } catch { /* ignore */ }
+    if (audiobookServerSessionId) {
+      const generation = ttsPlanGeneration
+      try {
+        const fromChapterId = state.ttsSession?.chapterId || requestedChapterId
+        const response = await fetch(`/api/v1/audiobook/sessions/${audiobookServerSessionId}/next?from_chapter_id=${encodeURIComponent(fromChapterId)}`, {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'X-Audiobook-Client': audiobookClientId },
+          signal: audiobookAbortController?.signal
+        })
+        if (!response.ok) throw new Error(`next manifest ${response.status}`)
+        const manifest = (await response.json()).next
+        if (!manifest || !state.reader.ttsActive || generation !== ttsPlanGeneration) return
+        const nextPlan = manifest.segments.map(item => ({ ...item, paraIdx: Number(item.paragraph_index), url: '', text: item.text || '' }))
+        ttsNextChapterPlan = nextPlan
+        ttsNextChapterId = manifest.chapter_id
+        ttsNextChapterFollowingId = manifest.next_chapter_id
+        ttsNextChapterTitle = manifest.title || '下一章'
+        ttsNextChapterStreamUrl = manifest.stream_endpoint || ''
+        ttsNextChapterSignature = manifest.manifest_hash || ''
+        ttsNextChapterCached = true
+        try {
+          if (!ttsNextChapterStreamUrl || !await window.OOHStoryAudiobookCache.shouldPrefetch()) return
+          const firstIndex = Number(nextPlan[0]?.index || 0)
+          const preload = await fetch(`${ttsNextChapterStreamUrl}?start=${encodeURIComponent(firstIndex)}&preload=1`, {
+            method: 'GET', credentials: 'same-origin', cache: 'no-store',
+            headers: { 'X-Audiobook-Client': audiobookClientId },
+            signal: audiobookAbortController?.signal
+          })
+          if (!preload.ok) throw await ttsBackendResponseError(preload)
+          await preload.arrayBuffer()
+        } catch (error) {
+          if (error?.name !== 'AbortError') console.warn('[TTS] next chapter stream preload unavailable', error)
+        }
+      } catch (error) {
+        if (error?.name !== 'AbortError') console.warn('[TTS] next persistent chapter unavailable', error)
+      }
+      return
+    }
+  }
+
+  const ttsQueueServerProgress = (immediate = false) => {
+    if (ttsProgressTimer) {
+      clearTimeout(ttsProgressTimer)
+      ttsProgressTimer = null
+    }
+    const sessionId = audiobookServerSessionId
+    const current = state.ttsSession
+    if (!sessionId || !current?.active || !current.chapterId) return null
+    const progressPlanIndex = !ttsSegmentFallbackMode && ttsChapterPlan.length ? ttsResolvedStreamPlanIndex() : Math.max(0, ttsPlanIndex)
+    const activeItem = ttsChapterPlan[progressPlanIndex]
+    const itemOffsetSeconds = ttsCurrentItemOffsetSeconds(progressPlanIndex)
+    if (activeItem) {
+      current.paragraphIndex = Number(activeItem.paraIdx ?? current.paragraphIndex) || 0
+      current.itemIndex = progressPlanIndex
+      current.absoluteItemIndex = Math.max(0, Number(activeItem.index ?? current.absoluteItemIndex ?? progressPlanIndex) || 0)
+      current.currentText = activeItem.text || current.currentText || ''; current.currentEmotion = activeItem.emotion || current.currentEmotion || 'neutral'
+      saveTtsCheckpoint(current)
+    }
+    const send = () => {
+      ttsProgressTimer = null
+      return fetch(`/api/v1/audiobook/sessions/${sessionId}/progress`, {
+        method: 'PUT',
+        credentials: 'same-origin',
+        keepalive: immediate,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Audiobook-Client': audiobookClientId
+        },
+        body: JSON.stringify({
+          chapter_id: Number(current.chapterId),
+          paragraph_index: Math.max(0, Number(current.paragraphIndex) || 0),
+          item_index: Math.max(0, Number(activeItem?.index ?? current.absoluteItemIndex ?? current.itemIndex) || 0),
+          audio_offset_ms: Math.max(0, Math.round(itemOffsetSeconds * 1000))
+        })
+      }).catch(() => null)
+    }
+    if (immediate) return send()
+    ttsProgressTimer = window.setTimeout(send, 1800)
+    return null
   }
 
   const stopTTS = ({ preservePending = false } = {}) => {
+    if (!preservePending) {
+      const finalProgress = ttsQueueServerProgress(true)
+      const closingSessionId = audiobookServerSessionId
+      // If creation has not returned a session ID yet, keep that POST alive.
+      // Its late-response branch owns the compensating DELETE. Aborting here
+      // can let the server commit a session while preventing the browser from
+      // ever learning the ID, leaving an orphan after rapid start/exit.
+      if (closingSessionId) audiobookAbortController?.abort()
+      audiobookAbortController = null
+      window.OOHStoryAudiobookCache?.cancel?.()
+      window.OOHStoryAudiobookCache?.releaseUrls?.()
+      if (closingSessionId) {
+        // Session cancellation must not wait behind a stalled final progress
+        // request. Otherwise rapid exit/re-entry leaves the old chapter streams
+        // consuming the per-user TTS slots and the next session appears paused.
+        fetch(`/api/v1/audiobook/sessions/${closingSessionId}`, {
+          method: 'DELETE', credentials: 'same-origin', keepalive: true,
+          headers: { 'X-Audiobook-Client': audiobookClientId }
+        }).catch(() => {})
+        Promise.resolve(finalProgress).catch(() => {})
+      }
+      audiobookServerSessionId = ''
+      audiobookManifestHash = ''
+      ttsChapterStreamUrl = ''
+    }
     if (ttsHeartbeat) { clearInterval(ttsHeartbeat); ttsHeartbeat = null }
+    ttsFallbackPlayback?.clearWatchdog()
     if (ttsRebuildTimer) { clearTimeout(ttsRebuildTimer); ttsRebuildTimer = null }
     ttsRebuildRequested = false
-    ttsPlaybackBlocked = false
-    ttsPlaybackNotice = ''
+    if (ttsLifecycle.snapshot().state !== 'idle') {
+      if (ttsLifecycle.snapshot().state !== 'stopping') ttsLifecycle.stop()
+      ttsLifecycle.finish()
+    }
     ttsPlanGeneration++
     if (preservePending) {
       // The current item has ended already. Detach the old chapter callbacks,
@@ -4569,6 +3628,8 @@ async function loadReader(bookId, chapterId) {
       if (ttsAudioEl) {
         ttsAudioEl.onended = null
         ttsAudioEl.onerror = null
+        ttsAudioEl.ontimeupdate = null
+        ttsAudioEl.onplaying = null
       }
     } else {
       ttsStopPlayback()
@@ -4585,17 +3646,6 @@ async function loadReader(bookId, chapterId) {
     } else if (!pending) {
       state.ttsPendingPlan = null
     }
-    const keepUrls = pending ? new Set(pending.items.map(item => item.url)) : null
-    if (keepUrls) {
-      for (const url of ttsCache.keys()) {
-        if (!keepUrls.has(url)) ttsCache.delete(url)
-      }
-      for (const url of ttsCachePromises.keys()) {
-        if (!keepUrls.has(url)) ttsCachePromises.delete(url)
-      }
-    } else {
-      ttsClearCache()
-    }
     ttsChapterPlan = []
     ttsPlanIndex = 0
     ttsNextChapterPlan = []
@@ -4603,8 +3653,16 @@ async function loadReader(bookId, chapterId) {
     ttsNextChapterId = null
     ttsNextChapterFollowingId = null
     ttsNextChapterTitle = ''
+    ttsNextChapterStreamUrl = ''
+    ttsContinuousStreamMode = false
+    ttsStreamStartPlanIndex = 0
+    ttsStreamResumeBaseSeconds = 0
+    ttsTimelineLoadedThrough = -1
+    ttsActiveStreamId = ''; ttsStreamEnding = false
+    ttsLastStreamCurrentTimeSeconds = 0; ttsTrustedPlanIndex = 0; ttsTrustedItemOffsetSeconds = 0
     ttsNextChapterCached = false
-    ttsPrevUrls = new Set()
+    if (ttsHighlightRetryFrame) cancelAnimationFrame(ttsHighlightRetryFrame)
+    ttsHighlightRetryFrame = null; ttsPendingHighlightIndex = null; ttsHighlightRetryAttempts = 0
     state.reader.ttsActive = false
     ttsParagraphIndex = -1
     ttsClearHighlight()
@@ -4643,10 +3701,9 @@ async function loadReader(bookId, chapterId) {
     const left = Math.max(0, stageRect.left) + Math.min(72, Math.max(24, stageRect.width * .12))
     const points = [[left, top], [innerWidth / 2, top], [innerWidth / 2, innerHeight / 2]]
     for (const [x, y] of points) {
-      const paragraph = document.elementFromPoint(x, y)?.closest?.('.reader-paragraph')
-      if (paragraph && readerContent.contains(paragraph)) {
-        return Math.max(0, Number(paragraph.dataset.ttsIndex) || 0)
-      }
+      const paragraph = readerParagraphFromPoint(x, y)
+      const index = readerParagraphIndex(paragraph)
+      if (index >= 0) return index
     }
     if (currentParagraphHint >= 0) {
       const hinted = readerContent.querySelector(`.reader-paragraph[data-tts-index="${currentParagraphHint}"]`)
@@ -4672,20 +3729,37 @@ async function loadReader(bookId, chapterId) {
     const audio = ttsEnsureAudio()
     audio.onended = null
     audio.onerror = null
+    audio.ontimeupdate = null
     ttsRebuildRequested = false
-    ttsPlaybackBlocked = false
-    ttsPlaybackNotice = ''
+    ttsLifecycle.restart()
     ttsPlanGeneration++
-    ttsClearCache()
+    audiobookAbortController?.abort()
+    window.OOHStoryAudiobookCache?.cancel?.()
+    window.OOHStoryAudiobookCache?.releaseUrls?.()
+    if (audiobookServerSessionId) {
+      fetch(`/api/v1/audiobook/sessions/${audiobookServerSessionId}`, {
+        method: 'DELETE', credentials: 'same-origin', keepalive: true,
+        headers: { 'X-Audiobook-Client': audiobookClientId }
+      }).catch(() => {})
+      audiobookServerSessionId = ''
+    }
     state.ttsPendingPlan = null
     state.ttsContinueOnLoad = false
-    ttsChapterPlan = ttsBuildChapterPlan(ttsParagraphs(), startIdx)
+    ttsChapterPlan = []
+    ttsChapterStreamUrl = ''
+    ttsActiveStreamId = ''; ttsStreamEnding = false
     ttsPlanIndex = 0
+    ttsLastStreamCurrentTimeSeconds = 0; ttsTrustedPlanIndex = 0; ttsTrustedItemOffsetSeconds = 0
     ttsNextChapterPlan = []
     ttsNextChapterSignature = ''
+    ttsNextChapterStreamUrl = ''
     ttsNextChapterCached = false
-    ttsCacheWindow(1)
-    if (ttsChapterPlan.length) ttsPlayItem(0)
+    ttsBackendManifest(startIdx, false).catch(error => {
+      if (!state.reader.ttsActive || error?.name === 'AbortError') return
+      if (ttsLifecycle.isPausedByUser()) return
+      console.warn('[TTS] backend manifest unavailable', error)
+      ttsMarkPlaybackBlocked(error, ttsBackendFailureNotice(error))
+    })
   }
 
   const ttsScheduleRebuild = () => {
@@ -4695,12 +3769,12 @@ async function loadReader(bookId, chapterId) {
     }
     if (!state.reader.ttsActive) return
     if (ttsRebuildTimer) clearTimeout(ttsRebuildTimer)
-    ttsRebuildTimer = null
     ttsRebuildRequested = true
-    const audio = ttsEnsureAudio()
-    if (audio.paused || audio.ended || !audio.src || ttsPlaybackBlocked) {
+    ttsRebuildTimer = window.setTimeout(() => {
+      ttsRebuildTimer = null
+      if (!state.reader.ttsActive) return
       ttsRebuildActivePlan()
-    }
+    }, 250)
   }
 
   const startTTS = (startParagraph = null) => {
@@ -4712,28 +3786,34 @@ async function loadReader(bookId, chapterId) {
     } else {
       stopTTS({ preservePending: Boolean(pending) })
     }
+    // Prime playback inside the user's click stack before any network/cache
+    // await. This is the actual iOS/Safari media unlock, not just construction.
+    ttsPrimeAudioFromGesture()
     state.reader.ttsActive = true
-    ttsPlaybackBlocked = false
+    ttsLifecycle.start()
     ttsRebuildRequested = false
-    ttsPlaybackNotice = ''
     saveReaderSettings()
-    ttsEnsureAudio()
+    const chapterMetrics = ttsChapterMetrics(requestedChapterId)
     state.ttsSession = {
       active: true,
       detached: false,
       bookId: String(requestedBookId),
       chapterId: String(requestedChapterId),
       paragraphIndex: explicitStart ? Math.max(0, startParagraph) : 0,
+      paragraphCount: 1,
       itemIndex: 0,
+      absoluteItemIndex: 0,
+      absoluteItemCount: 1,
       itemCount: 1,
       currentText: '',
       currentEmotion: 'neutral',
       bookTitle: chapter?.book?.title || '',
       chapterTitle: chapter?.title || '',
-      chapterNumber: chapterPosition + 1,
-      chapterCount: catalog.chapters.length,
+      chapterNumber: chapterMetrics.number,
+      chapterCount: chapterMetrics.count,
       contextItems: [],
       coverUrl: chapter?.book?.cover_url || `/api/v1/books/${requestedBookId}/cover`,
+      mediaCoverUrl: `/api/v1/books/${requestedBookId}/cover?variant=media-art`,
       playbackBlocked: false,
       playerOpen: false,
       returnPath: contextualHref(`/books/${requestedBookId}/chapters/${requestedChapterId}`),
@@ -4745,11 +3825,25 @@ async function loadReader(bookId, chapterId) {
       stop: options => stopTTS(options),
       resume: () => ttsResumePlayback(),
       pause: () => {
+        ttsFallbackPlayback?.clearWatchdog()
         if (ttsAudioEl && !ttsAudioEl.paused) ttsAudioEl.pause()
+        if (['starting', 'connecting', 'playing'].includes(ttsLifecycle.snapshot().state)) {
+          ttsLifecycle.pause()
+        }
         ttsUpdateControls()
       },
-      previous: () => { if (ttsPlanIndex > 0) ttsPlayItem(ttsPlanIndex - 1) },
-      next: () => { if (ttsPlanIndex < ttsChapterPlan.length - 1) ttsPlayItem(ttsPlanIndex + 1) },
+      previous: () => {
+        if (ttsPlanIndex > 0) {
+          if (ttsSegmentFallbackMode) ttsFallbackPlayback.play(ttsPlanIndex - 1)
+          else ttsPlayItem(ttsPlanIndex - 1)
+        }
+      },
+      next: () => {
+        if (ttsPlanIndex < ttsChapterPlan.length - 1) {
+          if (ttsSegmentFallbackMode) ttsFallbackPlayback.play(ttsPlanIndex + 1)
+          else ttsPlayItem(ttsPlanIndex + 1)
+        }
+      },
       setRate: value => {
         state.reader.ttsRate = Number(value)
         saveReaderSettings()
@@ -4770,6 +3864,18 @@ async function loadReader(bookId, chapterId) {
         ttsUpdateControls()
       },
       rebuild: () => ttsScheduleRebuild(),
+      previousChapter: () => {
+        const currentPosition = catalog.chapters.findIndex(item => String(item.id) === String(state.ttsSession?.chapterId))
+        const targetId = currentPosition > 0 ? catalog.chapters[currentPosition - 1]?.id : null
+        if (!targetId) return
+        state.ttsContinueOnLoad = true
+        goToChapter(targetId, true)
+      },
+      nextChapter: () => {
+        if (ttsFollowingChapterId) ttsChapterEnd()
+      },
+      hasPreviousChapter: () => catalog.chapters.findIndex(item => String(item.id) === String(state.ttsSession?.chapterId)) > 0,
+      hasNextChapter: () => Boolean(ttsFollowingChapterId),
       detach() {
         if (!state.ttsSession?.active) return
         state.ttsSession.detached = true
@@ -4790,18 +3896,20 @@ async function loadReader(bookId, chapterId) {
       ttsChapterPlan = pending.items
       state.ttsPendingPlan = null
     } else {
-      const paragraphs = ttsParagraphs()
-      const checkpoint = explicitStart ? null : readTtsCheckpoint(requestedBookId, requestedChapterId)
       const startIdx = explicitStart
         ? Math.max(0, startParagraph)
-        : Math.max(0, Number(checkpoint?.paragraphIndex ?? ttsFirstVisibleParagraph()) || 0)
-      console.log('[TTS] mode:', state.reader.ttsMode, 'narrator:', state.reader.ttsNarrator, 'paragraphs:', paragraphs.length, 'startIdx:', startIdx)
-      ttsChapterPlan = ttsBuildChapterPlan(paragraphs, startIdx)
+        : 0
+      console.log('[TTS] mode:', state.reader.ttsMode, 'narrator:', state.reader.ttsNarrator, 'paragraphs:', ttsParagraphs().length, 'startIdx:', startIdx)
+      ttsChapterPlan = []
       state.ttsSession.paragraphIndex = startIdx
+      ttsBackendManifest(startIdx, false).catch(error => {
+        if (!state.reader.ttsActive || error?.name === 'AbortError') return
+        if (ttsLifecycle.isPausedByUser()) return
+        console.warn('[TTS] backend manifest unavailable', error)
+        ttsMarkPlaybackBlocked(error, ttsBackendFailureNotice(error))
+      })
     }
     state.ttsSession.contextItems = ttsChapterPlan.map(item => item.text || '')
-    ttsClearCache(ttsPrevUrls)
-    ttsPrevUrls = new Set()
     ttsNextChapterCached = false
     ttsNextChapterSignature = ''
     if (ttsHeartbeat) clearInterval(ttsHeartbeat)
@@ -4809,33 +3917,50 @@ async function loadReader(bookId, chapterId) {
       if (!state.reader.ttsActive) { clearInterval(ttsHeartbeat); ttsHeartbeat = null }
     }, 5000)
     ttsCacheWindow(1)
-    if (state.reader.ttsActive) ttsPlayItem(0)
+    if (state.reader.ttsActive && ttsChapterPlan.length) ttsPlayItem(0)
   }
 
   const ttsResumePlayback = () => {
-    if (!state.reader.ttsActive || !ttsChapterPlan.length) return
-    const retryCurrentItem = ttsPlaybackBlocked
-    ttsPlaybackBlocked = false
-    ttsPlaybackNotice = ''
+    if (!state.reader.ttsActive || ttsStreamEnding) return
+    if (ttsLifecycle.isPausedByUser()) ttsLifecycle.resume()
+    if (!ttsChapterPlan.length) {
+      if (ttsLifecycle.isBlocked()) ttsLifecycle.retry()
+      ttsUpdateControls()
+      ttsRebuildActivePlan()
+      return
+    }
+    const retryCurrentItem = ttsLifecycle.isBlocked()
+    if (retryCurrentItem) ttsLifecycle.retry()
+    else ttsLifecycle.connect()
     ttsUpdateControls()
     const audio = ttsEnsureAudio()
     if (!retryCurrentItem && audio.src && audio.paused && !audio.ended) {
       Promise.resolve(audio.play()).then(() => {
-        ttsPlaybackBlocked = false
+        ttsLifecycle.playing()
         ttsUpdateControls()
       }).catch(error => ttsMarkPlaybackBlocked(error))
       return
     }
-    ttsPlayItem(Math.max(0, ttsPlanIndex))
+    const retryIndex = Math.max(0, Math.min(Math.max(ttsPlanIndex, ttsTrustedPlanIndex), ttsChapterPlan.length - 1)), retryOffset = retryIndex === ttsTrustedPlanIndex ? ttsTrustedItemOffsetSeconds : ttsCurrentItemOffsetSeconds(retryIndex)
+    if (ttsSegmentFallbackMode) ttsFallbackPlayback.play(retryIndex, retryOffset); else ttsPlayItem(retryIndex, retryOffset)
   }
 
-  const openTTS = () => {
-    if (state.ttsController?.active && state.ttsController.owner !== ttsOwner) {
-      openTtsPlayer()
+  const restartTTSFromChapterStart = () => {
+    try {
+      startTTS(0)
+    } catch (error) {
+      if (ttsLifecycle.snapshot().state !== 'idle') {
+        if (ttsLifecycle.snapshot().state !== 'stopping') ttsLifecycle.stop()
+        ttsLifecycle.finish()
+      }
+      state.reader.ttsActive = false
+      state.ttsController = null
+      state.ttsSession = null
+      saveReaderSettings()
+      ttsUpdateControls()
+      console.error('[TTS] player initialization failed', error)
       return
     }
-    if (!state.reader.ttsActive) startTTS()
-    else if (ttsPlaybackBlocked) ttsResumePlayback()
     openTtsPlayer()
   }
 
@@ -4906,7 +4031,7 @@ async function loadReader(bookId, chapterId) {
     desktopDayNightBtn,
     node('button', {
       class: `reader-toolbar-btn${state.reader.ttsActive ? ' active' : ''}`, type: 'button', text: '🔊', title: '听书',
-      onclick: openTTS
+      onclick: restartTTSFromChapterStart
     }),
     node('button', {
       class: 'reader-toolbar-btn', type: 'button', text: '⚙', title: '阅读设置',
@@ -5032,7 +4157,7 @@ async function loadReader(bookId, chapterId) {
       type: 'button',
       text: `停止听书 · ${state.reader.ttsRate}x`,
       hidden: '',
-      onclick: openTTS
+      onclick: openTtsPlayer
     }))
   ].filter(Boolean))
 
@@ -5115,8 +4240,18 @@ async function loadReader(bookId, chapterId) {
     type: 'button',
     text: '听书',
     onclick: () => {
-      openTTS()
+      restartTTSFromChapterStart()
       if (state.reader.ttsActive) setSettingsVisible(false)
+    }
+  })
+  ttsExitButton = node('button', {
+    type: 'button',
+    class: 'reader-tts-exit-inline',
+    text: '退出听书',
+    hidden: state.reader.ttsActive ? null : '',
+    onclick: () => {
+      stopTTS()
+      setSettingsVisible(false)
     }
   })
   fontSizeOutput = node('b', { text: `${state.reader.size}px` })
@@ -5132,6 +4267,24 @@ async function loadReader(bookId, chapterId) {
     }
   })
   const fontSizeLabel = node('label', {}, [node('span', { text: '阅读字号' }), fontSizeOutput, fontSizeInput])
+  ttsExitControl = node('section', {
+    class: 'reader-tts-exit',
+    hidden: state.reader.ttsActive ? null : ''
+  }, [
+    node('div', { class: 'reader-tts-exit-copy' }, [
+      node('span', { text: 'AUDIOBOOK ACTIVE' }),
+      node('strong', { text: '正在听书' }),
+      node('small', { text: '停止音频、销毁本次会话，并关闭底部听书浮层。' })
+    ]),
+    node('button', {
+      type: 'button',
+      text: '退出听书',
+      onclick: () => {
+        stopTTS()
+        setSettingsVisible(false)
+      }
+    })
+  ])
   settingsPanel = node('section', { class: 'reader-settings-panel', 'aria-hidden': 'true' }, [
     node('div', { class: 'reader-settings-title' }, [
       node('strong', { text: '阅读设置' }),
@@ -5153,7 +4306,7 @@ async function loadReader(bookId, chapterId) {
     }, 20),
     node('div', { class: 'reader-setting-group' }, [node('span', { text: '阅读背景色' }), backgroundOptions]),
     node('div', { class: 'reader-setting-group' }, [node('span', { text: '阅读模式' }), modeOptions]),
-    node('div', { class: 'reader-setting-toggles' }, [eyeCareButton, autoButton, ttsButton].filter(Boolean)),
+    node('div', { class: 'reader-setting-toggles' }, [eyeCareButton, autoButton, ttsButton, ttsExitButton].filter(Boolean)),
     rangeSetting('自动阅读速度', value => String(value), 1, 9, state.reader.autoSpeed, value => {
       state.reader.autoSpeed = value
       saveReaderSettings()
@@ -5166,24 +4319,9 @@ async function loadReader(bookId, chapterId) {
       ttsUpdateControls()
     }, 0.1),
     (() => {
-      const voices = [
-        { key: 'nuanxi', label: '暖溪 · 温婉知性', gender: 'female', lang: 'zh-CN' },
-        { key: 'lingxian', label: '灵弦 · 灵动俏皮', gender: 'female', lang: 'zh-CN' },
-        { key: 'shuanger', label: '霜儿 · 爽朗飒然', gender: 'female', lang: 'zh-CN' },
-        { key: 'yanzhi', label: '燕知 · 清亮质朴', gender: 'female', lang: 'zh-CN' },
-        { key: 'wanqing', label: '晚晴 · 柔婉细腻', gender: 'female', lang: 'zh-HK' },
-        { key: 'muyao', label: '沐瑶 · 端庄优雅', gender: 'female', lang: 'zh-HK' },
-        { key: 'qianyu', label: '浅语 · 温润恬静', gender: 'female', lang: 'zh-TW' },
-        { key: 'ruoxi', label: '若汐 · 甜美亲和', gender: 'female', lang: 'zh-TW' },
-        { key: 'kuangyun', label: '旷云 · 热血豪迈', gender: 'male', lang: 'zh-CN' },
-        { key: 'qingyan', label: '清砚 · 少年朗逸', gender: 'male', lang: 'zh-CN' },
-        { key: 'tongzhen', label: '童真 · 稚气天真', gender: 'male', lang: 'zh-CN' },
-        { key: 'mocheng', label: '墨澄 · 沉稳儒雅', gender: 'male', lang: 'zh-CN' },
-        { key: 'yueming', label: '岳鸣 · 浑厚磁性', gender: 'male', lang: 'zh-HK' },
-        { key: 'hanfeng', label: '寒枫 · 清冷内敛', gender: 'male', lang: 'zh-TW' }
-      ]
-      const modeVoiceFilter = { cantonese: 'zh-HK', hokkien: 'zh-TW' }
-      const modeDefaults = { cantonese: 'wanqing', hokkien: 'qianyu' }
+      let voices = []
+      let modeVoiceFilter = {}
+      let modeDefaults = {}
       const buildVoiceOptions = (select, filterLang, current) => {
         select.replaceChildren()
         const femaleGroup = document.createElement('optgroup')
@@ -5207,12 +4345,17 @@ async function loadReader(bookId, chapterId) {
       const narratorGroup = node('div', { class: 'reader-setting-group' }, [node('span', { text: '旁白音色' }), narratorSelectEl])
       const refreshVoiceSelects = () => {
         const mode = state.reader.ttsMode
-        const filterLang = modeVoiceFilter[mode] || null
-        if (filterLang && !voices.some(v => v.lang === filterLang && v.key === state.reader.ttsVoice)) {
+        const filterLang = modeVoiceFilter[mode] || 'zh-CN'
+        voiceSelectEl.disabled = narratorSelectEl.disabled = voices.length === 0
+        if (!voices.length) return
+        if (!voices.some(v => v.lang === filterLang && v.key === state.reader.ttsVoice)) {
           state.reader.ttsVoice = modeDefaults[mode]
         }
+        if (!voices.some(v => v.lang === 'zh-CN' && v.key === state.reader.ttsNarrator)) {
+          state.reader.ttsNarrator = 'mocheng'
+        }
         buildVoiceOptions(voiceSelectEl, filterLang, state.reader.ttsVoice)
-        buildVoiceOptions(narratorSelectEl, null, state.reader.ttsNarrator)
+        buildVoiceOptions(narratorSelectEl, 'zh-CN', state.reader.ttsNarrator)
         voiceGroup.style.display = mode === 'smart' ? 'none' : ''
         narratorGroup.style.display = mode === 'smart' ? '' : 'none'
       }
@@ -5261,6 +4404,15 @@ async function loadReader(bookId, chapterId) {
         ttsScheduleRebuild()
       }
       refreshVoiceSelects()
+      ttsVoicePolicyPromise.then(policy => {
+        voices = (policy.voices || []).map(voice => ({
+          key: voice.key, label: voice.label,
+          gender: voice.gender, lang: voice.language
+        }))
+        modeVoiceFilter = policy.mode_languages || {}
+        modeDefaults = policy.mode_defaults || {}
+        refreshVoiceSelects()
+      }).catch(error => console.warn('[TTS] voice registry unavailable', error))
       return [
         node('div', { class: 'reader-setting-group' }, [node('span', { text: '听书模式' }), modeSelect]),
         node('div', { class: 'reader-setting-group' }, [node('span', { text: '情感阅读' }), emotionSelect]),
@@ -5452,8 +4604,9 @@ async function loadReader(bookId, chapterId) {
 
   const showInterlineAction = (paragraph, clientX, clientY) => {
     interlineAction?.remove()
-    currentParagraphHint = Number(paragraph.dataset.paragraphIndex)
-    const paragraphIndex = Math.max(0, Number(paragraph.dataset.ttsIndex) || 0)
+    const resolvedParagraph = readerParagraphFromPoint(clientX, clientY, paragraph) || paragraph
+    currentParagraphHint = readerParagraphIndex(resolvedParagraph)
+    const paragraphIndex = Math.max(0, readerParagraphIndex(resolvedParagraph))
     const startFromHere = event => {
       event.stopPropagation()
       interlineAction?.remove()
@@ -5481,7 +4634,7 @@ async function loadReader(bookId, chapterId) {
         ]),
         node('button', {
           class: 'interline-action comment', type: 'button', role: 'menuitem',
-          onclick: event => { event.stopPropagation(); openInterlineDialog(paragraph) }
+          onclick: event => { event.stopPropagation(); openInterlineDialog(resolvedParagraph) }
         }, [
           node('span', { class: 'interline-action-icon', text: '🫧', 'aria-hidden': 'true' }),
           node('span', { text: '字里行间' })
@@ -5503,7 +4656,8 @@ async function loadReader(bookId, chapterId) {
     const cancel = () => { window.clearTimeout(timer); timer = null }
     paragraph.addEventListener('pointerdown', event => {
       if (event.button !== 0) return
-      currentParagraphHint = Number(paragraph.dataset.paragraphIndex)
+      const resolvedParagraph = updateCurrentParagraphFromPoint(event.clientX, event.clientY, paragraph) || paragraph
+      currentParagraphHint = readerParagraphIndex(resolvedParagraph)
       originX = event.clientX
       originY = event.clientY
       cancel()
@@ -5521,6 +4675,9 @@ async function loadReader(bookId, chapterId) {
   }
 
   readerContent = node('div', { class: 'reader-content' })
+  readerContent.addEventListener('pointerdown', event => {
+    updateCurrentParagraphFromPoint(event.clientX, event.clientY)
+  }, { passive: true })
   const illustrationPattern = /^\[illustration:(.+)\]$/
   let paragraphIndex = 0
   ;(chapter.content || '').split('\n').forEach(line => {
@@ -5598,6 +4755,27 @@ async function loadReader(bookId, chapterId) {
   }
   stage.addEventListener('scroll', handleProgressScroll, { passive: true })
   window.addEventListener('scroll', handleProgressScroll, { passive: true })
+  let autoAdvanceTimer = null
+  const handleAutoAdvance = () => {
+    if (state.reader.mode !== 'vertical' || !nextId) return
+    if (state.reader.autoReading || state.reader.ttsActive) return
+    const metrics = readerScrollMetrics(stage, 'vertical')
+    const atBottom = metrics.scrollTop + metrics.clientHeight >= metrics.scrollHeight - 8
+    if (atBottom && metrics.scrollHeight > metrics.clientHeight + 20) {
+      if (!autoAdvanceTimer) {
+        autoAdvanceTimer = setTimeout(() => {
+          autoAdvanceTimer = null
+          const m = readerScrollMetrics(stage, 'vertical')
+          if (m.scrollTop + m.clientHeight >= m.scrollHeight - 8) goToChapter(nextId)
+        }, 1200)
+      }
+    } else if (autoAdvanceTimer) {
+      clearTimeout(autoAdvanceTimer)
+      autoAdvanceTimer = null
+    }
+  }
+  stage.addEventListener('scroll', handleAutoAdvance, { passive: true })
+  window.addEventListener('scroll', handleAutoAdvance, { passive: true })
   const resizeListener = () => queuePagination(false)
   window.addEventListener('resize', resizeListener)
   visibilityListener = () => {
@@ -5605,14 +4783,14 @@ async function loadReader(bookId, chapterId) {
       flushReadingProgress()
       if (!state.reader.ttsActive) stopAutoReading()
     } else {
-      if (state.reader.ttsActive && ttsAudioEl && ttsAudioEl.paused && ttsPlanIndex >= 0) {
+      if (state.reader.ttsActive && !ttsStreamEnding && !ttsLifecycle.isPausedByUser() && ttsAudioEl && ttsAudioEl.paused && ttsPlanIndex >= 0) {
         ttsResumePlayback()
       }
     }
   }
   document.addEventListener('visibilitychange', visibilityListener)
   const pageShowListener = () => {
-    if (state.reader.ttsActive && ttsAudioEl?.paused && ttsPlanIndex >= 0) ttsResumePlayback()
+    if (state.reader.ttsActive && !ttsStreamEnding && !ttsLifecycle.isPausedByUser() && ttsAudioEl?.paused && ttsPlanIndex >= 0) ttsResumePlayback()
   }
   window.addEventListener('pageshow', pageShowListener)
   const pageHideListener = () => flushReadingProgress()
@@ -5644,6 +4822,8 @@ async function loadReader(bookId, chapterId) {
       window.clearTimeout(resizeTimer)
       window.clearTimeout(pageAnimationTimer)
       if (progressFrame) cancelAnimationFrame(progressFrame)
+      if (autoAdvanceTimer) { clearTimeout(autoAdvanceTimer); autoAdvanceTimer = null }
+      window.removeEventListener('scroll', handleAutoAdvance)
       window.removeEventListener('scroll', handleProgressScroll)
       window.removeEventListener('resize', resizeListener)
       document.removeEventListener('visibilitychange', visibilityListener)
@@ -5725,7 +4905,8 @@ async function loadDeconstructions() {
       node('div', { class: 'deconstruction-card-copy' }, [
         node('span', { class: 'eyebrow', text: index === 0 ? 'FEATURED READING FILE' : 'DEEP READING FILE' }),
         node('h2', { text: item.title }),
-        node('p', { class: 'deconstruction-document-summary', text: item.documents.map(doc => doc.label).join(' · ') || '拆解资料整理中' })
+        node('p', { class: 'deconstruction-document-summary', text: item.documents.map(doc => doc.label).join(' · ') || '拆解资料整理中' }),
+        item.contributor_username ? node('p', { class: 'deconstruction-contributor', text: `贡献者：${item.contributor_username}` }) : null
       ]),
       node('div', { class: 'deconstruction-card-bottom' }, [
         hasProgress ? node('div', { class: 'progress' }, node('span', { style: `width:${percentage}%` })) : null,
@@ -5736,7 +4917,8 @@ async function loadDeconstructions() {
               : `已收录 ${formatNumber(item.documents.length)} 份深读文档`
           }),
           node('strong', { text: '进入档案 →' })
-        ])
+        ]),
+        node('span', { class: 'deconstruction-like-count', text: `♡ ${formatNumber(item.like_count || 0)}` })
       ])
     ]))
   })
@@ -5801,13 +4983,52 @@ async function loadDeconstruction(slug) {
     imageAlt: data.cover_url ? `《${data.title}》封面` : 'OOH Story 品牌图标'
   })
   const allTabs = [
-    ...data.documents.map(doc => ({ type: 'doc', label: doc.label, content: doc.content })),
+    ...data.documents.map(doc => Array.isArray(doc.items)
+      ? {
+          type: 'subdir',
+          label: doc.label,
+          name: doc.subdirectory,
+          items: doc.items
+        }
+      : { type: 'doc', label: doc.label, content: doc.content }),
     ...subdirs.map(sd => ({ type: 'subdir', label: sd.label, name: sd.name, items: sd.items }))
   ]
   let active = 0
   const tabs = node('div', { class: 'report-tabs' })
   const body = node('div')
   const fileCache = {}
+  let liked = Boolean(data.viewer_liked)
+  let likeCount = Number(data.like_count || 0)
+  const likeLabel = node('span', { text: `${liked ? '♥' : '♡'} ${formatNumber(likeCount)}` })
+  const likeButton = node('button', {
+    class: `ghost-button deconstruction-like-button${liked ? ' active' : ''}`,
+    type: 'button',
+    'aria-label': liked ? '取消点赞' : '点赞这份拆书档案',
+    onclick: async () => {
+      if (!state.account) {
+        openAuthDialog('login')
+        return
+      }
+      likeButton.disabled = true
+      try {
+        const result = await api(`/api/v1/deconstructions/${encodeURIComponent(slug)}/likes`, {
+          method: 'POST',
+          headers: state.csrfToken ? { 'X-CSRF-Token': state.csrfToken } : {}
+        })
+        liked = Boolean(result.liked)
+        likeCount = Number(result.like_count || 0)
+        likeButton.classList.toggle('active', liked)
+        likeButton.setAttribute('aria-label', liked ? '取消点赞' : '点赞这份拆书档案')
+        likeLabel.textContent = `${liked ? '♥' : '♡'} ${formatNumber(likeCount)}`
+      } catch (error) {
+        const current = `${liked ? '♥' : '♡'} ${formatNumber(likeCount)}`
+        likeLabel.textContent = error.message || '点赞失败'
+        window.setTimeout(() => { likeLabel.textContent = current }, 1600)
+      } finally {
+        likeButton.disabled = false
+      }
+    }
+  }, likeLabel)
 
   async function loadSubdirFile(subdirName, filePath) {
     const cacheKey = `${subdirName}/${filePath}`
@@ -5903,8 +5124,10 @@ async function loadDeconstruction(slug) {
       node('span', { class: 'eyebrow', text: 'DEEP READING FILE' }),
       node('h1', { text: data.title }),
       node('p', { text: data.progress ? `逐章拆解 ${data.progress} · 完成度 ${data.progress_percent}%` : '全局拆书档案' }),
+      data.contributor_username ? node('p', { class: 'report-contributor', text: `贡献者：${data.contributor_username}` }) : null,
       node('div', { class: 'report-head-actions' }, [
         data.public_id ? node('a', { class: 'primary-button', href: `/books/${data.public_id}`, text: '打开原作' }) : null,
+        likeButton,
         state.account
           ? node('a', {
               class: 'ghost-button',
@@ -6025,7 +5248,7 @@ function loadContact() {
         node('div', { class: 'contact-item-icon', text: '📧' }),
         node('div', { class: 'contact-item-text' }, [
           node('h4', { text: '电子邮件' }),
-          node('p', { text: '请在部署时配置项目联系方式' })
+          node('p', { text: 'help@example.com' })
         ])
       ]),
       node('div', { class: 'contact-item' }, [
@@ -6072,7 +5295,7 @@ function loadClient() {
           node('div', { class: 'client-list-info' }, [
             node('h3', { text: 'Android 客户端' }),
             node('p', { text: '原生 Android 应用，支持离线缓存、TTS 语音朗读、自定义阅读设置等全部功能。' }),
-            node('span', { class: 'client-btn client-btn-secondary', text: '请从自己的 GitHub Releases 提供已签名安装包' })
+            node('a', { class: 'client-btn client-btn-primary', href: '/downloads/android/latest.apk', download: '', text: '下载 APK v1.18.20 安装包' })
           ])
         ]),
         node('div', { class: 'client-list-item' }, [
@@ -6301,6 +5524,7 @@ async function route() {
     else if (path === '/account/submissions') await loadSubmissionPage()
     else if (path === '/account/notifications') await loadNotificationsPage()
     else if (path === '/account/profile') await loadProfilePage()
+    else if (path === '/admin' || path.startsWith('/admin/')) await loadAdminPage(path)
     else if (/^\/book\/[A-Za-z0-9_-]{22}\/volume\/\d+$/.test(path)) {
       const parts = path.split('/')
       await loadVolume(parts[2], parts[4])
@@ -6420,8 +5644,8 @@ globalTtsReturn?.addEventListener('click', openTtsPlayer)
 ttsPlayerClose?.addEventListener('click', closeTtsPlayer)
 ttsPlayerReturn?.addEventListener('click', returnTtsToReader)
 ttsPlayerText?.addEventListener('click', returnTtsToReader)
-ttsPlayerPrevious?.addEventListener('click', () => state.ttsController?.previous?.())
-ttsPlayerNext?.addEventListener('click', () => state.ttsController?.next?.())
+ttsPlayerPrevious?.addEventListener('click', () => state.ttsController?.previousChapter?.())
+ttsPlayerNext?.addEventListener('click', () => state.ttsController?.nextChapter?.())
 ttsPlayerToggle?.addEventListener('click', () => {
   if (!state.ttsSession?.active) return
   if (ttsSessionIsPlaying()) state.ttsController?.pause?.()
@@ -6449,44 +5673,3 @@ updatePaletteButton()
 window.addEventListener('hashchange', route)
 window.addEventListener('popstate', route)
 applyReaderSettings()
-
-async function bootstrapAccount() {
-  const query = new URLSearchParams(location.search)
-  const googleError = query.get('google_error')
-  const googleLinked = query.get('google_linked')
-  const verification = query.get('verify')
-  if (verification) {
-    try {
-      await accountApi('/api/v1/auth/verify-email', {
-        method: 'POST',
-        body: { token: verification }
-      })
-      state.accountNotice = '邮箱验证成功，你现在可以安全上传作品。'
-    } catch (error) {
-      state.accountNotice = error.message
-    }
-    history.replaceState(null, '', '/account#/account')
-  }
-  await loadAccountSession()
-  if (googleLinked) {
-    state.accountNotice = 'Google 账户绑定成功，今后可以直接使用 Google 登录。'
-    history.replaceState(null, '', '/#/account')
-  }
-  if (googleError) {
-    history.replaceState(null, '', '/#/')
-    openAuthDialog('login', googleError)
-  }
-}
-
-const bootstrapQuery = new URLSearchParams(location.search)
-const hasAccountCallback = ['verify', 'google_linked', 'google_error']
-  .some(key => bootstrapQuery.has(key))
-if (pathFromLocation() === '/' && !hasAccountCallback) {
-  // The public home snapshot and anonymous session check are independent.
-  // Start both immediately so authentication latency never gates first paint.
-  const accountBootstrapPromise = bootstrapAccount()
-  route()
-  accountBootstrapPromise.then(refreshHomeContinueReading).catch(() => {})
-} else {
-  bootstrapAccount().finally(route)
-}

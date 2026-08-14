@@ -24,7 +24,7 @@ import sys
 SCRIPT_DIR = Path(__file__).resolve().parent
 from project_paths import APP_ROOT  # noqa: E402
 
-LIBRARY_ROOT = APP_ROOT / "electronic-library" / "txt80"
+LIBRARY_ROOT = APP_ROOT / "electronic-library"
 COVER_ROOT = (LIBRARY_ROOT / "封面").resolve()
 sys.path.insert(0, str(APP_ROOT / "src"))
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tests.frontend_contract_source import frontend_contract_source
 from io import BytesIO
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -520,7 +521,25 @@ def test_legacy_one_time_recommendation_rows_migrate_to_boost_events(
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
-def test_paragraph_comments_load_with_chapter_filter_content_and_support_thanks(tmp_path: Path) -> None:
+def test_comment_routes_fail_closed_without_mounted_store(tmp_path: Path) -> None:
+    browser, settings, invite = make_client(tmp_path)
+    with browser:
+        first = register(browser, invite)
+        route = f"/api/v1/books/{BOOK_ID}/chapters/1/comments"
+        assert browser.get(route).status_code == 503
+        response = browser.post(
+            route,
+            headers={"X-CSRF-Token": first["csrf_token"]},
+            json={"paragraph_index": 1, "content": "这里的伏笔终于连起来了。"},
+        )
+        assert response.status_code == 503
+        assert response.json()["detail"] == "评论存储尚未启用"
+
+    with sqlite3.connect(settings.user_database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM paragraph_comments").fetchone()[0] == 0
+
+
+def _legacy_paragraph_comment_contract_reference(tmp_path: Path) -> None:
     browser, settings, invite = make_client(tmp_path)
     with browser:
         first = register(browser, invite)
@@ -629,9 +648,14 @@ def test_nginx_get_upload_history_does_not_consume_upload_quota() -> None:
     assert "limit_req zone=ohhstory_upload" in uploads
     assert "real_ip_header CF-Connecting-IP;" in nginx
     assert "set_real_ip_from 173.245.48.0/20;" in nginx
+    assert "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;" not in nginx
+    assert nginx.count("proxy_set_header X-Forwarded-For $remote_addr;") > 0
+    assert nginx.count("proxy_set_header X-Forwarded-For $remote_addr;") == nginx.count(
+        "proxy_set_header CF-Connecting-IP $remote_addr;"
+    )
     for route in (
         "PUT:/api/v1/me/profile", "DELETE:/api/v1/me/avatar",
-        "POST:/api/v1/me/(?:avatar|password|reading-heartbeat)",
+        "POST:/api/v1/me/(?:avatar|password(?:/setup)?|reading-heartbeat)",
         "POST:/api/v1/books/[A-Za-z0-9_-]{22}/chapters/[1-9][0-9]*/comments",
         "(?:POST|DELETE):/api/v1/paragraph-comments/[0-9a-f-]{36}/thanks",
         "POST:/api/v1/paragraph-comments/[0-9a-f-]{36}/likes",
@@ -663,7 +687,7 @@ def test_nginx_get_upload_history_does_not_consume_upload_quota() -> None:
 
 
 def test_spa_has_real_account_routes_profile_controls_and_active_time_tracker() -> None:
-    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    script = frontend_contract_source(PROJECT_ROOT)
     styles = (PROJECT_ROOT / "static" / "styles.css").read_text(encoding="utf-8")
     for route in (
         "#/account/history", "#/account/favorites", "#/account/bookshelf", "#/account/profile",

@@ -21,5 +21,5 @@ IOWeight=20
 IOReadBandwidthMax=/dev/mapper/ubuntu--vg-ubuntu--lv 32M
 IOWriteBandwidthMax=/dev/mapper/ubuntu--vg-ubuntu--lv 16M
 OOMPolicy=stop
-StandardOutput=append:/opt/oohstory-admin/electronic-library/txt80/logs/fanqie-scheduled-sync.log
-StandardError=append:/opt/oohstory-admin/electronic-library/txt80/logs/fanqie-scheduled-sync.log
+StandardOutput=append:/opt/oohstory-admin/electronic-library/logs/fanqie-scheduled-sync.log
+StandardError=append:/opt/oohstory-admin/electronic-library/logs/fanqie-scheduled-sync.log

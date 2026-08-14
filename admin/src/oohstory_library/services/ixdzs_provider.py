@@ -10,7 +10,7 @@ import time
 import unicodedata
 import zipfile
 from pathlib import PurePosixPath
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, List
 from urllib.parse import urljoin, urlparse
 
 import requests

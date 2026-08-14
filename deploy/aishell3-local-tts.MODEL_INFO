@@ -1,0 +1,13 @@
+Model: vits-icefall-zh-aishell3
+Runtime: sherpa-onnx 1.13.4
+Language: Mandarin Chinese (zh-CN)
+Dataset: AISHELL-3 / OpenSLR SLR93
+Dataset license: Apache License 2.0
+Source: https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-icefall-zh-aishell3.tar.bz2
+Archive size: 31559701 bytes
+Archive SHA-256: ab468db3a3308cdd861495e0db2f25d79418a0c00639f74944c7cdf5dd8c6ec1
+Female voice keys: qinghe (speaker id 33), jinglan (speaker id 0)
+Male voice keys: yunzhou (speaker id 10), junchuan (speaker id 75)
+
+The model is used only for the local Mandarin character voices. It is
+not used by the Cantonese or Minnan modes.

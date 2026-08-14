@@ -19,6 +19,51 @@
   {% if notice %}<div class="alert {{ 'alert-info' if notice == '操作成功' else 'alert-error' }}" role="status">{{ notice }}</div>{% endif %}
   {% if sync_error %}<div class="alert alert-error">同步状态暂不可用：{{ sync_error }}</div>{% endif %}
 
+  <section class="library-panel root-migration-admin" id="root-migration">
+    <div class="library-panel-heading">
+      <div>
+        <p class="section-kicker">TRANSACTIONAL LIBRARY ROOT MIGRATION</p>
+        <h2>书库识别路径与目录迁移</h2>
+        <p>先预检影响，再冻结 OOHStory 的书库写任务；确认后会迁移目录并联动更新 MySQL、任务元数据、环境配置、systemd 路径和后台稳定入口。</p>
+      </div>
+      <span class="status {{ 'warn' if root_migration_status.get('status') in ['running','rolling_back'] else 'neutral' }}">
+        {{ root_migration_status.get('message') or '当前无迁移任务' }}
+      </span>
+    </div>
+    {% if root_migration_error %}<div class="alert alert-error">{{ root_migration_error }}</div>{% endif %}
+    <div class="root-migration-current">
+      <div><span>当前实体根路径</span><code>{{ root_migration_status.get('current_root') or root_migration_status.get('destination') or '/srv/oohstory/library' }}</code></div>
+      <div><span>当前阶段</span><b>{{ root_migration_status.get('stage') or 'idle' }}</b></div>
+      <div><span>最后更新</span><b>{{ root_migration_status.get('updated_at') or '—' }}</b></div>
+      {% if root_migration_status.get('mysql_rows') %}<div><span>已更新路径记录</span><b>{{ '{:,}'.format(root_migration_status.get('mysql_rows')) }}</b></div>{% endif %}
+    </div>
+    {% if root_migration_status.get('manifest_path') %}<p class="root-migration-manifest">迁移清单：<code>{{ root_migration_status.get('manifest_path') }}</code></p>{% endif %}
+    <form class="root-migration-preflight" method="post" action="{{ base_path }}/books/root-migration/preflight">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label><span>原书库实体目录</span><input name="source" type="text" maxlength="1024" required autocomplete="off" value="{{ root_migration_plan.get('source') if root_migration_plan else (root_migration_status.get('current_root') or root_migration_status.get('destination') or '/srv/oohstory/library') }}"><small>必须填写实体目录，不能填写软链接。</small></label>
+      <label><span>新书库实体目录</span><input name="destination" type="text" maxlength="1024" required autocomplete="off" value="{{ root_migration_plan.get('destination') if root_migration_plan else '' }}" placeholder="/srv/oohstory/library-new"><small>普通目录须不存在或为空；若原路径是挂载点，目标必须先挂载为空存储。</small></label>
+      <button class="button" type="submit" {% if root_migration_status.get('status') in ['running','rolling_back'] %}disabled{% endif %}>预检迁移影响</button>
+    </form>
+    {% if root_migration_plan %}
+      <div class="root-migration-plan">
+        <div class="root-migration-plan-metrics">
+          <span><b>{{ root_migration_plan.get('top_level', [])|length }}</b>顶层对象</span>
+          <span><b>{{ '{:,}'.format(root_migration_plan.get('mysql_rows', 0)) }}</b>数据库记录</span>
+          <span><b>{{ root_migration_plan.get('config_files', [])|length }}</b>配置文件</span>
+          <span><b>{{ root_migration_plan.get('units', [])|length }}</b>受控单元</span>
+        </div>
+        <p>迁移方式：{{ '同文件系统原子移动' if root_migration_plan.get('same_device') else '跨文件系统安全复制后切换' }}{% if root_migration_plan.get('source_is_mountpoint') %}；原路径为挂载点，将迁移其目录内容{% endif %}。</p>
+        <form class="root-migration-confirm confirm-form" data-confirm="确认开始书库根路径迁移？两套后台会短暂离线并自动恢复。" method="post" action="{{ base_path }}/books/root-migration/start">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="plan_token" value="{{ root_migration_plan.get('token') }}">
+          <label><span>输入“{{ root_migration_plan.get('confirmation') }}”后执行</span><input name="confirmation" type="text" maxlength="32" required autocomplete="off"></label>
+          <button class="button button-danger" type="submit">确认迁移并联动更新</button>
+        </form>
+        <small>启动后两套后台会短暂离线；迁移失败会自动恢复原路径、配置和原先运行的服务。</small>
+      </div>
+    {% endif %}
+  </section>
+
   <section class="library-panel sync-toggle-panel">
     <div class="library-panel-heading">
       <div>
@@ -67,8 +112,8 @@
       <div>
         <p class="section-kicker">PER-SITE FULL-RATE BODY SYNC</p>
         <h2>按站点全力同步正文</h2>
-        <p>与 Webnovel Writer 电子书库保持同等五站能力：本地 TXT80 与四个授权站点均可独立保存每轮目录数量，运行脚本会在每轮开始前读取最新配置。</p>
-        <p class="sync-boundary-copy">这里只控制 OOHStory 自有 <code>oohstory-*</code> 单元；两套系统共享 MySQL、NAS 与安全执行槽，但不会跨项目启动 <code>webnovel-*</code> 服务。</p>
+        <p>保持完整的站点调度合同：新笔趣阁、爱下和浏览器源按执行 lane 拆开；运行脚本会在每轮开始前读取最新配置。</p>
+        <p class="sync-boundary-copy">这里只控制 OOHStory 自有 <code>oohstory-*</code> 单元，并通过共享 MySQL、NAS 与安全执行槽约束并发。</p>
       </div>
       <span class="status info">原子配置 · 每轮读取</span>
     </div>
@@ -79,7 +124,14 @@
             <span class="status {{ 'ok' if site.active else ('info' if site.enabled else 'neutral') }}">{{ '运行中' if site.active else ('等待/重试' if site.enabled else '已关闭') }}</span>
             <h4>{{ site.label }}</h4>
             <p>{{ site.message or '尚未启动' }}</p>
+            <small>lane：{{ site.slot_lane or 'local' }}</small>
             {% if site.updated_at %}<small>更新：{{ site.updated_at }}</small>{% endif %}
+            {% set batch = site.batch or {} %}
+            {% if batch %}
+              <small>本轮 {{ batch.completed or 0 }}/{{ batch.selected or 0 }} · 失败 {{ batch.failed or 0 }} · 延迟 {{ batch.deferred or 0 }}</small>
+            {% endif %}
+            {% if site.backlog is not none %}<small>待补：{{ site.backlog }}</small>{% endif %}
+            {% if site.last_error %}<small class="sync-error-line">错误：{{ site.last_error }}</small>{% endif %}
           </div>
           <form class="sync-control-form" method="post" action="{{ base_path }}/books/site-full-sync">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -102,6 +154,47 @@
         </article>
       {% else %}
         <div class="alert alert-error">站点全力同步状态暂不可用；不会启动任何正文写任务。</div>
+      {% endfor %}
+    </div>
+  </section>
+
+  {% set serialized_update = sync_controls.get('serialized_update', {}) %}
+  <section class="library-panel site-full-sync-panel serialized-update-panel" id="serialized-update">
+    <div class="library-panel-heading">
+      <div>
+        <p class="section-kicker">SERIALIZED UPDATE LANES</p>
+        <h2>连载书正式追更</h2>
+        <p>{{ serialized_update.get('rate_contract') or '每个来源独立扫描最近更新榜，命中本地连载书后原子刷新原书。' }}</p>
+        <p class="sync-boundary-copy">这里只控制 OOHStory 自有 <code>oohstory-*</code> 追更模板；默认保持停用，避免与全量同步并发写库。</p>
+      </div>
+      <span class="status info">独立 lane · 可审计状态</span>
+    </div>
+    <div class="site-full-sync-grid">
+      {% for source in serialized_update.get('sources', []) %}
+        {% set totals = source.totals or {} %}
+        {% set tracked = source.tracked or {} %}
+        <article class="site-full-sync-card {{ 'active' if source.service_active else ('enabled' if source.enabled else '') }}">
+          <div>
+            <span class="status {{ 'ok' if source.service_active else ('info' if source.enabled else 'neutral') }}">{{ '追更中' if source.service_active else ('已启用' if source.enabled else '已关闭') }}</span>
+            <h4>{{ source.label }}</h4>
+            <p>{{ source.status or 'never_run' }}{% if source.mode %} · {{ source.mode }}{% endif %}</p>
+            <small>lane：{{ source.lane }}</small>
+            <small>上次检查：{{ source.checked_at or source.last_run or '暂无' }}</small>
+            <small>扫到 {{ totals.seen or 0 }} · 命中 {{ totals.local_matches or 0 }} · 选择 {{ totals.refresh_selected or 0 }} · 应用 {{ totals.refresh_applied or 0 }} · 失败 {{ totals.failed or 0 }}</small>
+            <small>追踪：applied {{ tracked.applied or 0 }} / observed {{ tracked.observed or 0 }} / failed {{ tracked.failed or 0 }} / 连载书 {{ tracked.ongoing_books or 0 }}</small>
+            {% for error in source.last_errors or [] %}
+              <small class="sync-error-line">错误：{{ error }}</small>
+            {% endfor %}
+          </div>
+          <form class="sync-control-form confirm-form" data-confirm="确认{{ '停止' if source.enabled else '开启' }}{{ source.label }}？追更任务默认应保持停用，避免和全量同步并行写库。" method="post" action="{{ base_path }}/books/serialized-update-sync">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="source_id" value="{{ source.id }}">
+            <input type="hidden" name="enabled" value="{{ '0' if source.enabled else '1' }}">
+            <button class="button {{ 'button-danger' if source.enabled else 'button-primary' }}" type="submit">{{ '停止追更' if source.enabled else '开启追更' }}</button>
+          </form>
+        </article>
+      {% else %}
+        <div class="alert alert-error">连载追更状态暂不可用；不会启动任何正文写任务。</div>
       {% endfor %}
     </div>
   </section>

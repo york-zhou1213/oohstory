@@ -61,13 +61,11 @@ class AccountService extends ChangeNotifier {
       accessibility: KeychainAccessibility.first_unlock_this_device,
     ),
   );
-  // OAuth client IDs are public identifiers. Keep the production Web client
-  // as a safe default so release builds cannot silently lose Google Sign-In;
-  // CI or alternate environments may still override it with --dart-define.
+  // OAuth client IDs are deployment-specific public identifiers. Supply them
+  // at build time; the source tree deliberately ships no production ID.
   static const _webClientId = String.fromEnvironment(
     'GOOGLE_WEB_CLIENT_ID',
-    defaultValue:
-        '1046473401516-7iohcfjigv2ufopiimo3a2ihiepr0dbh.apps.googleusercontent.com',
+    defaultValue: '',
   );
   static const _iosClientId = String.fromEnvironment('GOOGLE_IOS_CLIENT_ID');
   static const _requestTimeout = Duration(seconds: 20);
@@ -533,6 +531,26 @@ class AccountService extends ChangeNotifier {
     String bookId,
     String chapterId,
   ) => _request('/api/v1/books/$bookId/chapters/$chapterId/comments');
+
+  Future<Map<String, dynamic>> bookComments(String bookId) =>
+      _request('/api/v1/books/$bookId/comments');
+
+  Future<Map<String, dynamic>> createBookComment({
+    required String bookId,
+    required String content,
+  }) {
+    if (!isSignedIn) throw const AccountException('请先登录后再评论');
+    return _request(
+      '/api/v1/books/$bookId/comments',
+      method: 'POST',
+      body: {'content': content.trim()},
+    );
+  }
+
+  Future<Map<String, dynamic>> addBookCommentLike(String commentId) {
+    if (!isSignedIn) throw const AccountException('请先登录后再点赞');
+    return _request('/api/v1/comments/$commentId/likes', method: 'POST');
+  }
 
   Future<Map<String, dynamic>> createParagraphComment({
     required String bookId,

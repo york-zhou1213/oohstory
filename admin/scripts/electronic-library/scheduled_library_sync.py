@@ -18,7 +18,7 @@ from project_paths import APP_ROOT  # noqa: E402
 
 
 TOOLS_ROOT = Path(__file__).resolve().parent
-LIBRARY_ROOT = APP_ROOT / "electronic-library" / "txt80"
+LIBRARY_ROOT = APP_ROOT / "electronic-library"
 PYTHON = APP_ROOT / ".venv" / "bin" / "python"
 LOCK_PATHS = {
     "local": LIBRARY_ROOT / ".scheduled-library-local-sync.lock",

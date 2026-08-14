@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from app.error_boundaries import RECOVERABLE_INTEGRATION_ERRORS
+
 import asyncio
 from io import BytesIO
-import json
 from pathlib import Path
 import shutil
 from typing import Any, Callable
@@ -251,7 +252,7 @@ def create_admin_router(
             parsed["category"] = category_manager.resolve_source(parsed["category"])
         except AccountError as exc:
             raise error(exc) from exc
-        except Exception as exc:
+        except RECOVERABLE_INTEGRATION_ERRORS as exc:
             raise HTTPException(status_code=422, detail="小说资料字段不完整或格式无效") from exc
         original = Path(str(manuscript.filename or "")).name
         suffix = Path(original).suffix.casefold()

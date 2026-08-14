@@ -26,7 +26,6 @@ from oohstory_library.services.library_database import (  # noqa: E402
 DEFAULT_INDEX = (
     APP_ROOT
     / "electronic-library"
-    / "txt80"
     / "全局索引"
     / "electronic_library_index.sqlite3"
 )

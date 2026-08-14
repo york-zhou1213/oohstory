@@ -18,25 +18,24 @@
 sudo mysql < deploy/mysql/init.sql
 umask 077
 sudo mysql --batch --raw < deploy/mysql/runtime-users.sql \
-  > /var/lib/oohstory-admin/mysql-generated-passwords.txt
+  > /var/lib/oohstory-admin/generated-mysql-passwords.txt
 ```
 
 `init.sql` 是空库专用的 MySQL client 脚本，会创建 `oohstory_library`、顺序执行
-`001-022`、逐项写入 migration SHA-256，并创建无登录凭据的最小权限角色。发现目标
+`001-021`、逐项写入 migration SHA-256，并创建无登录凭据的读写角色。发现目标
 schema 已有任意表时会拒绝执行，禁止拿它覆盖或“修复”现有生产库。初始化途中
 失败时，应核对错误并仅清理这次刚创建、尚无业务数据的 schema 后重试；不要在
 已有库上强行重放 DDL。
 
-`runtime-users.sql` 只创建三个限制在 `127.0.0.1` 的账号：
+`runtime-users.sql` 只创建两个限制在 `127.0.0.1` 的账号：
 
 - `oohstory_library_writer`：业务管道使用，只有 DML 和临时表权限。
 - `oohstory_library_reader`：本地管理后台状态页使用，只有 `SELECT`。
-- `oohstory_public_reader`：公开 Reader 使用；全库只读，只能对匿名作品指标两张表执行必要的 `INSERT/UPDATE`。
 
-MySQL 会为三者生成随机密码并仅在首次创建时输出。将 writer 密码保存到
+MySQL 会为两者生成随机密码并仅在首次创建时输出。将 writer 密码保存到
 `/etc/oohstory-admin/library-mysql-password`，reader 密码保存到
-`/etc/oohstory-admin/mysql-password`，public-reader 密码保存到
-`/etc/oohstory-reader/mysql-password`；密码文件不得进入 Git。完成后删除上面的 root-only 临时输出文件。
+`/etc/oohstory-admin/mysql-password`；密码文件不得进入 Git。完成后删除上面的
+root-only 临时输出文件。
 
 `deploy/mysql/init.sql` 由全部编号 migration 自动生成，migration 仍是唯一真源：
 

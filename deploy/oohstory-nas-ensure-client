@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly SHARE_NAME="electronic-library-data"
+readonly WEBAPI="${OOHSTORY_NAS_ENROLL_WEBAPI:-/usr/syno/bin/synowebapi}"
+readonly JQ="${OOHSTORY_NAS_ENROLL_JQ:-/bin/jq}"
+readonly FLOCK="${OOHSTORY_NAS_ENROLL_FLOCK:-/bin/flock}"
+readonly LOCK_FILE="${OOHSTORY_NAS_ENROLL_LOCK_FILE:-/var/run/oohstory-nfs-enroll.lock}"
+
+log() {
+  printf 'oohstory-nas-enroll: %s\n' "$*"
+}
+
+require_executable() {
+  local command_path="$1"
+  if [[ "$command_path" != /* || ! -x "$command_path" ]]; then
+    log "invalid command path: $command_path" >&2
+    exit 64
+  fi
+}
+
+for command_path in "$WEBAPI" "$JQ" "$FLOCK"; do
+  require_executable "$command_path"
+done
+
+if [[ "$LOCK_FILE" != /* ]]; then
+  log "invalid lock path" >&2
+  exit 64
+fi
+
+readonly CLIENT_IP="${1:-}"
+if [[ ! "$CLIENT_IP" =~ ^(192\.0\.2|198\.51\.100|203\.0\.113)\.([0-9]{1,3})$ ]]; then
+  log "peer address is outside the approved server networks" >&2
+  exit 65
+fi
+readonly LAST_OCTET="${BASH_REMATCH[2]}"
+if ((10#$LAST_OCTET < 1 || 10#$LAST_OCTET > 254)); then
+  log "peer address is not a usable host address" >&2
+  exit 65
+fi
+
+exec 9>"$LOCK_FILE"
+"$FLOCK" 9
+
+load_rules() {
+  "$WEBAPI" --exec \
+    api=SYNO.Core.FileServ.NFS.SharePrivilege \
+    method=load \
+    version=1 \
+    "share_name=$SHARE_NAME" 2>/dev/null
+}
+
+if ! current_json="$(load_rules)"; then
+  log "DSM failed to load NFS rules" >&2
+  exit 69
+fi
+if ! printf '%s' "$current_json" | "$JQ" -e \
+  '.success == true and (.data.rule | type == "array")' >/dev/null; then
+  log "DSM returned an invalid NFS rule document" >&2
+  exit 69
+fi
+
+if printf '%s' "$current_json" | "$JQ" -e --arg client "$CLIENT_IP" \
+  '.data.rule | any(.client == $client or .client == ($client + "/32"))' >/dev/null; then
+  log "$CLIENT_IP is already authorized"
+  exit 0
+fi
+
+rules_json="$(printf '%s' "$current_json" | "$JQ" -c --arg client "$CLIENT_IP" '
+  .data.rule + [{
+    client: $client,
+    privilege: "rw",
+    root_squash: "admin",
+    async: true,
+    insecure: true,
+    crossmnt: true,
+    security_flavor: {
+      sys: true,
+      kerberos: false,
+      kerberos_integrity: false,
+      kerberos_privacy: false
+    }
+  }]
+')"
+
+if ! save_json="$("$WEBAPI" --exec \
+  api=SYNO.Core.FileServ.NFS.SharePrivilege \
+  method=save \
+  version=1 \
+  "share_name=$SHARE_NAME" \
+  "rule=$rules_json" 2>/dev/null)"; then
+  log "DSM failed to save NFS rules" >&2
+  exit 69
+fi
+if ! printf '%s' "$save_json" | "$JQ" -e '.success == true' >/dev/null; then
+  log "DSM rejected the NFS rule update" >&2
+  exit 69
+fi
+
+if ! verify_json="$(load_rules)" || ! printf '%s' "$verify_json" | "$JQ" -e \
+  --arg client "$CLIENT_IP" \
+  '.success == true and (.data.rule | any(.client == $client or .client == ($client + "/32")))' >/dev/null; then
+  log "DSM did not persist the NFS rule" >&2
+  exit 69
+fi
+
+log "authorized $CLIENT_IP for $SHARE_NAME"

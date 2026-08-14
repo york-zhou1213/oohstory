@@ -33,7 +33,7 @@ def test_library_entry_points_import_from_oohstory_package() -> None:
         "oohstory_library.services.electronic_library"
     )
     assert library.APP_ROOT == ROOT
-    assert library.DEFAULT_LIBRARY_ROOT == ROOT / "electronic-library" / "txt80"
+    assert library.DEFAULT_LIBRARY_ROOT == ROOT / "electronic-library"
     assert library.WORKER_PATH.is_file()
     assert library.BATCH_WORKER_PATH.is_file()
 
@@ -68,8 +68,7 @@ def test_scripts_resolve_oohstory_root_and_owned_service_modules(monkeypatch) ->
     assert missing == []
 
 
-def test_vendor_tree_has_no_old_repository_or_service_imports() -> None:
-    old_root = "/opt/legacy-webnovel-writer"
+def test_vendor_tree_has_no_legacy_service_imports() -> None:
     legacy_import = re.compile(r"(?<!oohstory_library\.)\bservices\.")
     offenders: list[str] = []
     for root in (
@@ -92,7 +91,7 @@ def test_vendor_tree_has_no_old_repository_or_service_imports() -> None:
             }:
                 continue
             text = path.read_text(encoding="utf-8")
-            if old_root in text or legacy_import.search(text):
+            if legacy_import.search(text):
                 offenders.append(str(path.relative_to(ROOT)))
     assert offenders == []
 

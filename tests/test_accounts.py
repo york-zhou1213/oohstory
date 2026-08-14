@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sqlite3
 
@@ -79,6 +80,17 @@ def test_duplicate_email_and_weak_password_are_rejected(tmp_path: Path) -> None:
     store.register("reader@example.com", "Correct-Horse-9-Battery", "读者", code)
     with pytest.raises(AccountError, match="已经注册"):
         store.register("READER@example.com", "Another-Good-8-Password", "读者", code)
+
+
+def test_weighted_rate_limit_enforces_character_budget(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    store.enforce_rate_limit("tts-owner", limit=10, window=60, cost=6)
+    store.enforce_rate_limit("tts-owner", limit=10, window=60, cost=4)
+
+    with pytest.raises(AccountError) as blocked:
+        store.enforce_rate_limit("tts-owner", limit=10, window=60, cost=1)
+
+    assert blocked.value.status_code == 429
 
 
 def test_display_names_and_direct_comment_writes_share_content_guard(tmp_path: Path) -> None:
@@ -170,7 +182,9 @@ def test_cookie_csrf_token_is_compared_as_a_hash(tmp_path: Path) -> None:
         store.require_csrf(loaded, "wrong-token")
 
 
-def test_invites_are_hashed_and_google_requires_existing_account_link(tmp_path: Path) -> None:
+def test_invites_are_hashed_and_google_first_login_is_direct_but_never_auto_merges(
+    tmp_path: Path,
+) -> None:
     store = make_store(tmp_path)
     code = invite(store)
     assert code.encode() not in store.path.read_bytes()
@@ -195,11 +209,59 @@ def test_invites_are_hashed_and_google_requires_existing_account_link(tmp_path: 
         "email_verified": True,
         "name": "Google Reader",
     }
-    with pytest.raises(AccountError, match="尚未绑定"):
+    with pytest.raises(AccountError, match="密码账户"):
         store.google_login(claims)
-    google_user = store.link_google(user["id"], claims)
+
+    direct_claims = claims | {
+        "sub": "google-direct-user",
+        "email": "direct@example.com",
+        "name": "Direct Reader",
+    }
+    google_user = store.google_login(direct_claims)
     assert google_user["email_verified"] is True
     assert google_user["google_linked"] is True
+    assert google_user["password_login_enabled"] is False
+    assert store.google_login(direct_claims)["id"] == google_user["id"]
+    assert store.login_methods(google_user["id"]) == {
+        "google": True,
+        "password": False,
+    }
+    with sqlite3.connect(store.path) as connection:
+        password_hash = connection.execute(
+            "SELECT password_hash FROM users WHERE id=?", (google_user["id"],)
+        ).fetchone()[0]
+        created = connection.execute(
+            "SELECT COUNT(*) FROM users WHERE email='direct@example.com'"
+        ).fetchone()[0]
+    assert password_hash is None
+    assert created == 1
+
+    direct_session = store.create_session(google_user, client="web")
+    with pytest.raises(AccountError, match="身份确认失败"):
+        store.setup_password(
+            google_user["id"],
+            direct_session.session_id,
+            direct_claims | {"sub": "different-google-subject"},
+            "Google-Local-8-Password",
+        )
+    store.setup_password(
+        google_user["id"],
+        direct_session.session_id,
+        direct_claims,
+        "Google-Local-8-Password",
+    )
+    assert store.login_methods(google_user["id"]) == {
+        "google": True,
+        "password": True,
+    }
+    assert store.password_login(
+        "direct@example.com", "Google-Local-8-Password"
+    )["id"] == google_user["id"]
+
+    linked_user = store.link_google(user["id"], claims)
+    assert linked_user["email_verified"] is True
+    assert linked_user["google_linked"] is True
+    assert linked_user["password_login_enabled"] is True
     assert store.google_login(claims)["id"] == user["id"]
 
     with pytest.raises(AccountError, match="邮箱必须"):
@@ -224,3 +286,47 @@ def test_web_google_link_token_is_single_use(tmp_path: Path) -> None:
     assert linked["google_linked"] is True
     with pytest.raises(AccountError, match="无效或已过期"):
         store.link_google_with_token(token, claims)
+
+
+def test_concurrent_google_first_login_creates_exactly_one_user(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    claims = {
+        "sub": "google-concurrent-subject",
+        "email": "concurrent@example.com",
+        "email_verified": True,
+        "name": "Concurrent Reader",
+    }
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        users = list(pool.map(lambda _index: store.google_login(claims), range(8)))
+
+    assert len({user["id"] for user in users}) == 1
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM users WHERE email='concurrent@example.com'"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM user_identities "
+            "WHERE provider='google' AND subject='google-concurrent-subject'"
+        ).fetchone()[0] == 1
+
+
+def test_deconstruction_likes_are_unique_and_toggleable(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    user, _ = store.register(
+        "reader@example.com",
+        "Correct-Horse-9-Battery",
+        "读者",
+        invite(store),
+    )
+    first = store.toggle_deconstruction_like(user["id"], "样本书")
+    assert first == {"slug": "样本书", "liked": True, "like_count": 1}
+    engagement = store.deconstruction_engagement(
+        ["样本书"], viewer_user_id=user["id"]
+    )
+    assert engagement["样本书"] == {
+        "like_count": 1,
+        "viewer_liked": True,
+        "download_count": 0,
+    }
+    second = store.toggle_deconstruction_like(user["id"], "样本书")
+    assert second == {"slug": "样本书", "liked": False, "like_count": 0}

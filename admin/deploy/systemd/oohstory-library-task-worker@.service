@@ -9,7 +9,7 @@ WorkingDirectory=/opt/oohstory-admin
 Environment=PYTHONUNBUFFERED=1
 Environment=LIBRARY_TASK_USE_SYSTEMD=1
 EnvironmentFile=-/etc/oohstory-admin/library.env
-ExecStart=/opt/oohstory-admin/.venv/bin/python /opt/oohstory-admin/src/oohstory_library/services/library_task_worker.py --task-file /srv/oohstory/library/txt80/全局拆书库/.tasks/%i.json
+ExecStart=/opt/oohstory-admin/.venv/bin/python /opt/oohstory-admin/src/oohstory_library/services/library_task_worker.py --task-file /srv/oohstory/library/全局拆书库/.tasks/%i.json
 Restart=no
 TimeoutStopSec=30
 CPUQuota=200%

@@ -26,14 +26,13 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_ROOT = Path("/srv/oohstory/library/txt80")
+DEFAULT_ROOT = Path("/srv/oohstory/library")
 OLD_NOTICE = (
     "爱下电子书Txt版阅读,下载和分享更多电子书请访问，"
     "简体:https://ixdzs8.com,繁体:https://ixdzs8.tw,"
     "E-mail:support@ixdzs.com"
 )
-PUBLIC_DOMAIN = os.getenv("OOHSTORY_PUBLIC_DOMAIN", "reader.example.com").strip() or "reader.example.com"
-NEW_NOTICE = f"{PUBLIC_DOMAIN}，好故事电子书"
+NEW_NOTICE = "reader.example.com，好故事电子书"
 ALLOWED_AREAS = ("body", "书籍")
 BODY_OBJECT_RE = re.compile(r"^[0-9a-f]{64}\.txt$")
 MYSQL_LOCK_NAME = "oohstory:replace-ixdzs-branding:v1"
@@ -53,7 +52,7 @@ XBIQUGE_SOURCE_HEADER_RE = re.compile(
     r"来源[：:]\s*https://(?:www\.)?xbiquge\.info/\S+"
 )
 CANONICAL_TXT80_ALIAS = Path(
-    "/opt/oohstory-admin/electronic-library/txt80"
+    "/srv/oohstory/library"
 )
 
 
@@ -807,7 +806,7 @@ def _validate_mapping(
             raise SafetyError("legacy TXT 替换结果与新 body 对象不一致")
     new_key = legacy.relative_path
     if not new_key.startswith("书籍/"):
-        raise SafetyError("新正文对象键必须指向 txt80/书籍/ 分类文件")
+        raise SafetyError("新正文对象键必须指向电子书库根目录的书籍/分类文件")
     return MySQLMigrationPlan(
         body=body,
         legacy=legacy,
@@ -1669,7 +1668,7 @@ def _parser() -> argparse.ArgumentParser:
         metavar="MANIFEST",
         help="确认旧 body 已零引用后，将其原子移动到 migration 备份目录",
     )
-    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="txt80 根目录")
+    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="电子书库根目录")
     parser.add_argument(
         "--backup-dir",
         type=Path,

@@ -7,6 +7,8 @@ structured actions to the root-owned library helper.
 
 from __future__ import annotations
 
+from oohstory_library.services.error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import os
 import re
 import secrets
@@ -127,10 +129,10 @@ class OperationsClient:
                         handle.write(data)
                         handle.flush()
                         os.fsync(handle.fileno())
-                except Exception:
+                except RECOVERABLE_OPERATION_ERRORS:
                     path.unlink(missing_ok=True)
                     raise
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             for path in created:
                 path.unlink(missing_ok=True)
             raise OperationsError("无法写入隔离上传区") from exc

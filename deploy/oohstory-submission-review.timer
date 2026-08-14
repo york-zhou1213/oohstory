@@ -3,6 +3,7 @@ Description=Poll OOH Story reader-submission AI review queue
 
 [Timer]
 OnBootSec=2min
+OnActiveSec=5s
 OnUnitInactiveSec=30s
 AccuracySec=5s
 Persistent=true

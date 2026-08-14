@@ -19,5 +19,5 @@ MemoryMax=768M
 TasksMax=128
 OOMPolicy=stop
 TimeoutStartSec=6h
-StandardOutput=append:/opt/oohstory-admin/electronic-library/txt80/logs/authorized-postprocess.log
-StandardError=append:/opt/oohstory-admin/electronic-library/txt80/logs/authorized-postprocess.log
+StandardOutput=append:/opt/oohstory-admin/electronic-library/logs/authorized-postprocess.log
+StandardError=append:/opt/oohstory-admin/electronic-library/logs/authorized-postprocess.log

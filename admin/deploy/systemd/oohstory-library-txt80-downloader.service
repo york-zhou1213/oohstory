@@ -20,8 +20,8 @@ IOWeight=20
 IOReadBandwidthMax=/dev/mapper/ubuntu--vg-ubuntu--lv 32M
 IOWriteBandwidthMax=/dev/mapper/ubuntu--vg-ubuntu--lv 16M
 OOMPolicy=stop
-StandardOutput=append:/opt/oohstory-admin/electronic-library/txt80/logs/download.log
-StandardError=append:/opt/oohstory-admin/electronic-library/txt80/logs/download.log
+StandardOutput=append:/opt/oohstory-admin/electronic-library/logs/download.log
+StandardError=append:/opt/oohstory-admin/electronic-library/logs/download.log
 
 [Install]
 WantedBy=multi-user.target

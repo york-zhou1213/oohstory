@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Consolidate the legacy global deconstruction root into the canonical one.
 
-The canonical root is ``/srv/oohstory/library/txt80/全局拆书库``.  After a
+The canonical root is ``/srv/oohstory/library/全局拆书库``.  After a
 verified overlay the legacy physical directory can be removed.  Production
 configuration must point directly at the canonical root.
 """
@@ -19,10 +19,8 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_LEGACY_ROOT = Path("/srv/oohstory/library/全局拆书库")
-DEFAULT_CANONICAL_ROOT = Path(
-    "/srv/oohstory/library/txt80/全局拆书库"
-)
+DEFAULT_LEGACY_ROOT = Path("/srv/oohstory/library/.legacy/全局拆书库")
+DEFAULT_CANONICAL_ROOT = Path("/srv/oohstory/library/全局拆书库")
 DEFAULT_PROJECTS_ROOT = Path(
     "/var/lib/oohstory-admin/library-project"
 )

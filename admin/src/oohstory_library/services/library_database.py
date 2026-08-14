@@ -7,6 +7,8 @@ Streams/locks/leases; the independently configured eviction cache lives in
 
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import contextlib
 import os
 import queue
@@ -23,7 +25,7 @@ from oohstory_library import library_env, library_env_name
 
 
 APP_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_OBJECT_ROOT = APP_ROOT / "electronic-library" / "txt80"
+DEFAULT_OBJECT_ROOT = APP_ROOT / "electronic-library"
 
 
 def _read_secret(value: str, file_value: str) -> str:
@@ -120,8 +122,8 @@ class LibraryInfrastructureSettings:
                 or "oohstory_library"
             ).strip(),
             mysql_user=str(
-                library_env("WEBNOVEL_MYSQL_USER", "oohstory_library_writer")
-                or "oohstory_library_writer"
+                library_env("WEBNOVEL_MYSQL_USER", "oohstory_library")
+                or "oohstory_library"
             ).strip(),
             mysql_password=_read_secret(
                 "WEBNOVEL_MYSQL_PASSWORD",
@@ -279,7 +281,7 @@ class MySQLConnectionPool:
             if create:
                 try:
                     connection = self._new_connection()
-                except Exception:
+                except RECOVERABLE_OPERATION_ERRORS:
                     with self._lock:
                         self._created -= 1
                     raise
@@ -287,13 +289,13 @@ class MySQLConnectionPool:
                 connection = self._available.get(timeout=10)
         try:
             connection.ping(reconnect=True)
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             self._discard(connection)
             with self._lock:
                 self._created += 1
             try:
                 connection = self._new_connection()
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 with self._lock:
                     self._created -= 1
                 raise
@@ -331,7 +333,7 @@ class MySQLConnectionPool:
                 connection.rollback()
             else:
                 connection.commit()
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             healthy = False
             with contextlib.suppress(Exception):
                 connection.rollback()

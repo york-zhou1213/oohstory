@@ -1,0 +1,13 @@
+[Unit]
+Description=Retry OOHStory NAS recovery until services are healthy
+
+[Timer]
+OnBootSec=20s
+OnUnitInactiveSec=30s
+AccuracySec=5s
+RandomizedDelaySec=5s
+Persistent=true
+Unit=oohstory-nas-recovery.service
+
+[Install]
+WantedBy=timers.target

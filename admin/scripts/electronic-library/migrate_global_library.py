@@ -113,9 +113,9 @@ def main() -> int:
     new_root = Path(args.new_root).expanduser().resolve()
     projects_root = Path(args.projects_root).expanduser().resolve()
     runtime_dir = Path(args.runtime_dir).expanduser().resolve()
-    catalog_path = new_root / "txt80" / "catalog.sqlite3"
-    global_root = new_root / "txt80" / "全局拆书库"
-    index_root = new_root / "txt80" / "全局索引"
+    catalog_path = new_root / "catalog.sqlite3"
+    global_root = new_root / "全局拆书库"
+    index_root = new_root / "全局索引"
 
     if not args.apply:
         print(

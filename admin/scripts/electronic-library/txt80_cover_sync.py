@@ -50,7 +50,7 @@ from oohstory_library.services.linovelib_provider import LinovelibProvider  # no
 from oohstory_library.services.shubaow_provider import AuthorizedShubaowProvider  # noqa: E402
 
 
-LIBRARY_ROOT = APP_ROOT / "electronic-library" / "txt80"
+LIBRARY_ROOT = APP_ROOT / "electronic-library"
 CATALOG_PATH = LIBRARY_ROOT / "catalog.sqlite3"
 COVER_ROOT = LIBRARY_ROOT / "封面"
 INDEX_PATH = Path(

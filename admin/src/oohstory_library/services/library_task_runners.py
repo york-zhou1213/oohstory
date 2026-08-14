@@ -9,7 +9,7 @@ import os
 import shutil
 import subprocess
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -61,7 +61,7 @@ def rotate_openclaw_session(
         history.append(
             {
                 "session_id": previous,
-                "rotated_at": datetime.now().isoformat(timespec="seconds"),
+                "rotated_at": datetime.now(UTC).isoformat(timespec="seconds"),
                 "reason": reason,
             }
         )

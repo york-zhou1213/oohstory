@@ -196,7 +196,7 @@ class UploadSecurityScanner:
                         shutil.copyfileobj(source, output, length=1024 * 1024)
                     target.chmod(0o600)
                     extracted.append(normalized.as_posix())
-        except Exception:
+        except BaseException:
             shutil.rmtree(destination, ignore_errors=True)
             raise
         return extracted

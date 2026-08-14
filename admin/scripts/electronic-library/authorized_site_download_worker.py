@@ -26,7 +26,7 @@ from urllib.parse import urlparse
 
 from project_paths import APP_ROOT  # noqa: E402
 BACKEND_ROOT = APP_ROOT / "src"
-LIBRARY_ROOT = APP_ROOT / "electronic-library" / "txt80"
+LIBRARY_ROOT = APP_ROOT / "electronic-library"
 STATE_PATH = (
     LIBRARY_ROOT / "全局索引" / "authorized-site-download-worker.json"
 )

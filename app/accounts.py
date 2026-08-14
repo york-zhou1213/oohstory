@@ -16,7 +16,7 @@ import sqlite3
 import unicodedata
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -92,9 +92,7 @@ def normalize_email(value: str) -> str:
 
 def clean_display_name(value: str, *, fallback: str = "读者") -> str:
     cleaned = " ".join(
-        unicodedata.normalize("NFKC", str(value or ""))
-        .replace("\x00", " ")
-        .split()
+        unicodedata.normalize("NFKC", str(value or "")).replace("\x00", " ").split()
     )
     if not cleaned:
         cleaned = fallback
@@ -126,7 +124,9 @@ def validate_password(value: str, *, email: str = "") -> str:
 
 
 def clean_profile_text(value: str, *, field: str, max_length: int) -> str:
-    cleaned = unicodedata.normalize("NFKC", str(value or "")).replace("\x00", "").strip()
+    cleaned = (
+        unicodedata.normalize("NFKC", str(value or "")).replace("\x00", "").strip()
+    )
     if len(cleaned) > max_length:
         raise AccountError(f"{field}不能超过 {max_length} 个字符")
     return cleaned
@@ -432,6 +432,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_upload_clean_digest
   ON deconstruction_uploads(sha256)
   WHERE sha256 IS NOT NULL AND status IN ('ai_pending','reviewing','approved','completed');
 
+CREATE TABLE IF NOT EXISTS deconstruction_download_metrics (
+  slug TEXT PRIMARY KEY,
+  download_count INTEGER NOT NULL DEFAULT 0 CHECK(download_count >= 0),
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deconstruction_likes (
+  slug TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(slug,user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_deconstruction_likes_slug
+  ON deconstruction_likes(slug,created_at DESC);
+
 CREATE TABLE IF NOT EXISTS novel_submissions (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -544,7 +559,9 @@ class AccountStore:
                     "SELECT user_id,book_id,spent_seconds,metric_applied,"
                     "created_at,applied_at FROM user_book_recommendations"
                 ).fetchall()
-                connection.execute("DROP INDEX IF EXISTS idx_user_book_recommendations_pending")
+                connection.execute(
+                    "DROP INDEX IF EXISTS idx_user_book_recommendations_pending"
+                )
                 connection.execute(
                     "DROP INDEX IF EXISTS idx_user_book_recommendations_user_book"
                 )
@@ -604,11 +621,12 @@ class AccountStore:
                     "ON user_book_recommendations(user_id,book_id,created_at DESC)"
                 )
             connection.commit()
-        except Exception:
+        except BaseException:
             connection.rollback()
             raise
         existing = {
-            str(row[1]) for row in connection.execute("PRAGMA table_info(deconstruction_uploads)")
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(deconstruction_uploads)")
         }
         columns = {
             "structure_profile": "TEXT",
@@ -620,7 +638,9 @@ class AccountStore:
         }
         for name, ddl in columns.items():
             if name not in existing:
-                connection.execute(f"ALTER TABLE deconstruction_uploads ADD COLUMN {name} {ddl}")
+                connection.execute(
+                    f"ALTER TABLE deconstruction_uploads ADD COLUMN {name} {ddl}"
+                )
         reaction_columns = {
             str(row[1])
             for row in connection.execute("PRAGMA table_info(paragraph_comment_thanks)")
@@ -652,6 +672,11 @@ class AccountStore:
 
     @staticmethod
     def _user_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        password_login_enabled = False
+        if "password_login_enabled" in row.keys():
+            password_login_enabled = bool(row["password_login_enabled"])
+        elif "password_hash" in row.keys():
+            password_login_enabled = bool(row["password_hash"])
         return {
             "id": row["id"],
             "email": row["email"],
@@ -660,6 +685,7 @@ class AccountStore:
             "google_linked": bool(row["google_linked"])
             if "google_linked" in row.keys()
             else False,
+            "password_login_enabled": password_login_enabled,
             "role": str(row["role"] if "role" in row.keys() else "user"),
         }
 
@@ -672,7 +698,32 @@ class AccountStore:
             ).fetchone()
         return row is not None
 
-    def enforce_rate_limit(self, key: str, *, limit: int = 8, window: int = 900) -> None:
+    def login_methods(self, user_id: str) -> dict[str, bool]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT password_hash,"
+                "EXISTS(SELECT 1 FROM user_identities i WHERE i.provider='google' "
+                "AND i.user_id=u.id) AS google_linked "
+                "FROM users u WHERE u.id=? AND u.status='active'",
+                (str(user_id),),
+            ).fetchone()
+        if not row:
+            raise AccountError("账户不存在", 404)
+        return {
+            "google": bool(row["google_linked"]),
+            "password": bool(row["password_hash"]),
+        }
+
+    def enforce_rate_limit(
+        self,
+        key: str,
+        *,
+        limit: int = 8,
+        window: int = 900,
+        cost: int = 1,
+    ) -> None:
+        if limit <= 0 or window <= 0 or cost <= 0:
+            raise ValueError("rate limit values must be positive")
         digest = token_hash(key)
         now = utcnow()
         cutoff = now - timedelta(seconds=window)
@@ -683,7 +734,7 @@ class AccountStore:
                 (digest,),
             ).fetchone()
             if row and datetime.fromisoformat(row["window_started_at"]) > cutoff:
-                attempts = int(row["attempts"]) + 1
+                attempts = int(row["attempts"]) + cost
                 if attempts > limit:
                     connection.rollback()
                     raise AccountError("尝试次数过多，请稍后再试", 429)
@@ -694,9 +745,9 @@ class AccountStore:
             else:
                 connection.execute(
                     "INSERT INTO auth_rate_limits(key_hash,window_started_at,attempts) "
-                    "VALUES(?,?,1) ON CONFLICT(key_hash) DO UPDATE SET "
-                    "window_started_at=excluded.window_started_at,attempts=1",
-                    (digest, iso(now)),
+                    "VALUES(?,?,?) ON CONFLICT(key_hash) DO UPDATE SET "
+                    "window_started_at=excluded.window_started_at,attempts=excluded.attempts",
+                    (digest, iso(now), cost),
                 )
             connection.commit()
 
@@ -729,7 +780,14 @@ class AccountStore:
             connection.execute(
                 "INSERT INTO registration_invites"
                 "(id,code_hash,label,max_uses,created_at,expires_at) VALUES(?,?,?,?,?,?)",
-                (invite_id, token_hash(code), label, int(max_uses), iso(now), expires_at),
+                (
+                    invite_id,
+                    token_hash(code),
+                    label,
+                    int(max_uses),
+                    iso(now),
+                    expires_at,
+                ),
             )
         return code, {
             "id": invite_id,
@@ -806,7 +864,14 @@ class AccountStore:
                 connection.execute(
                     "INSERT INTO users(id,email,display_name,password_hash,created_at,updated_at) "
                     "VALUES(?,?,?,?,?,?)",
-                    (user_id, email, display_name, PASSWORD_HASHER.hash(password), now, now),
+                    (
+                        user_id,
+                        email,
+                        display_name,
+                        PASSWORD_HASHER.hash(password),
+                        now,
+                        now,
+                    ),
                 )
                 if str(invite_code or "").strip():
                     self._consume_invite(
@@ -830,6 +895,9 @@ class AccountStore:
             "email": email,
             "display_name": display_name,
             "email_verified": False,
+            "google_linked": False,
+            "password_login_enabled": True,
+            "role": "user",
         }, verification
 
     def verify_email(self, verification: str) -> dict[str, Any]:
@@ -853,7 +921,9 @@ class AccountStore:
                 "WHERE id=?",
                 (now, now, row["user_id"]),
             )
-            user = connection.execute("SELECT * FROM users WHERE id=?", (row["user_id"],)).fetchone()
+            user = connection.execute(
+                "SELECT * FROM users WHERE id=?", (row["user_id"],)
+            ).fetchone()
             connection.commit()
         return self._user_from_row(user)
 
@@ -878,7 +948,9 @@ class AccountStore:
                 "INSERT INTO email_verification_tokens(token_hash,user_id,created_at,expires_at) "
                 "VALUES(?,?,?,?)",
                 (
-                    token_hash(verification), user_id, now,
+                    token_hash(verification),
+                    user_id,
+                    now,
                     iso(utcnow() + timedelta(hours=24)),
                 ),
             )
@@ -893,7 +965,9 @@ class AccountStore:
             ).fetchone()
         encoded = row["password_hash"] if row else None
         try:
-            valid = bool(encoded) and PASSWORD_HASHER.verify(encoded, str(password or ""))
+            valid = bool(encoded) and PASSWORD_HASHER.verify(
+                encoded, str(password or "")
+            )
         except (InvalidHashError, VerifyMismatchError):
             valid = False
         if not valid or row is None:
@@ -910,9 +984,28 @@ class AccountStore:
     def _google_identity(claims: dict[str, Any]) -> tuple[str, str]:
         subject = str(claims.get("sub") or "").strip()
         email = normalize_email(str(claims.get("email") or ""))
-        if not subject or not claims.get("email_verified"):
+        if (
+            not subject
+            or len(subject) > 255
+            or "\x00" in subject
+            or not claims.get("email_verified")
+        ):
             raise AccountError("Google 账户邮箱尚未验证", 401)
         return subject, email
+
+    @staticmethod
+    def _google_display_name(claims: dict[str, Any], email: str) -> str:
+        candidates = (
+            str(claims.get("name") or ""),
+            email.split("@", 1)[0],
+            "读者",
+        )
+        for candidate in candidates:
+            try:
+                return clean_display_name(candidate)
+            except AccountError:
+                continue
+        return "读者"
 
     @classmethod
     def _link_google_in_transaction(
@@ -934,8 +1027,7 @@ class AccountStore:
             raise AccountError("Google 邮箱必须与注册账户邮箱一致", 409)
 
         subject_owner = connection.execute(
-            "SELECT user_id FROM user_identities "
-            "WHERE provider='google' AND subject=?",
+            "SELECT user_id FROM user_identities WHERE provider='google' AND subject=?",
             (subject,),
         ).fetchone()
         if subject_owner and subject_owner["user_id"] != user_id:
@@ -977,32 +1069,88 @@ class AccountStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             identity = connection.execute(
-                "SELECT user_id FROM user_identities WHERE provider='google' AND subject=?",
+                "SELECT user_id FROM user_identities "
+                "WHERE provider='google' AND subject=?",
                 (subject,),
             ).fetchone()
-            if not identity:
-                connection.rollback()
-                raise AccountError(
-                    "该 Google 账户尚未绑定，请先用邮箱密码登录后绑定",
-                    409,
+            if identity:
+                user_id = str(identity["user_id"])
+                row = connection.execute(
+                    "SELECT u.*,1 AS google_linked FROM users u "
+                    "WHERE u.id=? AND u.status='active'",
+                    (user_id,),
+                ).fetchone()
+                if not row:
+                    connection.rollback()
+                    raise AccountError("账户已被停用", 403)
+                if str(row["email"]).casefold() != email.casefold():
+                    if row["password_hash"]:
+                        connection.rollback()
+                        raise AccountError("Google 账户邮箱与绑定记录不一致", 409)
+                    conflict = connection.execute(
+                        "SELECT id FROM users WHERE email=? AND id<>? LIMIT 1",
+                        (email, user_id),
+                    ).fetchone()
+                    if conflict:
+                        connection.rollback()
+                        raise AccountError("新的 Google 邮箱已被其他账户使用", 409)
+                    connection.execute(
+                        "UPDATE users SET email=?,updated_at=? WHERE id=?",
+                        (email, now, user_id),
+                    )
+            else:
+                email_owner = connection.execute(
+                    "SELECT u.id,u.password_hash,"
+                    "EXISTS(SELECT 1 FROM user_identities i "
+                    "WHERE i.provider='google' AND i.user_id=u.id) AS google_linked "
+                    "FROM users u WHERE u.email=? LIMIT 1",
+                    (email,),
+                ).fetchone()
+                if email_owner:
+                    connection.rollback()
+                    if email_owner["google_linked"]:
+                        raise AccountError("该邮箱已关联其他 Google 账户", 409)
+                    raise AccountError(
+                        "该邮箱已创建密码账户，请先用邮箱密码登录后在个人中心绑定 Google",
+                        409,
+                    )
+                user_id = str(uuid.uuid4())
+                connection.execute(
+                    "INSERT INTO users"
+                    "(id,email,display_name,password_hash,email_verified_at,status,"
+                    "created_at,updated_at,last_login_at) "
+                    "VALUES(?,?,?,NULL,?,'active',?,?,?)",
+                    (
+                        user_id,
+                        email,
+                        self._google_display_name(claims, email),
+                        now,
+                        now,
+                        now,
+                        now,
+                    ),
                 )
-            user_id = identity["user_id"]
+                connection.execute(
+                    "INSERT INTO user_identities"
+                    "(provider,subject,user_id,provider_email,created_at,last_login_at) "
+                    "VALUES('google',?,?,?,?,?)",
+                    (subject, user_id, email, now, now),
+                )
+                self._audit(connection, user_id, "google_account_create", "success")
             connection.execute(
                 "UPDATE user_identities SET last_login_at=?,provider_email=? "
                 "WHERE provider='google' AND subject=?",
                 (now, email, subject),
+            )
+            connection.execute(
+                "UPDATE users SET last_login_at=?,updated_at=? WHERE id=?",
+                (now, now, user_id),
             )
             row = connection.execute(
                 "SELECT u.*,1 AS google_linked FROM users u "
                 "WHERE u.id=? AND u.status='active'",
                 (user_id,),
             ).fetchone()
-            if not row:
-                connection.rollback()
-                raise AccountError("账户已被停用", 403)
-            if str(row["email"]).casefold() != email.casefold():
-                connection.rollback()
-                raise AccountError("Google 账户邮箱与绑定记录不一致", 409)
             connection.commit()
         return self._user_from_row(row)
 
@@ -1104,19 +1252,30 @@ class AccountStore:
                 "INSERT INTO user_sessions(id,user_id,token_hash,csrf_hash,client,user_agent_hash,ip_hash,created_at,last_seen_at,expires_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
-                    session_id, user["id"], token_hash(raw_token), token_hash(csrf), client,
+                    session_id,
+                    user["id"],
+                    token_hash(raw_token),
+                    token_hash(csrf),
+                    client,
                     token_hash(user_agent[:500]) if user_agent else None,
                     token_hash(ip[:100]) if ip else None,
-                    iso(now), iso(now), iso(expires),
+                    iso(now),
+                    iso(now),
+                    iso(expires),
                 ),
             )
         return SessionContext(
             session_id=session_id,
-            user_id=user["id"], email=user["email"], display_name=user["display_name"],
-            email_verified=bool(user["email_verified"]), client=client,
+            user_id=user["id"],
+            email=user["email"],
+            display_name=user["display_name"],
+            email_verified=bool(user["email_verified"]),
+            client=client,
             google_linked=self.google_linked(user["id"]),
             role=str(user.get("role") or "user"),
-            csrf_hash=token_hash(csrf), expires_at=iso(expires), token=raw_token,
+            csrf_hash=token_hash(csrf),
+            expires_at=iso(expires),
+            token=raw_token,
             csrf_token=csrf,
         )
 
@@ -1141,11 +1300,15 @@ class AccountStore:
             )
         return SessionContext(
             session_id=row["id"],
-            user_id=row["user_id"], email=row["email"], display_name=row["display_name"],
-            email_verified=bool(row["email_verified_at"]), client=row["client"],
+            user_id=row["user_id"],
+            email=row["email"],
+            display_name=row["display_name"],
+            email_verified=bool(row["email_verified_at"]),
+            client=row["client"],
             google_linked=bool(row["google_linked"]),
             role=str(row["role"] or "user"),
-            csrf_hash=bytes(row["csrf_hash"]), expires_at=row["expires_at"],
+            csrf_hash=bytes(row["csrf_hash"]),
+            expires_at=row["expires_at"],
         )
 
     def revoke_session(self, raw_token: str) -> None:
@@ -1168,7 +1331,9 @@ class AccountStore:
         return csrf
 
     def require_csrf(self, session: SessionContext, supplied: str) -> None:
-        if not supplied or not hmac.compare_digest(session.csrf_hash, token_hash(supplied)):
+        if not supplied or not hmac.compare_digest(
+            session.csrf_hash, token_hash(supplied)
+        ):
             raise AccountError("安全令牌无效，请刷新页面后重试", 403)
 
     def profile(self, user_id: str) -> dict[str, Any]:
@@ -1207,7 +1372,7 @@ class AccountStore:
         birthday = str(birthday or "").strip() or None
         if birthday:
             try:
-                parsed = datetime.strptime(birthday, "%Y-%m-%d").date()
+                parsed = date.fromisoformat(birthday)
             except ValueError as exc:
                 raise AccountError("生日格式无效") from exc
             if parsed.year < 1900 or parsed > utcnow().date():
@@ -1259,7 +1424,32 @@ class AccountStore:
             raise AccountError("用户尚未上传头像", 404)
         return int(row["avatar_version"])
 
-    def _audit(self, connection: sqlite3.Connection, user_id: str, event: str, outcome: str) -> None:
+    def comment_authors(self, user_ids: list[str]) -> dict[str, dict[str, Any]]:
+        ids = list(dict.fromkeys(str(item) for item in user_ids if item))[:1000]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT u.id,u.display_name,COALESCE(p.avatar_version,0) AS avatar_version,"
+                "COALESCE(rt.active_seconds,0) AS active_seconds "
+                "FROM users u LEFT JOIN user_profiles p ON p.user_id=u.id "
+                "LEFT JOIN user_reading_totals rt ON rt.user_id=u.id "
+                f"WHERE u.status='active' AND u.id IN ({placeholders})",
+                ids,
+            ).fetchall()
+        return {
+            str(row["id"]): {
+                "display_name": str(row["display_name"]),
+                "avatar_version": int(row["avatar_version"]),
+                "reading": reading_level_summary(int(row["active_seconds"])),
+            }
+            for row in rows
+        }
+
+    def _audit(
+        self, connection: sqlite3.Connection, user_id: str, event: str, outcome: str
+    ) -> None:
         connection.execute(
             "INSERT INTO security_audit_events(id,user_id,event,outcome,created_at) "
             "VALUES(?,?,?,?,?)",
@@ -1279,15 +1469,23 @@ class AccountStore:
                 "SELECT email,password_hash FROM users WHERE id=? AND status='active'",
                 (user_id,),
             ).fetchone()
-            encoded = row["password_hash"] if row else None
+            if row is None:
+                connection.rollback()
+                raise AccountError("账户不存在", 404)
+            encoded = row["password_hash"]
             try:
                 valid = bool(encoded) and PASSWORD_HASHER.verify(
-                    encoded, str(current_password or "")
+                    str(encoded), str(current_password or "")
                 )
             except (InvalidHashError, VerifyMismatchError):
                 valid = False
-            if not valid or row is None:
-                self._audit(connection, user_id, "password_change", "invalid_current_password")
+            if not valid:
+                self._audit(
+                    connection,
+                    user_id,
+                    "password_change",
+                    "invalid_current_password",
+                )
                 connection.commit()
                 raise AccountError("当前密码不正确", 401)
             password = validate_password(new_password, email=row["email"])
@@ -1306,6 +1504,61 @@ class AccountStore:
                 (now, user_id, session_id),
             ).rowcount
             self._audit(connection, user_id, "password_change", "success")
+            connection.commit()
+        return int(revoked)
+
+    def setup_password(
+        self,
+        user_id: str,
+        session_id: str,
+        claims: dict[str, Any],
+        new_password: str,
+    ) -> int:
+        subject, email = self._google_identity(claims)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT email,password_hash FROM users "
+                "WHERE id=? AND status='active'",
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise AccountError("账户不存在", 404)
+            if row["password_hash"]:
+                connection.rollback()
+                raise AccountError("邮箱密码登录已经启用", 409)
+            identity = connection.execute(
+                "SELECT subject FROM user_identities WHERE provider='google' "
+                "AND user_id=? LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if not identity or not hmac.compare_digest(
+                str(identity["subject"]), subject
+            ):
+                self._audit(
+                    connection, user_id, "password_setup", "google_subject_mismatch"
+                )
+                connection.commit()
+                raise AccountError("Google 身份确认失败", 403)
+            if str(row["email"]).casefold() != email.casefold():
+                self._audit(
+                    connection, user_id, "password_setup", "google_email_mismatch"
+                )
+                connection.commit()
+                raise AccountError("Google 邮箱与当前账户不一致", 409)
+            password = validate_password(new_password, email=row["email"])
+            now = iso()
+            connection.execute(
+                "UPDATE users SET password_hash=?,updated_at=? WHERE id=?",
+                (PASSWORD_HASHER.hash(password), now, user_id),
+            )
+            revoked = connection.execute(
+                "UPDATE user_sessions SET revoked_at=? WHERE user_id=? AND id<>? "
+                "AND revoked_at IS NULL",
+                (now, user_id, session_id),
+            ).rowcount
+            self._audit(connection, user_id, "password_setup", "success")
             connection.commit()
         return int(revoked)
 
@@ -1335,7 +1588,9 @@ class AccountStore:
             "metric_applied": pending_count == 0,
             "pending_count": pending_count,
             "donated_seconds": int(row["spent_seconds"] or 0),
-            "recommended_at": str(row["recommended_at"]) if row["recommended_at"] else None,
+            "recommended_at": str(row["recommended_at"])
+            if row["recommended_at"]
+            else None,
             "recommendation_cost_seconds": RECOMMENDATION_COST_SECONDS,
             "recommendation_cost_hours": 1,
         }
@@ -1496,7 +1751,9 @@ class AccountStore:
                     (user_id,),
                 ).fetchone()
                 connection.commit()
-                return reading_level_summary(int(total["active_seconds"]) if total else 0) | {
+                return reading_level_summary(
+                    int(total["active_seconds"]) if total else 0
+                ) | {
                     "accepted_seconds": int(duplicate["accepted_seconds"]),
                     "duplicate": True,
                 }
@@ -1509,7 +1766,9 @@ class AccountStore:
             if total and total["last_heartbeat_at"]:
                 elapsed = max(
                     0.0,
-                    (now_dt - datetime.fromisoformat(total["last_heartbeat_at"])).total_seconds(),
+                    (
+                        now_dt - datetime.fromisoformat(total["last_heartbeat_at"])
+                    ).total_seconds(),
                 )
                 accepted = 0 if elapsed < 5 else min(claimed, max(0, int(elapsed) + 2))
             connection.execute(
@@ -1550,7 +1809,11 @@ class AccountStore:
         comment_id = str(uuid.uuid4())
         now_dt = utcnow()
         now = iso(now_dt)
-        cleaned = unicodedata.normalize("NFKC", str(content or "")).replace("\x00", "").strip()
+        cleaned = (
+            unicodedata.normalize("NFKC", str(content or ""))
+            .replace("\x00", "")
+            .strip()
+        )
         if not cleaned:
             raise AccountError("评论不能为空")
         if len(cleaned) > 500:
@@ -1560,10 +1823,12 @@ class AccountStore:
             raise AccountError(moderation.detail, 422)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            recent = int(connection.execute(
-                "SELECT COUNT(*) FROM paragraph_comments WHERE user_id=? AND created_at>=?",
-                (user_id, iso(now_dt - timedelta(hours=24))),
-            ).fetchone()[0])
+            recent = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM paragraph_comments WHERE user_id=? AND created_at>=?",
+                    (user_id, iso(now_dt - timedelta(hours=24))),
+                ).fetchone()[0]
+            )
             if recent >= 100:
                 connection.rollback()
                 raise AccountError("今日评论次数已达上限，请明天再试", 429)
@@ -1572,8 +1837,16 @@ class AccountStore:
                 "(id,user_id,book_id,chapter_id,paragraph_index,paragraph_key,"
                 "paragraph_excerpt,content,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
-                    comment_id, user_id, str(book_id), int(chapter_id), int(paragraph_index),
-                    str(paragraph_key)[:80], str(paragraph_excerpt)[:160], cleaned, "visible", now,
+                    comment_id,
+                    user_id,
+                    str(book_id),
+                    int(chapter_id),
+                    int(paragraph_index),
+                    str(paragraph_key)[:80],
+                    str(paragraph_excerpt)[:160],
+                    cleaned,
+                    "visible",
+                    now,
                 ),
             )
             connection.commit()
@@ -1615,43 +1888,53 @@ class AccountStore:
         paragraphs: dict[str, dict[str, Any]] = {}
         for row in rows:
             key = str(row["paragraph_key"])
-            thread = paragraphs.setdefault(key, {
-                "paragraph_index": int(row["paragraph_index"]),
-                "paragraph_key": key,
-                "excerpt": row["paragraph_excerpt"],
-                "count": 0,
-                "total_thanks": 0,
-                "comments": [],
-            })
+            thread = paragraphs.setdefault(
+                key,
+                {
+                    "paragraph_index": int(row["paragraph_index"]),
+                    "paragraph_key": key,
+                    "excerpt": row["paragraph_excerpt"],
+                    "count": 0,
+                    "total_thanks": 0,
+                    "comments": [],
+                },
+            )
             rank = reading_level_summary(int(row["active_seconds"]))
             like_count = int(row["like_count"])
             viewer_like_count = int(row["viewer_like_count"])
-            thread["comments"].append({
-                "id": row["id"],
-                "content": row["content"],
-                "created_at": row["created_at"],
-                "like_count": like_count,
-                "viewer_like_count": viewer_like_count,
-                # Compatibility aliases for installed clients older than v1.9.2.
-                "thanks_count": like_count,
-                "thanked_by_me": viewer_like_count > 0,
-                "is_own": bool(viewer and row["user_id"] == viewer),
-                "author": {
-                    "display_name": row["display_name"],
-                    "avatar_url": (
-                        f"/api/v1/users/{row['user_id']}/avatar?v={int(row['avatar_version'])}"
-                        if int(row["avatar_version"]) > 0 else None
-                    ),
-                    "reading": {
-                        "level": rank["level"], "roman": rank["roman"], "name": rank["name"],
+            thread["comments"].append(
+                {
+                    "id": row["id"],
+                    "content": row["content"],
+                    "created_at": row["created_at"],
+                    "like_count": like_count,
+                    "viewer_like_count": viewer_like_count,
+                    # Compatibility aliases for installed clients older than v1.9.2.
+                    "thanks_count": like_count,
+                    "thanked_by_me": viewer_like_count > 0,
+                    "is_own": bool(viewer and row["user_id"] == viewer),
+                    "author": {
+                        "display_name": row["display_name"],
+                        "avatar_url": (
+                            f"/api/v1/users/{row['user_id']}/avatar?v={int(row['avatar_version'])}"
+                            if int(row["avatar_version"]) > 0
+                            else None
+                        ),
+                        "reading": {
+                            "level": rank["level"],
+                            "roman": rank["roman"],
+                            "name": rank["name"],
+                        },
                     },
-                },
-            })
+                }
+            )
             thread["count"] += 1
             thread["total_thanks"] += like_count
         return {
             "paragraphs": paragraphs,
-            "comment_count": sum(int(thread["count"]) for thread in paragraphs.values()),
+            "comment_count": sum(
+                int(thread["count"]) for thread in paragraphs.values()
+            ),
         }
 
     def adjust_paragraph_comment_like(
@@ -1708,11 +1991,13 @@ class AccountStore:
                         (str(comment_id), user_id),
                     )
                     viewer_like_count -= 1
-            count = int(connection.execute(
-                "SELECT COALESCE(SUM(like_count),0) FROM paragraph_comment_thanks "
-                "WHERE comment_id=?",
-                (str(comment_id),),
-            ).fetchone()[0])
+            count = int(
+                connection.execute(
+                    "SELECT COALESCE(SUM(like_count),0) FROM paragraph_comment_thanks "
+                    "WHERE comment_id=?",
+                    (str(comment_id),),
+                ).fetchone()[0]
+            )
             connection.commit()
         return {
             "liked": viewer_like_count > 0,
@@ -1724,24 +2009,35 @@ class AccountStore:
 
     def state(self, user_id: str) -> dict[str, Any]:
         with self._connect() as connection:
-            history = [dict(row) for row in connection.execute(
-                "SELECT book_id,chapter_id,progress,title,author,cover_url,updated_at "
-                "FROM user_reading_history WHERE user_id=? ORDER BY updated_at DESC LIMIT 500",
-                (user_id,),
-            )]
-            favorites = [dict(row) for row in connection.execute(
-                "SELECT book_id,title,author,cover_url,created_at,updated_at "
-                "FROM user_favorites WHERE user_id=? ORDER BY updated_at DESC LIMIT 1000",
-                (user_id,),
-            )]
-            bookshelf = [dict(row) for row in connection.execute(
-                "SELECT book_id,title,author,cover_url,note,created_at,updated_at "
-                "FROM user_bookshelf WHERE user_id=? ORDER BY updated_at DESC LIMIT 1000",
-                (user_id,),
-            )]
+            history = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT book_id,chapter_id,progress,title,author,cover_url,updated_at "
+                    "FROM user_reading_history WHERE user_id=? ORDER BY updated_at DESC LIMIT 500",
+                    (user_id,),
+                )
+            ]
+            favorites = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT book_id,title,author,cover_url,created_at,updated_at "
+                    "FROM user_favorites WHERE user_id=? ORDER BY updated_at DESC LIMIT 1000",
+                    (user_id,),
+                )
+            ]
+            bookshelf = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT book_id,title,author,cover_url,note,created_at,updated_at "
+                    "FROM user_bookshelf WHERE user_id=? ORDER BY updated_at DESC LIMIT 1000",
+                    (user_id,),
+                )
+            ]
         return {"history": history, "favorites": favorites, "bookshelf": bookshelf}
 
-    def sync_state(self, user_id: str, payload: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    def sync_state(
+        self, user_id: str, payload: dict[str, list[dict[str, Any]]]
+    ) -> dict[str, Any]:
         now = iso()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1754,20 +2050,37 @@ class AccountStore:
                     "title=excluded.title,author=excluded.author,cover_url=excluded.cover_url,"
                     "updated_at=MAX(updated_at,excluded.updated_at)",
                     (
-                        user_id, item["book_id"], int(item.get("chapter_id") or 1),
-                        float(item.get("progress") or 0), str(item.get("title") or "")[:200],
-                        str(item.get("author") or "")[:100], str(item.get("cover_url") or "")[:500],
+                        user_id,
+                        item["book_id"],
+                        int(item.get("chapter_id") or 1),
+                        float(item.get("progress") or 0),
+                        str(item.get("title") or "")[:200],
+                        str(item.get("author") or "")[:100],
+                        str(item.get("cover_url") or "")[:500],
                         str(item.get("updated_at") or now),
                     ),
                 )
-            for table, key in (("user_favorites", "favorites"), ("user_bookshelf", "bookshelf")):
+            for table, key in (
+                ("user_favorites", "favorites"),
+                ("user_bookshelf", "bookshelf"),
+            ):
                 for item in payload.get(key, [])[:1000]:
-                    note = str(item.get("note") or "")[:500] if table == "user_bookshelf" else None
-                    columns = "user_id,book_id,title,author,cover_url,created_at,updated_at"
+                    note = (
+                        str(item.get("note") or "")[:500]
+                        if table == "user_bookshelf"
+                        else None
+                    )
+                    columns = (
+                        "user_id,book_id,title,author,cover_url,created_at,updated_at"
+                    )
                     values: tuple[Any, ...] = (
-                        user_id, item["book_id"], str(item.get("title") or "")[:200],
-                        str(item.get("author") or "")[:100], str(item.get("cover_url") or "")[:500],
-                        str(item.get("created_at") or now), str(item.get("updated_at") or now),
+                        user_id,
+                        item["book_id"],
+                        str(item.get("title") or "")[:200],
+                        str(item.get("author") or "")[:100],
+                        str(item.get("cover_url") or "")[:500],
+                        str(item.get("created_at") or now),
+                        str(item.get("updated_at") or now),
                     )
                     if table == "user_bookshelf":
                         columns += ",note"
@@ -1782,9 +2095,7 @@ class AccountStore:
             connection.commit()
         return self.state(user_id)
 
-    def remove_state_item(
-        self, user_id: str, kind: str, book_id: str
-    ) -> int | None:
+    def remove_state_item(self, user_id: str, kind: str, book_id: str) -> int | None:
         tables = {
             "history": "user_reading_history",
             "favorites": "user_favorites",
@@ -1828,10 +2139,7 @@ class AccountStore:
                 "FROM user_favorites f INNER JOIN users u ON u.id=f.user_id "
                 "WHERE u.status='active' GROUP BY f.book_id"
             ).fetchall()
-        return {
-            str(row["book_id"]): int(row["favorite_count"])
-            for row in rows
-        }
+        return {str(row["book_id"]): int(row["favorite_count"]) for row in rows}
 
     def create_upload(self, user_id: str, filename: str, media_type: str) -> str:
         upload_id = str(uuid.uuid4())
@@ -1842,6 +2150,67 @@ class AccountStore:
                 (upload_id, user_id, filename, media_type[:100], "quarantined", iso()),
             )
         return upload_id
+
+    def receive_upload(
+        self,
+        upload_id: str,
+        user_id: str,
+        *,
+        stored_filename: str,
+        size: int,
+    ) -> None:
+        """Persist the completed transfer while leaving inspection queued."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE deconstruction_uploads SET stored_filename=?,bytes=?,rejection_reason='' "
+                "WHERE id=? AND user_id=? AND status='quarantined'",
+                (stored_filename, int(size), upload_id, user_id),
+            )
+        if int(cursor.rowcount) != 1:
+            raise AccountError("上传记录状态已变化，请重新上传", 409)
+
+    def claim_upload_scan(
+        self, *, upload_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Atomically claim one transferred archive for background inspection."""
+        stale_before = iso(utcnow() - timedelta(minutes=15))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE deconstruction_uploads SET status='quarantined',scanned_at=NULL "
+                "WHERE status='scanning' AND scanned_at<?",
+                (stale_before,),
+            )
+            where = "AND id=?" if upload_id else ""
+            params: tuple[Any, ...] = (upload_id,) if upload_id else ()
+            row = connection.execute(
+                "SELECT * FROM deconstruction_uploads WHERE status='quarantined' "
+                "AND stored_filename IS NOT NULL AND stored_filename!='' "
+                f"{where} ORDER BY created_at LIMIT 1",
+                params,
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+            connection.execute(
+                "UPDATE deconstruction_uploads SET status='scanning',scanned_at=? "
+                "WHERE id=? AND status='quarantined'",
+                (iso(), row["id"]),
+            )
+            claimed = connection.execute(
+                "SELECT * FROM deconstruction_uploads WHERE id=?",
+                (row["id"],),
+            ).fetchone()
+            connection.commit()
+        return dict(claimed)
+
+    def release_upload_scan(self, upload_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE deconstruction_uploads SET status='quarantined',scanned_at=NULL "
+                "WHERE id=? AND status='scanning'",
+                (upload_id,),
+            )
 
     def enforce_upload_quota(
         self,
@@ -1890,20 +2259,33 @@ class AccountStore:
     ) -> None:
         with self._connect() as connection:
             try:
-                connection.execute(
+                cursor = connection.execute(
                     "UPDATE deconstruction_uploads SET stored_filename=?,bytes=?,sha256=?,status='ai_pending',"
                     "scanner_engine=?,scanner_result=?,structure_profile=?,structure_report=?,"
-                    "scanned_at=?,queued_at=? WHERE id=? AND user_id=?",
+                    "scanned_at=?,queued_at=?,rejection_reason='' "
+                    "WHERE id=? AND user_id=? AND status='scanning'",
                     (
-                        stored_filename, size, digest, str(scanner.get("engine") or "")[:100],
-                        json.dumps(scanner, ensure_ascii=False, separators=(",", ":"))[:4000],
+                        stored_filename,
+                        size,
+                        digest,
+                        str(scanner.get("engine") or "")[:100],
+                        json.dumps(scanner, ensure_ascii=False, separators=(",", ":"))[
+                            :4000
+                        ],
                         str(structure.get("profile") or "")[:20],
-                        json.dumps(structure, ensure_ascii=False, separators=(",", ":"))[:20_000],
-                        iso(), iso(), upload_id, user_id,
+                        json.dumps(
+                            structure, ensure_ascii=False, separators=(",", ":")
+                        )[:20_000],
+                        iso(),
+                        iso(),
+                        upload_id,
+                        user_id,
                     ),
                 )
             except sqlite3.IntegrityError as exc:
                 raise AccountError("相同文件已经进入归纳队列", 409) from exc
+        if int(cursor.rowcount) != 1:
+            raise AccountError("上传检查任务状态已变化，请稍后刷新", 409)
 
     def reject_upload(self, upload_id: str, user_id: str, reason: str) -> None:
         with self._connect() as connection:
@@ -1915,13 +2297,16 @@ class AccountStore:
 
     def uploads(self, user_id: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
-            rows = [dict(row) for row in connection.execute(
-                "SELECT id,original_filename,bytes,sha256,media_type,status,scanner_engine,"
-                "rejection_reason,created_at,scanned_at,queued_at,completed_at,output_slug,"
-                "structure_profile,structure_report,review_result,reviewed_at,handoff_manifest "
-                "FROM deconstruction_uploads WHERE user_id=? ORDER BY created_at DESC LIMIT 200",
-                (user_id,),
-            )]
+            rows = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT id,original_filename,bytes,sha256,media_type,status,scanner_engine,"
+                    "rejection_reason,created_at,scanned_at,queued_at,completed_at,output_slug,"
+                    "structure_profile,structure_report,review_result,reviewed_at,handoff_manifest "
+                    "FROM deconstruction_uploads WHERE user_id=? ORDER BY created_at DESC LIMIT 200",
+                    (user_id,),
+                )
+            ]
         for row in rows:
             for key in ("structure_report", "review_result"):
                 try:
@@ -1950,8 +2335,16 @@ class AccountStore:
                 "(id,user_id,kind,title,message,action_url,resource_type,resource_id,dedupe_key,created_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
-                    notification_id, user_id, kind[:40], title[:120], message[:2000],
-                    action_url[:500], resource_type[:40], resource_id[:100], dedupe_key[:200], iso(),
+                    notification_id,
+                    user_id,
+                    kind[:40],
+                    title[:120],
+                    message[:2000],
+                    action_url[:500],
+                    resource_type[:40],
+                    resource_id[:100],
+                    dedupe_key[:200],
+                    iso(),
                 ),
             )
             row = connection.execute(
@@ -1960,21 +2353,86 @@ class AccountStore:
             ).fetchone()
         return str(row["id"])
 
-    def notifications(self, user_id: str, *, limit: int = 100) -> dict[str, Any]:
+    def notifications(
+        self, user_id: str, *, limit: int = 100, offset: int = 0
+    ) -> dict[str, Any]:
         bounded = min(max(int(limit), 1), 200)
+        bounded_offset = min(max(int(offset), 0), 100_000)
         with self._connect() as connection:
-            unread = int(connection.execute(
-                "SELECT COUNT(*) FROM user_notifications WHERE user_id=? AND read_at IS NULL",
-                (user_id,),
-            ).fetchone()[0])
-            items = [dict(row) for row in connection.execute(
-                "SELECT id,kind,title,message,action_url,resource_type,resource_id,created_at,read_at "
-                "FROM user_notifications WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT ?",
-                (user_id, bounded),
-            )]
-        return {"items": items, "unread_count": unread}
+            unread = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM user_notifications WHERE user_id=? AND read_at IS NULL",
+                    (user_id,),
+                ).fetchone()[0]
+            )
+            total = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM user_notifications WHERE user_id=?",
+                    (user_id,),
+                ).fetchone()[0]
+            )
+            action_required = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM ("
+                    "SELECT n.resource_type,n.resource_id FROM user_notifications n "
+                    "WHERE n.user_id=? AND n.read_at IS NULL AND n.kind='submission_review' "
+                    "AND n.resource_id IS NOT NULL AND ("
+                    "EXISTS(SELECT 1 FROM novel_submissions s WHERE s.id=n.resource_id AND s.user_id=n.user_id AND s.status='rejected') "
+                    "OR EXISTS(SELECT 1 FROM deconstruction_uploads d WHERE d.id=n.resource_id AND d.user_id=n.user_id AND d.status='rejected')"
+                    ") GROUP BY n.resource_type,n.resource_id)",
+                    (user_id,),
+                ).fetchone()[0]
+            )
+            items = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT id,kind,title,message,action_url,resource_type,resource_id,created_at,read_at "
+                    "FROM user_notifications WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
+                    (user_id, bounded, bounded_offset),
+                )
+            ]
+            for resource_type, table in (
+                ("deconstruction", "deconstruction_uploads"),
+                ("novel", "novel_submissions"),
+            ):
+                resource_ids = [
+                    str(item["resource_id"])
+                    for item in items
+                    if item.get("resource_type") == resource_type
+                    and item.get("resource_id")
+                ]
+                if not resource_ids:
+                    continue
+                placeholders = ",".join("?" for _ in resource_ids)
+                title_column = (
+                    "original_filename" if resource_type == "deconstruction" else "title"
+                )
+                resources = {
+                    str(row["id"]): {
+                        "status": str(row["status"]),
+                        "title": str(row["resource_title"] or "").strip(),
+                    }
+                    for row in connection.execute(
+                        f"SELECT id,status,{title_column} AS resource_title FROM {table} "
+                        f"WHERE user_id=? AND id IN ({placeholders})",
+                        (user_id, *resource_ids),
+                    )
+                }
+                for item in items:
+                    if item.get("resource_type") == resource_type:
+                        resource = resources.get(str(item.get("resource_id") or ""), {})
+                        item["resource_status"] = resource.get("status", "")
+                        item["resource_title"] = resource.get("title", "")
+        return {
+            "items": items,
+            "unread_count": unread,
+            "action_required_count": action_required,
+            "total_count": total,
+        }
 
-    def mark_notification_read(self, user_id: str, notification_id: str | None = None) -> int:
+    def mark_notification_read(
+        self, user_id: str, notification_id: str | None = None
+    ) -> int:
         now = iso()
         with self._connect() as connection:
             if notification_id:
@@ -1999,9 +2457,18 @@ class AccountStore:
                 "(id,user_id,title,author,category,serialization_status,summary,source,authorization,"
                 "manuscript_filename,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    submission_id, user_id, metadata["title"], metadata["author"],
-                    metadata["category"], metadata["serialization_status"], metadata["summary"],
-                    metadata["source"], metadata["authorization"], filename, "quarantined", iso(),
+                    submission_id,
+                    user_id,
+                    metadata["title"],
+                    metadata["author"],
+                    metadata["category"],
+                    metadata["serialization_status"],
+                    metadata["summary"],
+                    metadata["source"],
+                    metadata["authorization"],
+                    filename,
+                    "quarantined",
+                    iso(),
                 ),
             )
         return submission_id
@@ -2022,13 +2489,21 @@ class AccountStore:
                 "UPDATE novel_submissions SET manuscript_path=?,cover_path=?,bytes=?,sha256=?,"
                 "scanner_result=?,status='ai_pending' WHERE id=? AND user_id=? AND status='quarantined'",
                 (
-                    manuscript_path, cover_path, int(size), digest,
-                    json.dumps(scanner, ensure_ascii=False, separators=(",", ":"))[:20_000],
-                    submission_id, user_id,
+                    manuscript_path,
+                    cover_path,
+                    int(size),
+                    digest,
+                    json.dumps(scanner, ensure_ascii=False, separators=(",", ":"))[
+                        :20_000
+                    ],
+                    submission_id,
+                    user_id,
                 ),
             )
 
-    def reject_novel_submission(self, submission_id: str, user_id: str, reason: str) -> None:
+    def reject_novel_submission(
+        self, submission_id: str, user_id: str, reason: str
+    ) -> None:
         with self._connect() as connection:
             connection.execute(
                 "UPDATE novel_submissions SET status='rejected',rejection_reason=?,reviewed_at=? "
@@ -2038,15 +2513,22 @@ class AccountStore:
 
     def novel_submissions(self, user_id: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
-            rows = [dict(row) for row in connection.execute(
-                "SELECT id,title,author,category,serialization_status,summary,source,status,bytes,"
-                "rejection_reason,review_result,created_at,reviewed_at,completed_at,handoff_manifest "
-                "FROM novel_submissions WHERE user_id=? ORDER BY created_at DESC LIMIT 200",
-                (user_id,),
-            )]
+            rows = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT id,title,author,category,serialization_status,summary,source,status,bytes,"
+                    "rejection_reason,review_result,created_at,reviewed_at,completed_at,handoff_manifest "
+                    "FROM novel_submissions WHERE user_id=? ORDER BY created_at DESC LIMIT 200",
+                    (user_id,),
+                )
+            ]
         for row in rows:
             try:
-                row["review_result"] = json.loads(row["review_result"]) if row.get("review_result") else None
+                row["review_result"] = (
+                    json.loads(row["review_result"])
+                    if row.get("review_result")
+                    else None
+                )
             except (TypeError, ValueError, json.JSONDecodeError):
                 row["review_result"] = None
             row["handoff_ready"] = bool(row.pop("handoff_manifest", None))
@@ -2065,18 +2547,32 @@ class AccountStore:
             if not row:
                 connection.commit()
                 return None
-            table = "deconstruction_uploads" if row["submission_type"] == "deconstruction" else "novel_submissions"
+            table = (
+                "deconstruction_uploads"
+                if row["submission_type"] == "deconstruction"
+                else "novel_submissions"
+            )
             connection.execute(
                 f"UPDATE {table} SET status='reviewing' WHERE id=? AND status='ai_pending'",
                 (row["id"],),
             )
-            payload = dict(connection.execute(f"SELECT * FROM {table} WHERE id=?", (row["id"],)).fetchone())
+            payload = dict(
+                connection.execute(
+                    f"SELECT * FROM {table} WHERE id=?", (row["id"],)
+                ).fetchone()
+            )
             connection.commit()
         payload["submission_type"] = row["submission_type"]
         return payload
 
-    def release_review(self, submission_type: str, submission_id: str, reason: str) -> None:
-        table = "deconstruction_uploads" if submission_type == "deconstruction" else "novel_submissions"
+    def release_review(
+        self, submission_type: str, submission_id: str, reason: str
+    ) -> None:
+        table = (
+            "deconstruction_uploads"
+            if submission_type == "deconstruction"
+            else "novel_submissions"
+        )
         with self._connect() as connection:
             if table == "deconstruction_uploads":
                 connection.execute(
@@ -2099,14 +2595,19 @@ class AccountStore:
         *,
         handoff_manifest: str = "",
     ) -> dict[str, Any] | None:
-        table = "deconstruction_uploads" if submission_type == "deconstruction" else "novel_submissions"
+        table = (
+            "deconstruction_uploads"
+            if submission_type == "deconstruction"
+            else "novel_submissions"
+        )
         approved = result.get("decision") == "approve"
         status = "approved" if approved else "rejected"
         reason = "" if approved else str(result.get("reason") or "审核未通过")[:2000]
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                f"SELECT user_id FROM {table} WHERE id=? AND status='reviewing'", (submission_id,)
+                f"SELECT user_id FROM {table} WHERE id=? AND status='reviewing'",
+                (submission_id,),
             ).fetchone()
             if not row:
                 connection.rollback()
@@ -2115,8 +2616,14 @@ class AccountStore:
                 f"UPDATE {table} SET status=?,review_result=?,rejection_reason=?,reviewed_at=?,handoff_manifest=? "
                 "WHERE id=? AND status='reviewing'",
                 (
-                    status, json.dumps(result, ensure_ascii=False, separators=(",", ":"))[:20_000],
-                    reason, iso(), handoff_manifest[:2000], submission_id,
+                    status,
+                    json.dumps(result, ensure_ascii=False, separators=(",", ":"))[
+                        :20_000
+                    ],
+                    reason,
+                    iso(),
+                    handoff_manifest[:2000],
+                    submission_id,
                 ),
             )
             connection.commit()
@@ -2128,36 +2635,51 @@ class AccountStore:
         records: list[dict[str, Any]] = []
         with self._connect() as connection:
             for submission_type, table in (
-                ("deconstruction", "deconstruction_uploads"), ("novel", "novel_submissions")
+                ("deconstruction", "deconstruction_uploads"),
+                ("novel", "novel_submissions"),
             ):
+                title_column = (
+                    "original_filename" if submission_type == "deconstruction" else "title"
+                )
                 rows = connection.execute(
-                    f"SELECT id,user_id,status,handoff_manifest FROM {table} "
+                    f"SELECT id,user_id,status,handoff_manifest,{title_column} AS resource_title FROM {table} "
                     f"WHERE handoff_manifest IS NOT NULL AND handoff_manifest!='' "
                     f"AND status='approved'{where} LIMIT 200",
                     params,
                 )
-                records.extend({**dict(row), "submission_type": submission_type} for row in rows)
+                records.extend(
+                    {**dict(row), "submission_type": submission_type} for row in rows
+                )
         return records
 
     def complete_handoff(
         self, submission_type: str, submission_id: str, result: dict[str, Any]
     ) -> dict[str, str] | None:
-        table = "deconstruction_uploads" if submission_type == "deconstruction" else "novel_submissions"
+        table = (
+            "deconstruction_uploads"
+            if submission_type == "deconstruction"
+            else "novel_submissions"
+        )
         succeeded = str(result.get("status") or "").casefold() == "completed"
         status = "completed" if succeeded else "rejected"
-        message = str(result.get("message") or (
-            "投稿已入库" if succeeded else "入库阶段未通过"
-        ))[:2000]
+        message = str(
+            result.get("message") or ("投稿已入库" if succeeded else "入库阶段未通过")
+        )[:2000]
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                f"SELECT user_id FROM {table} WHERE id=? AND status='approved'", (submission_id,)
+                f"SELECT user_id FROM {table} WHERE id=? AND status='approved'",
+                (submission_id,),
             ).fetchone()
             if not row:
                 connection.rollback()
                 return None
             extra = ""
-            values: list[Any] = [status, iso() if succeeded else None, "" if succeeded else message]
+            values: list[Any] = [
+                status,
+                iso() if succeeded else None,
+                "" if succeeded else message,
+            ]
             if table == "deconstruction_uploads":
                 extra = ",output_slug=?"
                 values.append(str(result.get("output_slug") or "")[:160])
@@ -2167,6 +2689,119 @@ class AccountStore:
             )
             connection.commit()
         return {"user_id": str(row["user_id"]), "status": status, "message": message}
+
+    def deconstruction_engagement(
+        self, slugs: list[str], *, viewer_user_id: str | None = None
+    ) -> dict[str, dict[str, Any]]:
+        normalized = list(
+            dict.fromkeys(str(value or "").strip()[:160] for value in slugs)
+        )[:500]
+        normalized = [value for value in normalized if value]
+        if not normalized:
+            return {}
+        placeholders = ",".join("?" for _ in normalized)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT slug,COUNT(*) AS like_count FROM deconstruction_likes "
+                f"WHERE slug IN ({placeholders}) GROUP BY slug",
+                normalized,
+            ).fetchall()
+            liked: set[str] = set()
+            if viewer_user_id:
+                liked = {
+                    str(row["slug"])
+                    for row in connection.execute(
+                        f"SELECT slug FROM deconstruction_likes WHERE user_id=? "
+                        f"AND slug IN ({placeholders})",
+                        (str(viewer_user_id), *normalized),
+                    ).fetchall()
+                }
+            download_rows = connection.execute(
+                f"SELECT slug,download_count FROM deconstruction_download_metrics "
+                f"WHERE slug IN ({placeholders})",
+                normalized,
+            ).fetchall()
+        counts = {str(row["slug"]): int(row["like_count"]) for row in rows}
+        downloads = {
+            str(row["slug"]): int(row["download_count"])
+            for row in download_rows
+        }
+        return {
+            slug: {
+                "like_count": counts.get(slug, 0),
+                "viewer_liked": slug in liked,
+                "download_count": downloads.get(slug, 0),
+            }
+            for slug in normalized
+        }
+
+    def deconstruction_download_counts(
+        self, slugs: list[str] | tuple[str, ...]
+    ) -> dict[str, int]:
+        normalized = tuple(dict.fromkeys(str(slug) for slug in slugs if str(slug)))
+        if not normalized:
+            return {}
+        placeholders = ",".join("?" for _ in normalized)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT slug,download_count FROM deconstruction_download_metrics "
+                f"WHERE slug IN ({placeholders})",
+                normalized,
+            ).fetchall()
+        result = {slug: 0 for slug in normalized}
+        result.update(
+            {str(row["slug"]): int(row["download_count"]) for row in rows}
+        )
+        return result
+
+    def increment_deconstruction_download(self, slug: str) -> int:
+        normalized = str(slug or "").strip()
+        if not normalized or len(normalized) > 160 or normalized.startswith("."):
+            raise AccountError("拆书档案标识无效", 422)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "INSERT INTO deconstruction_download_metrics"
+                "(slug,download_count,updated_at) VALUES(?,1,?) "
+                "ON CONFLICT(slug) DO UPDATE SET "
+                "download_count=download_count+1,updated_at=excluded.updated_at "
+                "RETURNING download_count",
+                (normalized, iso()),
+            ).fetchone()
+            connection.commit()
+        return int(row["download_count"])
+
+    def toggle_deconstruction_like(self, user_id: str, slug: str) -> dict[str, Any]:
+        normalized = str(slug or "").strip()[:160]
+        if not normalized:
+            raise AccountError("拆书档案不存在", 404)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT 1 FROM deconstruction_likes WHERE slug=? AND user_id=?",
+                (normalized, str(user_id)),
+            ).fetchone()
+            if existing:
+                connection.execute(
+                    "DELETE FROM deconstruction_likes WHERE slug=? AND user_id=?",
+                    (normalized, str(user_id)),
+                )
+                liked = False
+            else:
+                connection.execute(
+                    "INSERT INTO deconstruction_likes(slug,user_id,created_at) "
+                    "VALUES(?,?,?)",
+                    (normalized, str(user_id), iso()),
+                )
+                liked = True
+            count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM deconstruction_likes WHERE slug=?",
+                    (normalized,),
+                ).fetchone()[0]
+            )
+            connection.commit()
+        return {"slug": normalized, "liked": liked, "like_count": count}
 
     def record_admin_audit(
         self,
@@ -2182,9 +2817,14 @@ class AccountStore:
                 "(id,actor_user_id,action,resource_type,resource_id,detail,created_at) "
                 "VALUES(?,?,?,?,?,?,?)",
                 (
-                    str(uuid.uuid4()), str(actor_user_id), str(action)[:80],
-                    str(resource_type)[:40], str(resource_id)[:160],
-                    json.dumps(detail or {}, ensure_ascii=False, separators=(",", ":"))[:4000],
+                    str(uuid.uuid4()),
+                    str(actor_user_id),
+                    str(action)[:80],
+                    str(resource_type)[:40],
+                    str(resource_id)[:160],
+                    json.dumps(detail or {}, ensure_ascii=False, separators=(",", ":"))[
+                        :4000
+                    ],
                     iso(),
                 ),
             )
@@ -2192,8 +2832,7 @@ class AccountStore:
     def admin_summary(self) -> dict[str, int]:
         with self._connect() as connection:
             user = connection.execute(
-                "SELECT COUNT(*) total,SUM(status='active') active "
-                "FROM users"
+                "SELECT COUNT(*) total,SUM(status='active') active FROM users"
             ).fetchone()
             invites = connection.execute(
                 "SELECT COUNT(*) total,SUM(disabled_at IS NULL AND (expires_at IS NULL OR expires_at>?) "
@@ -2226,8 +2865,14 @@ class AccountStore:
         params: list[Any] = []
         cleaned = " ".join(str(query or "").split())[:100]
         if cleaned:
-            conditions.append("(u.email LIKE ? ESCAPE '\\' OR u.display_name LIKE ? ESCAPE '\\')")
-            needle = "%" + cleaned.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            conditions.append(
+                "(u.email LIKE ? ESCAPE '\\' OR u.display_name LIKE ? ESCAPE '\\')"
+            )
+            needle = (
+                "%"
+                + cleaned.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                + "%"
+            )
             params.extend((needle, needle))
         if status in {"active", "disabled"}:
             conditions.append("u.status=?")
@@ -2236,9 +2881,11 @@ class AccountStore:
         page_size = min(max(int(page_size), 1), 100)
         page = max(int(page), 1)
         with self._connect() as connection:
-            total = int(connection.execute(
-                f"SELECT COUNT(*) FROM users u{where}", tuple(params)
-            ).fetchone()[0])
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM users u{where}", tuple(params)
+                ).fetchone()[0]
+            )
             rows = connection.execute(
                 "SELECT u.id,u.email,u.display_name,u.status,u.role,u.email_verified_at,"
                 "u.created_at,u.last_login_at,COALESCE(t.active_seconds,0) active_seconds,"
@@ -2249,7 +2896,10 @@ class AccountStore:
                 (iso(), *params, page_size, (page - 1) * page_size),
             ).fetchall()
         return {
-            "items": [dict(row) | {"email_verified": bool(row["email_verified_at"])} for row in rows],
+            "items": [
+                dict(row) | {"email_verified": bool(row["email_verified_at"])}
+                for row in rows
+            ],
             "page": page,
             "page_size": page_size,
             "total": total,
@@ -2268,10 +2918,12 @@ class AccountStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             actor = connection.execute(
-                "SELECT role FROM users WHERE id=? AND status='active'", (str(actor_user_id),)
+                "SELECT role FROM users WHERE id=? AND status='active'",
+                (str(actor_user_id),),
             ).fetchone()
             target = connection.execute(
-                "SELECT id,email,display_name,status,role FROM users WHERE id=?", (str(user_id),)
+                "SELECT id,email,display_name,status,role FROM users WHERE id=?",
+                (str(user_id),),
             ).fetchone()
             if not actor or actor["role"] not in {"admin", "owner"}:
                 connection.rollback()
@@ -2293,8 +2945,10 @@ class AccountStore:
                 )
             connection.commit()
         return {
-            "id": str(target["id"]), "email": str(target["email"]),
-            "display_name": str(target["display_name"]), "status": status,
+            "id": str(target["id"]),
+            "email": str(target["email"]),
+            "display_name": str(target["display_name"]),
+            "status": status,
             "role": str(target["role"]),
         }
 
@@ -2312,7 +2966,9 @@ class AccountStore:
                     (str(uuid.uuid4()), source, source, (index + 1) * 10, now, now),
                 )
 
-    def managed_categories(self, *, include_disabled: bool = False) -> list[dict[str, Any]]:
+    def managed_categories(
+        self, *, include_disabled: bool = False
+    ) -> list[dict[str, Any]]:
         where = "" if include_disabled else " WHERE enabled=1"
         with self._connect() as connection:
             rows = connection.execute(
@@ -2320,13 +2976,19 @@ class AccountStore:
                 f"created_at,updated_at FROM managed_categories{where} "
                 "ORDER BY sort_order,display_name,id"
             ).fetchall()
-        return [dict(row) | {"enabled": bool(row["enabled"]), "is_custom": bool(row["is_custom"])} for row in rows]
+        return [
+            dict(row)
+            | {"enabled": bool(row["enabled"]), "is_custom": bool(row["is_custom"])}
+            for row in rows
+        ]
 
     def create_managed_category(
         self, name: str, *, description: str = "", sort_order: int = 100
     ) -> dict[str, Any]:
         display = " ".join(unicodedata.normalize("NFKC", str(name or "")).split())
-        description = " ".join(unicodedata.normalize("NFKC", str(description or "")).split())
+        description = " ".join(
+            unicodedata.normalize("NFKC", str(description or "")).split()
+        )
         if not 1 <= len(display) <= 40 or len(description) > 240:
             raise AccountError("分类名称或简介长度无效", 422)
         category_id = str(uuid.uuid4())
@@ -2337,7 +2999,15 @@ class AccountStore:
                     "INSERT INTO managed_categories"
                     "(id,source_name,display_name,description,sort_order,is_custom,created_at,updated_at) "
                     "VALUES(?,?,?,?,?,1,?,?)",
-                    (category_id, display, display, description, min(max(int(sort_order), 0), 10000), now, now),
+                    (
+                        category_id,
+                        display,
+                        display,
+                        description,
+                        min(max(int(sort_order), 0), 10000),
+                        now,
+                        now,
+                    ),
                 )
         except sqlite3.IntegrityError as exc:
             raise AccountError("该分类已经存在", 409) from exc
@@ -2347,11 +3017,15 @@ class AccountStore:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT id,source_name,display_name,description,enabled,sort_order,is_custom,"
-                "created_at,updated_at FROM managed_categories WHERE id=?", (str(category_id),)
+                "created_at,updated_at FROM managed_categories WHERE id=?",
+                (str(category_id),),
             ).fetchone()
         if not row:
             raise AccountError("分类不存在", 404)
-        return dict(row) | {"enabled": bool(row["enabled"]), "is_custom": bool(row["is_custom"])}
+        return dict(row) | {
+            "enabled": bool(row["enabled"]),
+            "is_custom": bool(row["is_custom"]),
+        }
 
     def update_managed_category(
         self,
@@ -2362,15 +3036,26 @@ class AccountStore:
         enabled: bool,
         sort_order: int,
     ) -> dict[str, Any]:
-        display = " ".join(unicodedata.normalize("NFKC", str(display_name or "")).split())
-        description = " ".join(unicodedata.normalize("NFKC", str(description or "")).split())
+        display = " ".join(
+            unicodedata.normalize("NFKC", str(display_name or "")).split()
+        )
+        description = " ".join(
+            unicodedata.normalize("NFKC", str(description or "")).split()
+        )
         if not 1 <= len(display) <= 40 or len(description) > 240:
             raise AccountError("分类名称或简介长度无效", 422)
         with self._connect() as connection:
             cursor = connection.execute(
                 "UPDATE managed_categories SET display_name=?,description=?,enabled=?,sort_order=?,updated_at=? "
                 "WHERE id=?",
-                (display, description, int(bool(enabled)), min(max(int(sort_order), 0), 10000), iso(), str(category_id)),
+                (
+                    display,
+                    description,
+                    int(bool(enabled)),
+                    min(max(int(sort_order), 0), 10000),
+                    iso(),
+                    str(category_id),
+                ),
             )
         if cursor.rowcount != 1:
             raise AccountError("分类不存在", 404)
@@ -2379,7 +3064,9 @@ class AccountStore:
     def delete_managed_category(self, category_id: str) -> dict[str, Any]:
         category = self.managed_category(category_id)
         with self._connect() as connection:
-            connection.execute("DELETE FROM managed_categories WHERE id=?", (str(category_id),))
+            connection.execute(
+                "DELETE FROM managed_categories WHERE id=?", (str(category_id),)
+            )
         return category
 
     def mark_admin_novel_submission(self, submission_id: str, user_id: str) -> None:
@@ -2394,7 +3081,8 @@ class AccountStore:
                 "WHERE id=? AND user_id=? AND status='ai_pending'",
                 (
                     json.dumps(result, ensure_ascii=False, separators=(",", ":")),
-                    str(submission_id), str(user_id),
+                    str(submission_id),
+                    str(user_id),
                 ),
             )
         if cursor.rowcount != 1:

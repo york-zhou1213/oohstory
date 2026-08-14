@@ -2,7 +2,7 @@
 
 Migration date: 2026-08-03
 
-Source workspace: `/opt/legacy-webnovel-writer`
+Source workspace: `/opt/oohstory-admin`
 
 Source base commit: `0c7340df3783dd332c2f6ecf55a608c0e0f80708`
 
@@ -79,7 +79,7 @@ zlibrary_provider
   `/srv/oohstory/library` data tree. Data is not copied into Git.
 
 The default library root is
-`<oohstory-backend>/electronic-library/txt80`. `OOHSTORY_LIBRARY_*`
+`<oohstory-backend>/electronic-library`. `OOHSTORY_LIBRARY_*`
 environment variables take precedence; legacy `WEBNOVEL_*` variables remain
 accepted only for transition compatibility.
 

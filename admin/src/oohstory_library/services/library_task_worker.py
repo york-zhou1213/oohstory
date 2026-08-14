@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import argparse
 import json
 import os
@@ -10,22 +12,22 @@ import select
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from oohstory_library.services.codex_cli import codex_env, ensure_codex_cli  # noqa: E402
-from oohstory_library.services.electronic_library import ElectronicLibraryService  # noqa: E402
-from oohstory_library.services.library_task_runners import (  # noqa: E402
+from oohstory_library.services.codex_cli import codex_env, ensure_codex_cli
+from oohstory_library.services.electronic_library import ElectronicLibraryService
+from oohstory_library.services.library_task_runners import (
     cli_runtime_env,
     ensure_openclaw_task_agent,
     find_cli,
     openclaw_session_lineage_state,
     rotate_openclaw_session,
 )
-from oohstory_library.services.oh_story_contracts import (  # noqa: E402
+from oohstory_library.services.oh_story_contracts import (
     has_resume_checkpoint,
     long_pipeline_stages,
     project_long_contract_failures,
@@ -73,7 +75,7 @@ LONG_BOUNDARY_SNAPSHOT = ".webnovel-chapter-boundaries.md"
 
 
 def now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _long_boundary_section(progress_text: str) -> str:
@@ -515,7 +517,7 @@ def detect_progress(output_dir: Path, pipeline: str) -> tuple[int, str]:
                 if completed:
                     stage = max(completed)
                     return min(95, 15 + stage * 13), f"Stage {stage} 已完成"
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 pass
         if (output_dir / "写作手法.md").exists():
             return 72, "Stage 4：写作手法"
@@ -688,7 +690,7 @@ Stage 3/4 条件产物验收规则：
 10. 本任务唯一授权 AI 模型：{selected_model}。主会话、章节提取、块级聚合和任何子会话都必须使用该模型。
 11. 调用 sessions_spawn 时必须显式传入 `model: "{selected_model}"`；禁止省略 model，禁止改用默认模型，禁止使用任何 fallback。
 12. 如果该模型暂时不可用或额度不足，立即停止并保留断点；严禁回落到 ChatGPT、Claude、Gemini 或其他模型。
-13. 技能文件的唯一允许入口是 `/opt/oohstory/skills/{'story-short-analyze' if pipeline == 'short' else 'story-long-analyze'}/SKILL.md`；禁止用 `find /`、`find /mnt` 或其他全盘扫描寻找技能。
+13. 技能文件的唯一允许入口是 `/opt/oohstory-agent-skills/{'story-short-analyze' if pipeline == 'short' else 'story-long-analyze'}/SKILL.md`；禁止用 `find /`、`find /mnt` 或其他全盘扫描寻找技能。
 14. 文件发现只能限定在原文只读软链接、唯一输出目录、上述精确技能目录和技能明确引用的资源内；禁止遍历工作区、整座电子书库、根目录或其他挂载点。
 {optional_artifact_instruction}
 
@@ -710,7 +712,7 @@ def codex_logged_in(codex: str) -> bool:
         )
         text = f"{result.stdout}\n{result.stderr}".lower()
         return result.returncode == 0 and "logged in" in text and "not logged in" not in text
-    except Exception:
+    except RECOVERABLE_OPERATION_ERRORS:
         return False
 
 
@@ -891,7 +893,7 @@ def delete_completed_openclaw_session(
             text=True,
             timeout=25,
         )
-    except Exception as exc:
+    except RECOVERABLE_OPERATION_ERRORS as exc:
         task["ai_session_cleanup"] = "error"
         task["ai_session_cleanup_error"] = str(exc)[:500]
         return
@@ -1477,7 +1479,7 @@ def run(task_file: Path) -> int:
         delete_completed_openclaw_session(task, runner)
         write_task(task_file, task)
         return 0
-    except Exception as exc:
+    except RECOVERABLE_OPERATION_ERRORS as exc:
         task = read_task(task_file)
         failure_context = f"{exc}\n{current_run_log_tail(log_path)}"
         token_exhausted = is_token_exhaustion(failure_context)

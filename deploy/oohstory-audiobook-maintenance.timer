@@ -1,0 +1,12 @@
+[Unit]
+Description=Run OOH Story audiobook maintenance every 15 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+RandomizedDelaySec=2min
+Persistent=true
+Unit=oohstory-audiobook-maintenance.service
+
+[Install]
+WantedBy=timers.target

@@ -25,7 +25,7 @@ class ForbiddenBodyStore:
 
 
 def service_for(tmp_path: Path) -> tuple[ElectronicLibraryService, FakeCatalog]:
-    library_root = tmp_path / "txt80"
+    library_root = tmp_path / "electronic-library"
     (library_root / "书籍" / "科幻小说").mkdir(parents=True)
     service = ElectronicLibraryService.__new__(ElectronicLibraryService)
     service.library_root = library_root.resolve()
@@ -65,7 +65,7 @@ def test_import_rejects_body_outside_categorized_books_root(tmp_path: Path):
     body.parent.mkdir()
     body.write_text("旧副本", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="txt80/书籍"):
+    with pytest.raises(ValueError, match="电子书库根目录的书籍"):
         service._insert_imported_catalog_row(
             source_id="txt80-74",
             title="错误路径",
@@ -83,7 +83,7 @@ def test_import_rejects_body_outside_categorized_books_root(tmp_path: Path):
     ("body/aa/bb/file.txt", "/书籍/科幻小说/a.txt", "书籍/../body/a.txt"),
 )
 def test_mysql_catalog_rejects_noncanonical_body_keys(object_key: str):
-    with pytest.raises(ValueError, match="txt80/书籍"):
+    with pytest.raises(ValueError, match="电子书库根目录的书籍"):
         MySQLCatalogStore._canonical_body_object_key(object_key)
 
 
@@ -91,7 +91,7 @@ def test_nas_object_store_rejects_body_copies(tmp_path: Path):
     source = tmp_path / "source.txt"
     source.write_text("正文", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="txt80/书籍"):
+    with pytest.raises(ValueError, match="电子书库根目录的书籍"):
         NasObjectStore(tmp_path / "objects").put_file(
             source,
             asset_type="body",

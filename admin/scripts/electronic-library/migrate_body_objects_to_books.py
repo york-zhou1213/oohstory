@@ -46,7 +46,7 @@ BODY_KEY = re.compile(
     r"^body/([0-9a-f]{2})/([0-9a-f]{2})/([0-9a-f]{64})\.txt$"
 )
 MYSQL_LOCK = "oohstory:body-to-categorized-books:v1"
-DEFAULT_ROOT = Path("/srv/oohstory/library/txt80")
+DEFAULT_ROOT = Path("/srv/oohstory/library")
 
 
 class MigrationError(RuntimeError):
@@ -159,7 +159,7 @@ def _canonical_file(root: Path, raw_path: Any) -> Path:
         resolved = candidate.resolve(strict=True)
         resolved.relative_to((root / "书籍").resolve(strict=True))
     except (FileNotFoundError, ValueError) as exc:
-        raise MigrationError("分类正文不存在或不在 txt80/书籍/ 内") from exc
+        raise MigrationError("分类正文不存在或不在电子书库根目录的书籍/内") from exc
     metadata = resolved.lstat()
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
         raise MigrationError("分类正文必须是真实普通文件")
@@ -628,7 +628,7 @@ def main() -> int:
     if settings.catalog_backend != "mysql":
         raise MigrationError("只允许在 MySQL catalog backend 执行")
     if settings.object_root.expanduser().resolve() != root:
-        raise MigrationError("MySQL object_root 与规范 txt80 根目录不一致")
+        raise MigrationError("MySQL object_root 与规范电子书库根目录不一致")
     pool = MySQLConnectionPool(settings)
     manifest_path = (
         args.manifest.expanduser()

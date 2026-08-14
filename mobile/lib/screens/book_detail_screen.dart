@@ -6,6 +6,8 @@ import '../services/account_service.dart';
 import '../models/book.dart';
 import '../theme/app_theme.dart';
 import '../widgets/recommendation_donation_dialog.dart';
+import '../widgets/user_content_notice_dialog.dart';
+import '../utils/user_content_guard.dart';
 import 'reader_screen.dart';
 import 'volume_detail_screen.dart';
 import 'auth_screen.dart';
@@ -27,6 +29,7 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
   List<Volume> _volumes = [];
   bool _loading = true;
   bool _catalogExpanded = false;
+  bool _chaptersReversed = false;
   bool _descExpanded = false;
   bool _isFavorite = false;
   bool _inCloudShelf = false;
@@ -36,6 +39,10 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
   bool _downloading = false;
   int _downloadedCount = 0;
   ReadingProgress? _savedProgress;
+  final _commentController = TextEditingController();
+  List<Map<String, dynamic>> _bookComments = [];
+  bool _postingComment = false;
+  final Set<String> _likingComments = {};
 
   @override
   void initState() {
@@ -51,6 +58,7 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
         _api.getBook(widget.bookId),
         _api.getChapterCatalog(widget.bookId),
         _api.getBookMetrics(widget.bookId),
+        AccountService.instance.bookComments(widget.bookId),
       ]);
       Map<String, dynamic>? recommendation;
       if (AccountService.instance.isSignedIn) {
@@ -78,10 +86,87 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
           );
           _downloadedCount = _storage.downloadedChapterCount(widget.bookId);
           _savedProgress = _progress.get(widget.bookId);
+          _bookComments =
+              ((results[3] as Map<String, dynamic>)['comments'] as List? ??
+                      const [])
+                  .whereType<Map>()
+                  .map((item) => Map<String, dynamic>.from(item))
+                  .toList();
         });
       }
     } catch (_) {
       if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _refreshBookComments() async {
+    final data = await AccountService.instance.bookComments(widget.bookId);
+    if (!mounted) return;
+    setState(() {
+      _bookComments = (data['comments'] as List? ?? const [])
+          .whereType<Map>()
+          .map((item) => Map<String, dynamic>.from(item))
+          .toList();
+    });
+  }
+
+  Future<void> _postBookComment() async {
+    if (!AccountService.instance.isSignedIn) {
+      final signedIn = await Navigator.of(
+        context,
+      ).push<bool>(MaterialPageRoute(builder: (_) => const AuthScreen()));
+      if (signedIn != true || !mounted) return;
+    }
+    final content = _commentController.text.trim();
+    if (content.isEmpty || _postingComment) return;
+    final issue = UserContentGuard.issue(content);
+    if (issue != null) {
+      await showUserContentNoticeDialog(context, issue: issue);
+      return;
+    }
+    setState(() => _postingComment = true);
+    try {
+      await AccountService.instance.createBookComment(
+        bookId: widget.bookId,
+        content: content,
+      );
+      _commentController.clear();
+      await _refreshBookComments();
+    } on AccountException catch (error) {
+      if (!mounted) return;
+      if (UserContentGuard.isModerationMessage(error.message)) {
+        await showUserContentNoticeDialog(context, issue: error.message);
+      } else {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.message)));
+      }
+    } finally {
+      if (mounted) setState(() => _postingComment = false);
+    }
+  }
+
+  Future<void> _likeBookComment(Map<String, dynamic> comment) async {
+    if (!AccountService.instance.isSignedIn) {
+      final signedIn = await Navigator.of(
+        context,
+      ).push<bool>(MaterialPageRoute(builder: (_) => const AuthScreen()));
+      if (signedIn != true || !mounted) return;
+    }
+    final id = comment['id'] as String? ?? '';
+    if (id.isEmpty || _likingComments.contains(id)) return;
+    setState(() => _likingComments.add(id));
+    try {
+      await AccountService.instance.addBookCommentLike(id);
+      await _refreshBookComments();
+    } on AccountException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.message)));
+      }
+    } finally {
+      if (mounted) setState(() => _likingComments.remove(id));
     }
   }
 
@@ -195,7 +280,9 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
     setState(() => _downloading = true);
 
     int downloaded = 0;
+    bool rateLimited = false;
     for (final ch in _chapters) {
+      if (!mounted) break;
       if (_storage.isChapterDownloaded(_book!.id, ch.id)) {
         downloaded++;
         continue;
@@ -207,13 +294,23 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
           downloaded++;
           if (mounted) setState(() => _downloadedCount = downloaded);
         }
+        await Future.delayed(const Duration(milliseconds: 200));
+      } on ApiException catch (e) {
+        if (e.statusCode == 429) {
+          rateLimited = true;
+          break;
+        }
       } catch (_) {}
     }
     if (mounted) {
       setState(() => _downloading = false);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('下载完成，共$downloaded章'),
+          content: Text(
+            rateLimited
+                ? '下载暂停（请求过快），已下载$downloaded章，稍后可继续'
+                : '下载完成，共$downloaded章',
+          ),
           behavior: SnackBarBehavior.floating,
         ),
       );
@@ -272,6 +369,7 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
             SliverToBoxAdapter(child: _buildDescription(theme, book)),
           SliverToBoxAdapter(child: _buildChapterHeader(theme)),
           _buildChapterList(theme),
+          SliverToBoxAdapter(child: _buildBookComments(theme)),
           const SliverToBoxAdapter(child: SizedBox(height: 100)),
         ],
       ),
@@ -524,6 +622,191 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
     );
   }
 
+  Widget _buildBookComments(ThemeData theme) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 20, 20, 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(
+                '读者评论',
+                style: theme.textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: AppTheme.seedPurple.withValues(alpha: .1),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  '${_bookComments.length} 条',
+                  style: TextStyle(fontSize: 11, color: AppTheme.seedPurple),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          if (_bookComments.isEmpty)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(22),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.surfaceContainerHighest.withValues(
+                  alpha: .35,
+                ),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: const Column(
+                children: [
+                  Text('💬', style: TextStyle(fontSize: 28)),
+                  SizedBox(height: 6),
+                  Text('还没有书评，留下第一条阅读感受。'),
+                ],
+              ),
+            )
+          else
+            ..._bookComments.map((comment) {
+              final author = Map<String, dynamic>.from(
+                comment['author'] as Map? ?? const {},
+              );
+              final reading = Map<String, dynamic>.from(
+                author['reading'] as Map? ?? const {},
+              );
+              final displayName = author['display_name'] as String? ?? '读者';
+              final own = comment['is_own'] == true;
+              final viewerLikes =
+                  ((comment['viewer_like_count'] as num?)?.toInt() ?? 0).clamp(
+                    0,
+                    3,
+                  );
+              final likes = (comment['like_count'] as num?)?.toInt() ?? 0;
+              final id = comment['id'] as String? ?? '';
+              final created = DateTime.tryParse(
+                comment['created_at'] as String? ?? '',
+              )?.toLocal();
+              return Container(
+                width: double.infinity,
+                margin: const EdgeInsets.only(bottom: 10),
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  border: Border.all(
+                    color: theme.dividerColor.withValues(alpha: .6),
+                  ),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        CircleAvatar(
+                          radius: 17,
+                          backgroundColor: AppTheme.seedPurple.withValues(
+                            alpha: .12,
+                          ),
+                          child: Text(
+                            displayName.characters.isEmpty
+                                ? '读'
+                                : displayName.characters.first,
+                          ),
+                        ),
+                        const SizedBox(width: 9),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                displayName,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              Text(
+                                '${reading['roman'] ?? 'Ⅰ'} · ${reading['name'] ?? '只如初见'}',
+                                style: theme.textTheme.labelSmall,
+                              ),
+                            ],
+                          ),
+                        ),
+                        if (created != null)
+                          Text(
+                            '${created.month.toString().padLeft(2, '0')}-${created.day.toString().padLeft(2, '0')}',
+                            style: theme.textTheme.labelSmall,
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Text(
+                      comment['content'] as String? ?? '',
+                      style: const TextStyle(height: 1.65),
+                    ),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: TextButton.icon(
+                        onPressed:
+                            own ||
+                                viewerLikes >= 3 ||
+                                _likingComments.contains(id)
+                            ? null
+                            : () => _likeBookComment(comment),
+                        icon: const Icon(
+                          Icons.favorite_border_rounded,
+                          size: 18,
+                        ),
+                        label: Text(
+                          own
+                              ? '收到点赞 · $likes'
+                              : viewerLikes >= 3
+                              ? '已点满 3/3 · $likes'
+                              : viewerLikes > 0
+                              ? '再赞一次 $viewerLikes/3 · $likes'
+                              : '点赞 · $likes',
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _commentController,
+            minLines: 2,
+            maxLines: 4,
+            maxLength: 500,
+            decoration: InputDecoration(
+              hintText: AccountService.instance.isSignedIn
+                  ? '写下你对这本书的感受…'
+                  : '登录后发表评论',
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(14),
+              ),
+            ),
+          ),
+          Align(
+            alignment: Alignment.centerRight,
+            child: FilledButton.icon(
+              onPressed: _postingComment ? null : _postBookComment,
+              icon: _postingComment
+                  ? const SizedBox(
+                      width: 15,
+                      height: 15,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.send_rounded, size: 17),
+              label: Text(_postingComment ? '发布中…' : '发布评论'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildChapterHeader(ThemeData theme) {
     final label = _volumes.isNotEmpty
         ? '${_volumes.length}卷 · ${_chapters.length}章'
@@ -558,6 +841,22 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
           if (_volumes.isEmpty)
             TextButton.icon(
               onPressed: () =>
+                  setState(() => _chaptersReversed = !_chaptersReversed),
+              icon: Icon(
+                _chaptersReversed ? Icons.arrow_upward : Icons.arrow_downward,
+                size: 16,
+              ),
+              label: Text(
+                _chaptersReversed ? '倒序' : '正序',
+                style: const TextStyle(fontSize: 12),
+              ),
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+              ),
+            ),
+          if (_volumes.isEmpty)
+            TextButton.icon(
+              onPressed: () =>
                   setState(() => _catalogExpanded = !_catalogExpanded),
               icon: Icon(
                 _catalogExpanded ? Icons.unfold_less : Icons.unfold_more,
@@ -578,12 +877,14 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
 
   Widget _buildChapterList(ThemeData theme) {
     if (_volumes.isNotEmpty) return _buildVolumeList(theme);
+    final displayChapters =
+        _chaptersReversed ? _chapters.reversed.toList() : _chapters;
     final showCount = _catalogExpanded
-        ? _chapters.length
-        : _chapters.length.clamp(0, 20);
+        ? displayChapters.length
+        : displayChapters.length.clamp(0, 20);
     return SliverList(
       delegate: SliverChildBuilderDelegate((context, i) {
-        final ch = _chapters[i];
+        final ch = displayChapters[i];
         return Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12),
           child: ListTile(
@@ -909,6 +1210,7 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
 
   @override
   void dispose() {
+    _commentController.dispose();
     _api.dispose();
     super.dispose();
   }

@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import sys
 import threading
@@ -41,7 +42,7 @@ from urllib3.util.retry import Retry
 
 BASE_URL = "https://www.txt80.cc"
 from project_paths import APP_ROOT  # noqa: E402
-ROOT = APP_ROOT / "electronic-library" / "txt80"
+ROOT = APP_ROOT / "electronic-library"
 BOOK_ROOT = ROOT / "书籍"
 DB_PATH = ROOT / "catalog.sqlite3"
 CSV_PATH = ROOT / "catalog.csv"
@@ -50,19 +51,29 @@ USER_AGENT = (
     "+https://www.txt80.cc/; site-owner-test)"
 )
 LEGACY_LIBRARY_NOTICE = "本书为八零电子书(txt8080.com)"
-PUBLIC_DOMAIN = os.getenv("OOHSTORY_PUBLIC_DOMAIN", "reader.example.com").strip() or "reader.example.com"
-LEGACY_REBRANDED_NOTICE = f"本书为八零电子书({PUBLIC_DOMAIN})"
-PUBLIC_LIBRARY_NOTICE = f"本书为Ooh！好故事({PUBLIC_DOMAIN})"
+LEGACY_REBRANDED_NOTICE = "本书为八零电子书(reader.example.com)"
+PUBLIC_LIBRARY_NOTICE = "本书为Ooh！好故事(reader.example.com)"
 IXDZS_PROMOTIONAL_NOTICE = (
     "爱下电子书Txt版阅读,下载和分享更多电子书请访问，"
     "简体:https://ixdzs8.com,繁体:https://ixdzs8.tw,"
     "E-mail:support@ixdzs.com"
 )
-OOHSTORY_EBOOK_NOTICE = f"{PUBLIC_DOMAIN}，好故事电子书"
+OOHSTORY_EBOOK_NOTICE = "reader.example.com，好故事电子书"
 LEGACY_LIBRARY_DOMAIN_RE = re.compile(
     r"(?:(?:www\.)?txt80\.cc|(?:www\.)?txt02\.com|ohhstory\.com)",
     re.IGNORECASE,
 )
+
+# This machine can reach only one address from each Cloudflare pair reliably.
+# Returning the working route first avoids a long connect timeout per request.
+PREFERRED_IPS = {
+    "www.txt80.cc": ("172.67.199.148", "104.21.42.29"),
+    "txt80.cc": ("172.67.199.148", "104.21.42.29"),
+    "d.txt80.la": ("172.67.189.248", "104.21.89.166"),
+    "d.txt80.com": ("209.141.52.69",),
+}
+_ORIGINAL_GETADDRINFO = socket.getaddrinfo
+
 
 sys.path.insert(0, str(APP_ROOT / "src"))
 
@@ -77,6 +88,30 @@ from oohstory_library.services.library_database import (  # noqa: E402
 )
 from oohstory_library.services.library_download_queue import LibraryDownloadQueue  # noqa: E402
 from oohstory_library.services.library_runtime_mysql import MySQLLibraryRuntime  # noqa: E402
+
+
+def _preferred_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    ips = PREFERRED_IPS.get(str(host).lower())
+    if not ips:
+        return _ORIGINAL_GETADDRINFO(
+            host, port, family, type, proto, flags
+        )
+    answers = []
+    for ip in ips:
+        try:
+            answers.extend(
+                _ORIGINAL_GETADDRINFO(
+                    ip, port, socket.AF_INET, type, proto, flags
+                )
+            )
+        except OSError:
+            continue
+    return answers or _ORIGINAL_GETADDRINFO(
+        host, port, family, type, proto, flags
+    )
+
+
+socket.getaddrinfo = _preferred_getaddrinfo
 
 
 SCHEMA = """
@@ -973,7 +1008,7 @@ def normalize_txt_to_utf8(path: Path):
         .replace(LEGACY_LIBRARY_NOTICE, PUBLIC_LIBRARY_NOTICE)
         .replace(IXDZS_PROMOTIONAL_NOTICE, OOHSTORY_EBOOK_NOTICE)
     )
-    normalized = LEGACY_LIBRARY_DOMAIN_RE.sub(PUBLIC_DOMAIN, normalized)
+    normalized = LEGACY_LIBRARY_DOMAIN_RE.sub("reader.example.com", normalized)
     normalized = normalized.replace(
         LEGACY_REBRANDED_NOTICE,
         PUBLIC_LIBRARY_NOTICE,

@@ -52,13 +52,21 @@ class _BookshelfPageState extends State<BookshelfPage> {
       _refresh();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('已导入「${file.name.replaceAll(RegExp(r'\.(txt|TXT)$'), '')}」'), behavior: SnackBarBehavior.floating),
+          SnackBar(
+            content: Text(
+              '已导入「${file.name.replaceAll(RegExp(r'\.(txt|TXT)$'), '')}」',
+            ),
+            behavior: SnackBarBehavior.floating,
+          ),
         );
       }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('导入失败: $e'), behavior: SnackBarBehavior.floating),
+          SnackBar(
+            content: Text('导入失败: $e'),
+            behavior: SnackBarBehavior.floating,
+          ),
         );
       }
     }
@@ -71,7 +79,10 @@ class _BookshelfPageState extends State<BookshelfPage> {
         title: const Text('删除书籍'),
         content: Text('确定要从书架中删除「${book.title}」吗？'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
           FilledButton(
             onPressed: () async {
               await _storage.deleteLocalBook(book.id);
@@ -94,7 +105,10 @@ class _BookshelfPageState extends State<BookshelfPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('我的书架', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 17)),
+        title: Text(
+          '我的书架',
+          style: TextStyle(fontWeight: FontWeight.w700, fontSize: 17),
+        ),
         actions: [
           IconButton(onPressed: _import, icon: const Icon(Icons.add_rounded)),
         ],
@@ -102,72 +116,131 @@ class _BookshelfPageState extends State<BookshelfPage> {
       body: !_initialized
           ? const Center(child: CircularProgressIndicator())
           : _books.isEmpty
-              ? Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(Icons.shelves, size: 48, color: theme.colorScheme.onSurface.withValues(alpha: 0.15)),
-                      const SizedBox(height: 12),
-                      Text('书架空空如也', style: TextStyle(fontSize: 15, color: theme.colorScheme.onSurface.withValues(alpha: 0.4))),
-                      const SizedBox(height: 16),
-                      FilledButton.icon(
-                        onPressed: _import,
-                        icon: const Icon(Icons.add, size: 18),
-                        label: const Text('导入 TXT 小说'),
+          ? Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.shelves,
+                    size: 48,
+                    color: theme.colorScheme.onSurface.withValues(alpha: 0.15),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    '书架空空如也',
+                    style: TextStyle(
+                      fontSize: 15,
+                      color: theme.colorScheme.onSurface.withValues(alpha: 0.4),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  FilledButton.icon(
+                    onPressed: _import,
+                    icon: const Icon(Icons.add, size: 18),
+                    label: const Text('导入 TXT 小说'),
+                  ),
+                ],
+              ),
+            )
+          : ListView.builder(
+              padding: const EdgeInsets.all(16),
+              itemCount: _books.length,
+              itemBuilder: (context, i) {
+                final book = _books[i];
+                final cardColor = isDark
+                    ? const Color(0xFF1E1E30)
+                    : Colors.white;
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 10),
+                  decoration: BoxDecoration(
+                    color: cardColor,
+                    borderRadius: BorderRadius.circular(12),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.04),
+                        blurRadius: 6,
+                        offset: const Offset(0, 2),
                       ),
                     ],
                   ),
-                )
-              : ListView.builder(
-                  padding: const EdgeInsets.all(16),
-                  itemCount: _books.length,
-                  itemBuilder: (context, i) {
-                    final book = _books[i];
-                    final cardColor = isDark ? const Color(0xFF1E1E30) : Colors.white;
-                    return Container(
-                      margin: const EdgeInsets.only(bottom: 10),
+                  child: ListTile(
+                    contentPadding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
+                    leading: Container(
+                      width: 44,
+                      height: 60,
                       decoration: BoxDecoration(
-                        color: cardColor,
-                        borderRadius: BorderRadius.circular(12),
-                        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 6, offset: const Offset(0, 2))],
+                        gradient: LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [
+                            Color.lerp(
+                                  AppTheme.seedPurple,
+                                  Colors.blue,
+                                  (i * 0.15) % 1.0,
+                                ) ??
+                                AppTheme.seedPurple,
+                            Color.lerp(
+                                  const Color(0xFFA29BFE),
+                                  Colors.teal,
+                                  (i * 0.2) % 1.0,
+                                ) ??
+                                const Color(0xFFA29BFE),
+                          ],
+                        ),
+                        borderRadius: BorderRadius.circular(6),
                       ),
-                      child: ListTile(
-                        contentPadding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
-                        leading: Container(
-                          width: 44, height: 60,
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              begin: Alignment.topLeft, end: Alignment.bottomRight,
-                              colors: [
-                                Color.lerp(AppTheme.seedPurple, Colors.blue, (i * 0.15) % 1.0) ?? AppTheme.seedPurple,
-                                Color.lerp(const Color(0xFFA29BFE), Colors.teal, (i * 0.2) % 1.0) ?? const Color(0xFFA29BFE),
-                              ],
-                            ),
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          child: Center(
-                            child: Text(
-                              book.title.length > 2 ? book.title.substring(0, 2) : book.title,
-                              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: Colors.white),
-                            ),
+                      child: Center(
+                        child: Text(
+                          book.title.length > 2
+                              ? book.title.substring(0, 2)
+                              : book.title,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white,
                           ),
                         ),
-                        title: Text(book.title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
-                        subtitle: Text(
-                          '${_formatSize(book.fileSize)} · TXT',
-                          style: TextStyle(fontSize: 12, color: theme.colorScheme.onSurface.withValues(alpha: 0.5)),
-                        ),
-                        trailing: IconButton(
-                          icon: Icon(Icons.delete_outline, size: 20, color: theme.colorScheme.onSurface.withValues(alpha: 0.4)),
-                          onPressed: () => _delete(book),
-                        ),
-                        onTap: () => Navigator.of(context).push(
-                          MaterialPageRoute(builder: (_) => LocalReaderScreen(book: book)),
-                        ).then((_) => _refresh()),
                       ),
-                    );
-                  },
-                ),
+                    ),
+                    title: Text(
+                      book.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w600,
+                        fontSize: 14,
+                      ),
+                    ),
+                    subtitle: Text(
+                      '${_formatSize(book.fileSize)} · TXT',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: theme.colorScheme.onSurface.withValues(
+                          alpha: 0.5,
+                        ),
+                      ),
+                    ),
+                    trailing: IconButton(
+                      icon: Icon(
+                        Icons.delete_outline,
+                        size: 20,
+                        color: theme.colorScheme.onSurface.withValues(
+                          alpha: 0.4,
+                        ),
+                      ),
+                      onPressed: () => _delete(book),
+                    ),
+                    onTap: () => Navigator.of(context)
+                        .push(
+                          MaterialPageRoute(
+                            builder: (_) => LocalReaderScreen(book: book),
+                          ),
+                        )
+                        .then((_) => _refresh()),
+                  ),
+                );
+              },
+            ),
     );
   }
 }

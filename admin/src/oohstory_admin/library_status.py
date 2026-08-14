@@ -7,6 +7,8 @@ never opens the legacy catalog SQLite files.
 
 from __future__ import annotations
 
+from oohstory_library.services.error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import json
 import os
 import shutil
@@ -70,6 +72,28 @@ SYNC_AI_COVER_UNITS = tuple(
     for index in range(1, 9)
 )
 SYNC_LABELS = {"local": "同步本地书库", "fanqie": "同步番茄书库"}
+SITE_FULL_SYNC_CONFIG: dict[str, dict[str, str]] = {
+    "txt80": {"label": "TXT80 本地书库正文", "group": "local"},
+    "xbiquge": {"label": "新笔趣阁授权正文", "group": "fanqie"},
+    "ixdzs": {"label": "爱下授权正文", "group": "fanqie"},
+    "shubaow": {"label": "书宝授权正文", "group": "fanqie"},
+    "linovelib": {"label": "哔哩轻小说授权正文", "group": "fanqie"},
+}
+SITE_FULL_SYNC_LANES = {
+    "txt80": "local",
+    "xbiquge": "http-xbiquge",
+    "ixdzs": "http-ixdzs",
+    "shubaow": "browser-shubaow",
+    "linovelib": "browser-shubaow",
+}
+SERIALIZED_UPDATE_SOURCE_CONFIG: dict[str, dict[str, str]] = {
+    "xbiquge": {"label": "新笔趣阁连载追更", "lane": "update-xbiquge"},
+    "ixdzs": {"label": "爱下连载追更", "lane": "update-ixdzs"},
+    "shubaow": {"label": "书宝连载追更", "lane": "update-shubaow"},
+    "linovelib": {"label": "哔哩轻小说连载追更", "lane": "update-linovelib"},
+}
+SERIALIZED_UPDATE_TIMER_TEMPLATE = "oohstory-library-serialized-update-sync@{source}.timer"
+SERIALIZED_UPDATE_SERVICE_TEMPLATE = "oohstory-library-serialized-update-sync@{source}.service"
 
 _INDEX_DEFAULT = {
     "status": "idle",
@@ -385,7 +409,7 @@ class LibraryStatusService:
                 "prefix": self.settings.library_redis_prefix,
                 "download_stream_length": int(client.xlen(stream)),
             }
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             return {"ok": False, "error": _error(exc)}
 
     def _unit_statuses(self) -> dict[str, dict[str, Any]]:
@@ -398,6 +422,18 @@ class LibraryStatusService:
                     *SYNC_CONTENT_SERVICE_UNITS.values(),
                     *SYNC_LIBRARY_ASSET_UNITS.values(),
                     SYNC_AI_COVER_UNITS,
+                    tuple(
+                        f"oohstory-library-site-full-sync@{site}.service"
+                        for site in SITE_FULL_SYNC_CONFIG
+                    ),
+                    tuple(
+                        SERIALIZED_UPDATE_TIMER_TEMPLATE.format(source=source)
+                        for source in SERIALIZED_UPDATE_SOURCE_CONFIG
+                    ),
+                    tuple(
+                        SERIALIZED_UPDATE_SERVICE_TEMPLATE.format(source=source)
+                        for source in SERIALIZED_UPDATE_SOURCE_CONFIG
+                    ),
                 )
                 for unit in group
             )
@@ -481,6 +517,71 @@ class LibraryStatusService:
                 ),
                 "ai_cover_enabled": all(statuses[unit]["enabled"] for unit in SYNC_AI_COVER_UNITS),
             }
+        sites: list[dict[str, Any]] = []
+        for site_id, config in SITE_FULL_SYNC_CONFIG.items():
+            unit = f"oohstory-library-site-full-sync@{site_id}.service"
+            state = _read_json(
+                self.runtime_dir / f"oohstory-site-full-sync-{site_id}.json",
+                {},
+            )
+            sites.append(
+                {
+                    "id": site_id,
+                    "label": config["label"],
+                    "group": config["group"],
+                    "unit": unit,
+                    "enabled": statuses[unit]["enabled"],
+                    "active": statuses[unit]["active"],
+                    "active_state": statuses[unit]["active_state"],
+                    "status": str(state.get("status") or "idle"),
+                    "message": str(state.get("message") or "尚未启动"),
+                    "slot_lane": SITE_FULL_SYNC_LANES.get(site_id, "http"),
+                    "updated_at": str(state.get("updated_at") or ""),
+                }
+            )
+        controls["site_full_sync"] = {
+            "target_books_per_minute": None,
+            "authorized_sites_share_slot": False,
+            "execution_lanes": dict(SITE_FULL_SYNC_LANES),
+            "rate_contract": "各站点按真实传输边界使用独立执行 lane。",
+            "sites": sites,
+        }
+        sources: list[dict[str, Any]] = []
+        for source, config in SERIALIZED_UPDATE_SOURCE_CONFIG.items():
+            timer = SERIALIZED_UPDATE_TIMER_TEMPLATE.format(source=source)
+            service = SERIALIZED_UPDATE_SERVICE_TEMPLATE.format(source=source)
+            state = _read_json(
+                self.runtime_dir / f"serialized-source-updates-{source}.json",
+                {},
+            )
+            totals = state.get("totals") if isinstance(state, dict) else {}
+            totals = totals if isinstance(totals, dict) else {}
+            sources.append(
+                {
+                    "id": source,
+                    "label": config["label"],
+                    "lane": config["lane"],
+                    "timer_unit": timer,
+                    "service_unit": service,
+                    "enabled": statuses[timer]["enabled"],
+                    "timer_active": statuses[timer]["active"],
+                    "service_active": statuses[service]["active"],
+                    "active_state": statuses[service]["active_state"],
+                    "next_run": statuses[timer]["next_run"],
+                    "last_run": statuses[timer]["last_run"],
+                    "status": str(state.get("status") or "never_run"),
+                    "mode": str(state.get("mode") or ""),
+                    "checked_at": str(state.get("completed_at_epoch") or ""),
+                    "totals": totals,
+                    "tracked": {},
+                    "last_errors": [],
+                }
+            )
+        controls["serialized_update"] = {
+            "label": "连载追更",
+            "rate_contract": "每个来源独立 update lane 定时扫描最近更新榜。",
+            "sources": sources,
+        }
         return controls
 
     def _deconstruction_status(self) -> dict[str, Any]:
@@ -617,7 +718,7 @@ class LibraryStatusService:
         try:
             snapshot = self.database.snapshot()
             mysql_error = None
-        except Exception as exc:
+        except RECOVERABLE_OPERATION_ERRORS as exc:
             snapshot = None
             mysql_error = _error(exc)
         object_status = self._object_status()

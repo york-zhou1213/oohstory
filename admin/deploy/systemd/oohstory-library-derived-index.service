@@ -2,7 +2,7 @@
 Description=Manual tone and plot index worker
 After=network-online.target mysql.service remote-fs.target
 Wants=network-online.target
-RequiresMountsFor=/srv/oohstory/library/txt80
+RequiresMountsFor=/srv/oohstory/library
 StartLimitIntervalSec=10min
 StartLimitBurst=6
 

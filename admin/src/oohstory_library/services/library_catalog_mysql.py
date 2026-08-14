@@ -259,7 +259,7 @@ class MySQLCatalogStore:
             or any(part in {"", ".", ".."} for part in key.parts)
             or key.as_posix() != raw
         ):
-            raise ValueError("正文对象键必须指向 txt80/书籍/ 下的分类文件")
+            raise ValueError("正文对象键必须指向电子书库根目录的书籍/分类文件")
         return raw
 
     @staticmethod
@@ -661,17 +661,6 @@ class MySQLCatalogStore:
         body_object_key = self._canonical_body_object_key(body_object_key)
         title = normalize_catalog_title(title)
         identity_key = self._identity_key(title, author)
-        source_name = (
-            "xbiquge"
-            if source_id.startswith("xbiquge-")
-            else "ixdzs"
-            if source_id.startswith("ixdzs-")
-            else "shubaow"
-            if source_id.startswith("shubaow-")
-            else "linovelib"
-            if source_id.startswith("linovelib-")
-            else "other"
-        )
         facet_keys: set[tuple[str, int, str]] = set()
         status_keys: set[tuple[str, str]] = set()
         with self.pool.connection() as connection:

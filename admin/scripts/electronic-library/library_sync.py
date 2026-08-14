@@ -19,7 +19,7 @@ from typing import Any
 from project_paths import APP_ROOT  # noqa: E402
 
 
-LIBRARY_ROOT = APP_ROOT / "electronic-library" / "txt80"
+LIBRARY_ROOT = APP_ROOT / "electronic-library"
 BOOKS_ROOT = LIBRARY_ROOT / "书籍"
 CATALOG_PATH = LIBRARY_ROOT / "catalog.sqlite3"
 STATUS_PATH = LIBRARY_ROOT / "全局索引" / "library-sync-status.json"

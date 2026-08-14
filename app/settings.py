@@ -18,6 +18,7 @@ class Settings:
     library_root: Path
     state_root: Path
     allowed_hosts: tuple[str, ...]
+    audiobook_audio_root: Path | None = None
     catalog_backend: str = "sqlite"
     object_root: Path | None = None
     mysql_host: str = "127.0.0.1"
@@ -35,6 +36,7 @@ class Settings:
     max_report_chars: int = 200_000
     max_cover_bytes: int = 20 * 1024 * 1024
     account_database: Path | None = None
+    comment_root: Path | None = None
     session_cookie: str = "oohstory_session"
     session_ttl_seconds: int = 30 * 24 * 60 * 60
     google_web_client_id: str = ""
@@ -58,6 +60,8 @@ class Settings:
     smtp_from: str = ""
     smtp_starttls: bool = True
     public_origin: str = "http://localhost:8091"
+    gender_guess_enabled: bool = False
+    gender_guess_confidence_threshold: float = 0.7
 
     @property
     def catalog_path(self) -> Path:
@@ -82,6 +86,11 @@ class Settings:
     @property
     def reader_index_root(self) -> Path:
         return self.state_root / "reader-index"
+
+    @property
+    def audiobook_storage_root(self) -> Path:
+        """Dedicated audio/cache root, retaining the legacy state-root fallback."""
+        return self.audiobook_audio_root or self.state_root
 
     @property
     def cover_root(self) -> Path:
@@ -123,11 +132,20 @@ class Settings:
         return self.avatar_root or self.state_root / "user-avatars"
 
     @property
+    def comment_object_root(self) -> Path:
+        return self.comment_root or (self.object_root or self.library_root) / "comments"
+
+    @property
     def user_submission_handoff_root(self) -> Path:
         return (
             self.submission_handoff_root
             or self.library_root / "全局索引" / "用户投稿队列"
         )
+
+    @property
+    def maintenance_flag_path(self) -> Path:
+        """Return the fixed, local-only maintenance mode marker."""
+        return self.state_root / "maintenance.enabled"
 
 
 def load_settings() -> Settings:
@@ -139,7 +157,7 @@ def load_settings() -> Settings:
     ).expanduser().resolve()
     raw_hosts = os.getenv(
         "OOHSTORY_ALLOWED_HOSTS",
-        "localhost,127.0.0.1,testserver",
+        "reader.example.com,www.reader.example.com,m.reader.example.com,localhost,127.0.0.1,testserver",
     )
     allowed_hosts = tuple(
         host.strip().lower() for host in raw_hosts.split(",") if host.strip()
@@ -156,12 +174,16 @@ def load_settings() -> Settings:
     if catalog_backend not in {"mysql", "sqlite"}:
         raise RuntimeError("OOHSTORY_CATALOG_BACKEND 必须是 mysql 或 sqlite")
     raw_object_root = os.getenv("OOHSTORY_OBJECT_ROOT", "").strip()
+    raw_audiobook_audio_root = os.getenv(
+        "OOHSTORY_AUDIOBOOK_AUDIO_ROOT", ""
+    ).strip()
     raw_password_file = os.getenv(
         "OOHSTORY_MYSQL_PASSWORD_FILE", ""
     ).strip()
     raw_account_database = os.getenv(
         "OOHSTORY_ACCOUNT_DATABASE", ""
     ).strip()
+    raw_comment_root = os.getenv("OOHSTORY_COMMENT_ROOT", "").strip()
     raw_upload_root = os.getenv("OOHSTORY_USER_UPLOAD_ROOT", "").strip()
     raw_avatar_root = os.getenv("OOHSTORY_USER_AVATAR_ROOT", "").strip()
     raw_handoff_root = os.getenv("OOHSTORY_SUBMISSION_HANDOFF_ROOT", "").strip()
@@ -171,6 +193,11 @@ def load_settings() -> Settings:
         library_root=library_root,
         state_root=state_root,
         allowed_hosts=allowed_hosts,
+        audiobook_audio_root=(
+            Path(raw_audiobook_audio_root).expanduser().resolve()
+            if raw_audiobook_audio_root
+            else None
+        ),
         catalog_backend=catalog_backend,
         object_root=(
             Path(raw_object_root).expanduser().resolve()
@@ -197,6 +224,11 @@ def load_settings() -> Settings:
         account_database=(
             Path(raw_account_database).expanduser().resolve()
             if raw_account_database
+            else None
+        ),
+        comment_root=(
+            Path(raw_comment_root).expanduser().resolve()
+            if raw_comment_root
             else None
         ),
         session_cookie=os.getenv(
@@ -259,7 +291,16 @@ def load_settings() -> Settings:
         smtp_from=os.getenv("OOHSTORY_SMTP_FROM", "").strip(),
         smtp_starttls=os.getenv("OOHSTORY_SMTP_STARTTLS", "1").strip().casefold()
         not in {"0", "false", "no"},
-        public_origin=os.getenv("OOHSTORY_PUBLIC_ORIGIN", "http://localhost:8091").strip().rstrip("/"),
+        public_origin=os.getenv(
+            "OOHSTORY_PUBLIC_ORIGIN", "http://localhost:8091"
+        ).strip().rstrip("/"),
+        gender_guess_enabled=os.getenv(
+            "OOHSTORY_GENDER_GUESS_ENABLED", ""
+        ).strip().casefold() in {"1", "true", "yes"},
+        gender_guess_confidence_threshold=min(
+            max(float(os.getenv("OOHSTORY_GENDER_GUESS_CONFIDENCE_THRESHOLD", "0.7")), 0.5),
+            0.99,
+        ),
         public_deconstruction_root=(
             Path(raw_deconstruction_root).expanduser().resolve()
             if raw_deconstruction_root

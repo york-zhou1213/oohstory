@@ -16,22 +16,29 @@ RuntimeDirectory=oohstory-reader
 RuntimeDirectoryMode=0700
 Environment=PYTHONUNBUFFERED=1
 Environment=OOHSTORY_CATALOG_BACKEND=mysql
-Environment=OOHSTORY_LIBRARY_ROOT=/srv/oohstory/library
 Environment=OOHSTORY_OBJECT_ROOT=/srv/oohstory/library
+Environment=OOHSTORY_COMMENT_ROOT=/srv/oohstory/library/comments
 Environment=OOHSTORY_MYSQL_HOST=127.0.0.1
 Environment=OOHSTORY_MYSQL_PORT=3306
 Environment=OOHSTORY_MYSQL_DATABASE=oohstory_library
 Environment=OOHSTORY_MYSQL_USER=oohstory_public_reader
 Environment=OOHSTORY_MYSQL_PASSWORD_FILE=/etc/oohstory-reader/mysql-password
 Environment=OOHSTORY_MYSQL_POOL_SIZE=8
+Environment=OOHSTORY_CAST_PREWARM_ENABLED=1
+Environment=OOHSTORY_CAST_PREWARM_WORKER=0
+Environment=OOHSTORY_CAST_ENGINE_VERSION=oohstory-cast-v15-colonfield1
 Environment=OOHSTORY_STATE_ROOT=/var/lib/oohstory-reader
+Environment=OOHSTORY_AUDIOBOOK_AUDIO_ROOT=/srv/oohstory/library/oohstory/audiobook-audio
+Environment=OOHSTORY_LOCAL_TTS_MODEL_ROOT=/srv/oohstory/library/oohstory/tts-models/vits-icefall-zh-aishell3
 Environment=OOHSTORY_USER_UPLOAD_ROOT=/var/lib/oohstory-reader/user-uploads
 Environment=OOHSTORY_MAX_UPLOAD_BYTES=67108864
 Environment=OOHSTORY_UPLOAD_DAILY_FILES=5
 Environment=OOHSTORY_UPLOAD_DAILY_BYTES=268435456
-Environment=OOHSTORY_DECONSTRUCTION_ROOT=/srv/oohstory-deconstructions
-Environment=OOHSTORY_PUBLIC_ORIGIN=https://reader.example.com
-Environment=OOHSTORY_ALLOWED_HOSTS=reader.example.com,localhost,127.0.0.1
+Environment=OOHSTORY_DECONSTRUCTION_ROOT=/srv/oohstory/library/全局拆书库
+Environment=OOHSTORY_ALLOWED_HOSTS=reader.example.com,www.reader.example.com,m.reader.example.com,localhost,127.0.0.1
+# External gender-guess lookup for audiobook character voices
+Environment=OOHSTORY_GENDER_GUESS_ENABLED=0
+Environment=OOHSTORY_GENDER_GUESS_CONFIDENCE_THRESHOLD=0.7
 ExecStart=/opt/oohstory-reader/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8091 --workers 2 --proxy-headers --forwarded-allow-ips=127.0.0.1
 Restart=on-failure
 RestartSec=3
@@ -63,8 +70,10 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 IPAddressDeny=any
 IPAddressAllow=localhost
+# Outbound HTTPS for gender-guess: existing tts-network.conf drop-in clears IPAddressDeny
 UMask=0077
 ReadOnlyPaths=/opt/oohstory-reader
+ReadWritePaths=/srv/oohstory/library/comments /srv/oohstory/library/oohstory/audiobook-audio
 ReadOnlyPaths=/srv/oohstory/library
 
 [Install]

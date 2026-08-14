@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly MOUNT_TARGET="/srv/oohstory/library"
+readonly EXPECTED_SOURCE="192.0.2.20:/export/oohstory-library"
+readonly EXPECTED_FSTYPE="nfs4"
+readonly MOUNT_UNIT='mnt-nas\x2delectronic\x2dlibrary\x2ddata.mount'
+readonly -a OOHSTORY_UNITS=(
+  "oohstory-reader.service"
+  "oohstory-admin.service"
+)
+
+readonly SYSTEMCTL="${OOHSTORY_NAS_RECOVERY_SYSTEMCTL:-/usr/bin/systemctl}"
+readonly MOUNTPOINT="${OOHSTORY_NAS_RECOVERY_MOUNTPOINT:-/usr/bin/mountpoint}"
+readonly FINDMNT="${OOHSTORY_NAS_RECOVERY_FINDMNT:-/usr/bin/findmnt}"
+readonly FLOCK="${OOHSTORY_NAS_RECOVERY_FLOCK:-/usr/bin/flock}"
+readonly ENROLL_CLIENT="${OOHSTORY_NAS_RECOVERY_ENROLL_CLIENT:-/usr/local/libexec/oohstory-nas-enroll-client}"
+readonly LOCK_FILE="${OOHSTORY_NAS_RECOVERY_LOCK_FILE:-/run/lock/oohstory-nas-recovery.lock}"
+
+log() {
+  printf 'oohstory-nas-recovery: %s\n' "$*"
+}
+
+require_executable() {
+  local command_path="$1"
+  if [[ "$command_path" != /* || ! -x "$command_path" ]]; then
+    log "refusing invalid command path: $command_path"
+    exit 64
+  fi
+}
+
+for command_path in "$SYSTEMCTL" "$MOUNTPOINT" "$FINDMNT" "$FLOCK" "$ENROLL_CLIENT"; do
+  require_executable "$command_path"
+done
+
+if [[ "$LOCK_FILE" != /* ]]; then
+  log "refusing non-absolute lock path: $LOCK_FILE"
+  exit 64
+fi
+
+exec 9>"$LOCK_FILE"
+if ! "$FLOCK" --nonblock 9; then
+  log "another recovery attempt is already running"
+  exit 0
+fi
+
+# A new server node may reach the NAS from an address not yet present in the
+# Synology NFS ACL. The dedicated SSH key can run only the NAS enrollment
+# wrapper, which derives the address from SSH_CONNECTION and preserves all
+# existing rules. Enrollment is best effort because an existing ACL may still
+# allow the mount while SSH is temporarily unavailable.
+if ! "$MOUNTPOINT" --quiet "$MOUNT_TARGET"; then
+  if ! "$ENROLL_CLIENT"; then
+    log "NAS client enrollment is unavailable; attempting the existing NFS rules"
+  fi
+
+  # The eager fstab mount can fail before the NAS becomes reachable. Clear only
+  # its exact generated unit, then retry the normal systemd-controlled mount.
+  "$SYSTEMCTL" reset-failed "$MOUNT_UNIT" >/dev/null 2>&1 || true
+  if ! "$SYSTEMCTL" start "$MOUNT_UNIT"; then
+    log "NFS mount is still unavailable; a later timer run will retry"
+    exit 0
+  fi
+fi
+
+if ! "$MOUNTPOINT" --quiet "$MOUNT_TARGET"; then
+  log "$MOUNT_TARGET is not a mount point; refusing to start OOHStory"
+  exit 0
+fi
+
+if ! actual_source="$($FINDMNT --raw --noheadings --first-only --target "$MOUNT_TARGET" --output SOURCE)"; then
+  log "cannot verify the mounted source; refusing to start OOHStory"
+  exit 0
+fi
+if ! actual_fstype="$($FINDMNT --raw --noheadings --first-only --target "$MOUNT_TARGET" --output FSTYPE)"; then
+  log "cannot verify the mounted filesystem type; refusing to start OOHStory"
+  exit 0
+fi
+
+if [[ "$actual_source" != "$EXPECTED_SOURCE" || "$actual_fstype" != "$EXPECTED_FSTYPE" ]]; then
+  log "unexpected mount identity source=$actual_source fstype=$actual_fstype; refusing to start OOHStory"
+  exit 0
+fi
+
+for unit in "${OOHSTORY_UNITS[@]}"; do
+  if ! "$SYSTEMCTL" is-enabled --quiet "$unit"; then
+    log "$unit is not enabled; respecting operator intent"
+    continue
+  fi
+  if "$SYSTEMCTL" is-active --quiet "$unit"; then
+    continue
+  fi
+  "$SYSTEMCTL" reset-failed "$unit" >/dev/null 2>&1 || true
+  "$SYSTEMCTL" start "$unit"
+  log "started $unit after verified NAS recovery"
+done

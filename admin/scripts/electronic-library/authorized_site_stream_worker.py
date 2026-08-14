@@ -40,7 +40,6 @@ from oohstory_library.services.library_runtime_mysql import MySQLLibraryRuntime 
 STATE_PATH = (
     APP_ROOT
     / "electronic-library"
-    / "txt80"
     / "全局索引"
     / "authorized-site-stream-worker.json"
 )

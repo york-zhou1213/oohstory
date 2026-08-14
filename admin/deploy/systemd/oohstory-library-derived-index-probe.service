@@ -1,7 +1,7 @@
 [Unit]
 Description=Probe and recover the durable derived-index pipeline
 After=mysql.service remote-fs.target
-RequiresMountsFor=/srv/oohstory/library/txt80
+RequiresMountsFor=/srv/oohstory/library
 
 [Service]
 Type=oneshot

@@ -1,14 +1,17 @@
 
 # projects_manager.py - 多项目管理服务
+from __future__ import annotations
+
+from .error_boundaries import RECOVERABLE_OPERATION_ERRORS
+
 import json
 import uuid
 import base64
 import mimetypes
 from pathlib import Path
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Dict, List, Optional, Any
 from oohstory_library.services.genre_catalog import canonical_genre_id, canonical_substyle_id
-from oohstory_library.services.tone_catalog import TONE_TAG_CATALOG
 
 from oohstory_library.services.project_prompt_store import ensure_project_prompts
 
@@ -57,7 +60,7 @@ def save_project_cover(project_path: str, cover_data: str) -> str:
         if old != cover_path:
             try:
                 old.unlink()
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 pass
 
     raw = base64.b64decode(payload if payload else cover_data)
@@ -84,7 +87,7 @@ def _load_projects_data() -> Dict[str, Any]:
     if PROJECTS_FILE.exists():
         try:
             data = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             pass
 
     # 自动发现根目录项目 (兼容旧版本) - 仅当没有任何项目时
@@ -100,7 +103,7 @@ def _load_projects_data() -> Dict[str, Any]:
                     name = state.get("project_info", {}).get("title", state.get("title", "默认项目"))
                 else:
                     name = "默认项目"
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 name = "默认项目"
 
             default_project = {
@@ -108,8 +111,8 @@ def _load_projects_data() -> Dict[str, Any]:
                 "name": name,
                 "path": str(root_path.absolute()),
                 "genre": "未知",
-                "created_at": datetime.now().strftime("%Y-%m-%d"),
-                "last_opened": datetime.now().strftime("%Y-%m-%d"),
+                "created_at": datetime.now(UTC).strftime("%Y-%m-%d"),
+                "last_opened": datetime.now(UTC).strftime("%Y-%m-%d"),
                 "exists": True
             }
             data["projects"].append(default_project)
@@ -247,7 +250,7 @@ def list_projects() -> List[Dict[str, Any]]:
                     if new_genre and new_genre != p.get("genre"):
                         p["genre"] = new_genre
                         updated = True
-                except Exception:
+                except RECOVERABLE_OPERATION_ERRORS:
                     pass
 
             # 统计章节数和总字数（支持卷目录递归）
@@ -268,10 +271,10 @@ def list_projects() -> List[Dict[str, Any]]:
                     for f in chapter_files:
                         try:
                             total_words += len(f.read_text(encoding="utf-8"))
-                        except Exception:
+                        except RECOVERABLE_OPERATION_ERRORS:
                             pass
                     p["total_words"] = total_words
-                except Exception:
+                except RECOVERABLE_OPERATION_ERRORS:
                     p["total_chapters"] = 0
                     p["total_words"] = 0
             else:
@@ -287,7 +290,7 @@ def list_projects() -> List[Dict[str, Any]]:
                 save_project_cover(p["path"], legacy_cover)
                 p.pop("cover_data", None)
                 updated = True
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 pass
         p["cover_url"] = get_project_cover_url(p.get("id", ""), p["path"]) if p.get("exists") else None
 
@@ -320,7 +323,7 @@ def set_current_project(path: Path):
     # 更新最后打开时间
     for p in data["projects"]:
         if str(Path(p["path"]).expanduser().resolve()) == abs_path:
-            p["last_opened"] = datetime.now().strftime("%Y-%m-%d")
+            p["last_opened"] = datetime.now(UTC).strftime("%Y-%m-%d")
             break
 
     _save_projects_data(data)
@@ -388,7 +391,7 @@ def create_project(
         "title": safe_name,
         "genre": genre,
         "substyle": substyle,
-        "created_at": datetime.now().isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
         "initialized": is_manual_project,
         "current_chapter": 0,
         "project_info": {
@@ -439,8 +442,8 @@ def create_project(
         "genre": genre,
         "substyle": substyle,
         "tone_tags": normalized_tone_tags,
-        "created_at": datetime.now().strftime("%Y-%m-%d"),
-        "last_opened": datetime.now().strftime("%Y-%m-%d")
+        "created_at": datetime.now(UTC).strftime("%Y-%m-%d"),
+        "last_opened": datetime.now(UTC).strftime("%Y-%m-%d")
     }
 
     data["projects"].append(project)
@@ -457,7 +460,7 @@ def switch_project(project_id: str) -> Dict[str, Any]:
             if not Path(p["path"]).expanduser().exists():
                 return {"error": "项目路径不存在", "path": p["path"]}
             data["current_project"] = p["path"]
-            p["last_opened"] = datetime.now().strftime("%Y-%m-%d")
+            p["last_opened"] = datetime.now(UTC).strftime("%Y-%m-%d")
             _save_projects_data(data)
             return {"success": True, "project": p}
     return {"error": "项目不存在"}
@@ -490,7 +493,7 @@ def rename_project(project_id: str, new_name: str) -> Dict[str, Any]:
         if state_file.exists():
             try:
                 state = json.loads(state_file.read_text(encoding="utf-8"))
-            except Exception:
+            except RECOVERABLE_OPERATION_ERRORS:
                 state = {}
         else:
             state = {}
@@ -511,7 +514,7 @@ def rename_project(project_id: str, new_name: str) -> Dict[str, Any]:
         old_path = p["path"]
         p["name"] = safe_name
         p["path"] = str(project_path)
-        p["updated_at"] = datetime.now().isoformat()
+        p["updated_at"] = datetime.now(UTC).isoformat()
         if current_project_path == old_path:
             data["current_project"] = p["path"]
         _save_projects_data(data)
@@ -544,7 +547,7 @@ def import_project(path: str) -> Dict[str, Any]:
                 genre = state.get("genre", genre)
                 substyle = state.get("substyle", "")
             ensure_project_prompts(project_path, genre, substyle)
-        except Exception:
+        except RECOVERABLE_OPERATION_ERRORS:
             pass
 
     data = _load_projects_data()
@@ -562,8 +565,8 @@ def import_project(path: str) -> Dict[str, Any]:
         "name": name,
         "path": str(project_path.absolute()),
         "genre": genre,
-        "created_at": datetime.now().strftime("%Y-%m-%d"),
-        "last_opened": datetime.now().strftime("%Y-%m-%d")
+        "created_at": datetime.now(UTC).strftime("%Y-%m-%d"),
+        "last_opened": datetime.now(UTC).strftime("%Y-%m-%d")
     }
     data["projects"].append(project)
     data["current_project"] = project["path"]
@@ -585,7 +588,7 @@ def delete_project(project_id: str, delete_files: bool = False) -> Dict[str, Any
                 import shutil
                 try:
                     shutil.rmtree(removed["path"])
-                except Exception as e:
+                except RECOVERABLE_OPERATION_ERRORS as e:
                     return {"success": True, "warning": f"文件删除失败: {e}"}
 
             return {"success": True}

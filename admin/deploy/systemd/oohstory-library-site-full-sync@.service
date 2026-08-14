@@ -23,8 +23,8 @@ MemoryHigh=10G
 MemoryMax=12G
 TasksMax=512
 OOMPolicy=stop
-StandardOutput=append:/opt/oohstory-admin/electronic-library/txt80/logs/site-full-sync-%i.log
-StandardError=append:/opt/oohstory-admin/electronic-library/txt80/logs/site-full-sync-%i.log
+StandardOutput=append:/opt/oohstory-admin/electronic-library/logs/site-full-sync-%i.log
+StandardError=append:/opt/oohstory-admin/electronic-library/logs/site-full-sync-%i.log
 
 [Install]
 WantedBy=multi-user.target

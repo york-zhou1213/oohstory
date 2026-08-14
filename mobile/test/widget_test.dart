@@ -10,12 +10,14 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:oohstory/main.dart';
 
 void main() {
-  testWidgets('OOH Story app renders branded splash', (
+  testWidgets('OOH Story app opens the main shell after the branded splash', (
     WidgetTester tester,
   ) async {
-    await tester.pumpWidget(const OohStoryApp());
+    await tester.pumpWidget(const OohStoryApp(checkForUpdates: false));
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pump(const Duration(milliseconds: 500));
 
-    expect(find.text('OOH Story'), findsOneWidget);
-    expect(find.text('好故事正在发生'), findsOneWidget);
+    expect(find.text('发现'), findsWidgets);
+    expect(find.text('书库'), findsOneWidget);
   });
 }

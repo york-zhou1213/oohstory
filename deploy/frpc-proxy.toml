@@ -3,5 +3,4 @@ name = "oohstory-reader"
 type = "tcp"
 localIP = "127.0.0.1"
 localPort = 8091
-# Example only. Match this to a private, authenticated FRP server if used.
-remotePort = 19091
+remotePort = 18641

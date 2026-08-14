@@ -37,7 +37,14 @@ class FakeLibraryActions:
                 },
                 "site_full_sync": {
                     "target_books_per_minute": 100,
-                    "authorized_sites_share_slot": True,
+                    "authorized_sites_share_slot": False,
+                    "execution_lanes": {
+                        "txt80": "local",
+                        "xbiquge": "http-xbiquge",
+                        "ixdzs": "http-ixdzs",
+                        "shubaow": "browser-shubaow",
+                        "linovelib": "browser-shubaow",
+                    },
                     "sites": [
                         {
                             "id": site_id,
@@ -49,14 +56,44 @@ class FakeLibraryActions:
                             "updated_at": "",
                             "configurable": True,
                             "books_per_cycle": 100,
+                            "slot_lane": lane,
+                            "batch": {"selected": 0, "completed": 0, "failed": 0, "deferred": 0},
+                            "cumulative": {"attempted": 0, "completed": 0, "failed": 0, "deferred": 0},
                         }
-                        for site_id, label in (
-                            ("txt80", "TXT80 本地书库正文"),
-                            ("xbiquge", "新笔趣阁授权正文"),
-                            ("ixdzs", "爱下授权正文"),
-                            ("shubaow", "书宝授权正文"),
-                            ("linovelib", "哔哩轻小说授权正文"),
+                        for site_id, label, lane in (
+                            ("txt80", "TXT80 本地书库正文", "local"),
+                            ("xbiquge", "新笔趣阁授权正文", "http-xbiquge"),
+                            ("ixdzs", "爱下授权正文", "http-ixdzs"),
+                            ("shubaow", "书宝授权正文", "browser-shubaow"),
+                            ("linovelib", "哔哩轻小说授权正文", "browser-shubaow"),
                         )
+                    ],
+                },
+                "serialized_update": {
+                    "label": "连载追更",
+                    "rate_contract": "每个来源独立 update lane 定时扫描最近更新榜",
+                    "sources": [
+                        {
+                            "id": "ixdzs",
+                            "label": "爱下连载追更",
+                            "lane": "update-ixdzs",
+                            "enabled": False,
+                            "service_active": False,
+                            "timer_active": False,
+                            "status": "completed",
+                            "mode": "direct",
+                            "checked_at": "2026-08-12 12:00:00",
+                            "last_run": "",
+                            "totals": {
+                                "seen": 20,
+                                "local_matches": 3,
+                                "refresh_selected": 1,
+                                "refresh_applied": 1,
+                                "failed": 0,
+                            },
+                            "tracked": {"applied": 8, "observed": 12, "ongoing_books": 30},
+                            "last_errors": [],
+                        }
                     ],
                 },
                 "cover_redraw": {
@@ -72,6 +109,33 @@ class FakeLibraryActions:
                         "failed": 0,
                     },
                 },
+            }
+        elif action == "root_migration_status":
+            data = {
+                "status": "idle",
+                "stage": "idle",
+                "message": "尚未执行书库根路径迁移",
+                "current_root": "/srv/oohstory/library",
+                "updated_at": "2026-08-07T03:00:00+00:00",
+            }
+        elif action == "root_migration_preflight":
+            data = {
+                "token": "d" * 32,
+                "source": request["source"],
+                "destination": request["destination"],
+                "same_device": True,
+                "source_is_mountpoint": True,
+                "top_level": [{"name": "书籍"}, {"name": "全局索引"}],
+                "mysql_rows": 384787,
+                "config_files": ["/etc/example.env"],
+                "units": ["oohstory-reader.service", "webnovel-writer-backend.service"],
+                "confirmation": "迁移电子书库",
+            }
+        elif action == "root_migration_start":
+            data = {
+                "status": "running",
+                "stage": "queued",
+                "message": "迁移任务已进入独立系统服务",
             }
         elif action == "plot_adaptations":
             data = {
@@ -206,10 +270,11 @@ def test_root_runner_is_fail_closed_and_reports_capabilities():
     assert payload["ok"] is True
     assert payload["data"]["project_tone_matching"] is False
     assert "site_full_sync" in payload["data"]["actions"]
+    assert "serialized_update_source" in payload["data"]["actions"]
     assert "delete_catalog_books" in payload["data"]["actions"]
     assert payload["data"]["delete_limit"] == 100
     runner_source = runner.read_text(encoding="utf-8")
-    assert "/opt/legacy-webnovel-writer" not in runner_source
+    assert ".codespace/workspace" not in runner_source
     assert "/etc/webnovel-writer" not in runner_source
     assert "webnovel-library-" not in runner_source
     assert "/opt/oohstory-admin/scripts/electronic-library/delete_catalog_books.py" in runner_source
@@ -610,9 +675,47 @@ def test_sync_index_plot_query_and_adaptation_workbench(settings, components):
         assert "书库定时同步" in sync_page.text
         assert "本地书目与正文增量同步" in sync_page.text
         assert "按站点全力同步正文" in sync_page.text
+        assert "连载书正式追更" in sync_page.text
+        assert "update-ixdzs" in sync_page.text
         assert "封面重绘加速器" in sync_page.text
+        assert "书库识别路径与目录迁移" in sync_page.text
+        assert "/srv/oohstory/library" in sync_page.text
         assert "每轮目录本数" in sync_page.text
         assert "61" in sync_page.text
+
+        migration_preflight = client.post(
+            "/admin/books/root-migration/preflight",
+            data={
+                "csrf_token": csrf,
+                "source": "/srv/oohstory/library",
+                "destination": "/srv/oohstory/library-v2",
+            },
+        )
+        assert migration_preflight.status_code == 200
+        assert "384,787" in migration_preflight.text
+        assert "迁移电子书库" in migration_preflight.text
+        assert actions.calls[-3] == (
+            "root_migration_preflight",
+            {
+                "source": "/srv/oohstory/library",
+                "destination": "/srv/oohstory/library-v2",
+            },
+        )
+
+        migration_start = client.post(
+            "/admin/books/root-migration/start",
+            data={
+                "csrf_token": csrf,
+                "plan_token": "d" * 32,
+                "confirmation": "迁移电子书库",
+            },
+            follow_redirects=False,
+        )
+        assert migration_start.status_code == 303
+        assert actions.calls[-1] == (
+            "root_migration_start",
+            {"plan_token": "d" * 32, "confirmation": "迁移电子书库"},
+        )
 
         books = client.get("/admin/books/catalog?view=plot")
         assert books.status_code == 200
@@ -644,6 +747,21 @@ def test_sync_index_plot_query_and_adaptation_workbench(settings, components):
         assert actions.calls[-1] == (
             "site_full_sync",
             {"site_id": "ixdzs", "enabled": True, "books_per_cycle": 72},
+        )
+
+        serialized_update = client.post(
+            "/admin/books/serialized-update-sync",
+            data={
+                "csrf_token": csrf,
+                "source_id": "ixdzs",
+                "enabled": "1",
+            },
+            follow_redirects=False,
+        )
+        assert serialized_update.status_code == 303
+        assert actions.calls[-1] == (
+            "serialized_update_source",
+            {"source_id": "ixdzs", "enabled": True},
         )
 
         redraw = client.post(
@@ -722,6 +840,9 @@ def test_sync_index_plot_query_and_adaptation_workbench(settings, components):
         status_api = client.get("/api/admin/books/sync-controls")
         assert status_api.status_code == 200
         assert status_api.json()["local"]["content_enabled"] is True
+        migration_status_api = client.get("/api/admin/books/root-migration/status")
+        assert migration_status_api.status_code == 200
+        assert migration_status_api.json()["data"]["current_root"] == "/srv/oohstory/library"
         sync_api = client.post(
             "/api/admin/books/sync-control",
             headers={"x-csrf-token": csrf},
@@ -737,6 +858,16 @@ def test_sync_index_plot_query_and_adaptation_workbench(settings, components):
         assert actions.calls[-1] == (
             "site_full_sync",
             {"site_id": "shubaow", "enabled": True, "books_per_cycle": 88},
+        )
+        serialized_update_api = client.post(
+            "/api/admin/books/serialized-update-sync",
+            headers={"x-csrf-token": csrf},
+            json={"source_id": "ixdzs", "enabled": True},
+        )
+        assert serialized_update_api.status_code == 200
+        assert actions.calls[-1] == (
+            "serialized_update_source",
+            {"source_id": "ixdzs", "enabled": True},
         )
         redraw_api = client.post(
             "/api/admin/books/cover-redraw-control",

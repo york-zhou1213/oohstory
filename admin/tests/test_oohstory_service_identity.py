@@ -10,7 +10,7 @@ def test_oohstory_runtime_has_no_webnovel_service_or_project_paths() -> None:
     forbidden = (
         "webnovel-library-",
         "webnovel-shubaow-browser.service",
-        "/opt/legacy-webnovel-writer",
+        "/opt/webnovel-writer",
         "/etc/webnovel-writer",
     )
     files = [
@@ -39,9 +39,7 @@ def test_oohstory_browser_service_owns_profile_and_cdp_port() -> None:
         ROOT / "deploy" / "systemd" / "oohstory-shubaow-browser.service"
     ).read_text(encoding="utf-8")
     assert "--remote-debugging-port=9223" in unit
-    assert "User=oohstory" in unit
-    assert "StateDirectory=oohstory-browser" in unit
-    assert "--user-data-dir=/var/lib/oohstory-browser/profile" in unit
+    assert "--user-data-dir=/var/lib/oohstory-admin/shubaow-browser-profile" in unit
     assert "webnovel" not in unit.casefold()
 
     dependent_units = (

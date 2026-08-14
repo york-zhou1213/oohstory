@@ -1,0 +1,38 @@
+[Unit]
+Description=OOH Story bounded audiobook cache and database maintenance
+After=mysql.service remote-fs.target
+RequiresMountsFor=/srv/oohstory/library
+
+[Service]
+Type=oneshot
+User=naslibrary
+Group=users
+SupplementaryGroups=oohstory
+WorkingDirectory=/opt/oohstory-reader
+Environment=PYTHONUNBUFFERED=1
+Environment=OOHSTORY_CATALOG_BACKEND=mysql
+Environment=OOHSTORY_OBJECT_ROOT=/srv/oohstory/library
+Environment=OOHSTORY_MYSQL_HOST=127.0.0.1
+Environment=OOHSTORY_MYSQL_PORT=3306
+Environment=OOHSTORY_MYSQL_DATABASE=oohstory_library
+Environment=OOHSTORY_MYSQL_USER=oohstory_reader
+Environment=OOHSTORY_MYSQL_PASSWORD_FILE=/etc/oohstory-reader/mysql-password
+Environment=OOHSTORY_MYSQL_POOL_SIZE=2
+Environment=OOHSTORY_STATE_ROOT=/var/lib/oohstory-reader
+Environment=OOHSTORY_AUDIOBOOK_AUDIO_ROOT=/srv/oohstory/library/oohstory/audiobook-audio
+ExecStart=/opt/oohstory-reader/.venv/bin/python -m app.audiobook_maintenance
+Nice=15
+CPUQuota=20%
+CPUWeight=10
+MemoryMax=256M
+IOWeight=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/oohstory-reader /srv/oohstory/library/oohstory/audiobook-audio
+ReadOnlyPaths=/srv/oohstory/library /etc/oohstory-reader
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077

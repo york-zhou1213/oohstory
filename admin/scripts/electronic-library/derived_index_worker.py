@@ -23,7 +23,7 @@ from oohstory_library.services.unit_names import library_unit_name  # noqa: E402
 
 
 SERVICE_NAME = library_unit_name("oohstory-library-derived-index.service")
-DEFAULT_RUNTIME_DIR = APP_ROOT / "electronic-library" / "txt80" / "全局索引"
+DEFAULT_RUNTIME_DIR = APP_ROOT / "electronic-library" / "全局索引"
 RUNTIME_DIR = Path(
     os.getenv("WEBNOVEL_LIBRARY_RUNTIME_DIR", str(DEFAULT_RUNTIME_DIR))
 ).expanduser().resolve()

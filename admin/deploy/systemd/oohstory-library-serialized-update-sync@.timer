@@ -1,0 +1,12 @@
+[Unit]
+Description=Regular OOHStory serialized-book update scan for %i
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=30m
+RandomizedDelaySec=5m
+Persistent=true
+Unit=oohstory-library-serialized-update-sync@%i.service
+
+[Install]
+WantedBy=timers.target

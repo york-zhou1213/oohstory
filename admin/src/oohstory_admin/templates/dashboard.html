@@ -7,9 +7,10 @@
 </div>
 
 <nav class="quick-action-grid" aria-label="常用工作台">
+  <a class="maintenance-quick-action {{ 'is-enabled' if dashboard.maintenance.enabled else '' }}" href="{{ base_path }}/maintenance"><span aria-hidden="true">◇</span><strong>站点维护</strong><small>{{ '维护页正在生效' if dashboard.maintenance.enabled else '一键切换全静态维护页' }}</small><em>管理公开访问 →</em></a>
   <a href="{{ base_path }}/library"><span aria-hidden="true">▦</span><strong>电子书库</strong><small>同步、封面、索引和任务总览</small><em>打开工作台 →</em></a>
   <a href="{{ base_path }}/books/catalog"><span aria-hidden="true">▤</span><strong>小说目录</strong><small>7 类馆藏视图与全局拆书库</small><em>浏览全部书目 →</em></a>
-  <a href="{{ base_path }}/pipeline"><span aria-hidden="true">⌘</span><strong>管道与服务</strong><small>服务控制和白名单脚本管理</small><em>进入服务治理 →</em></a>
+  <a href="{{ base_path }}/pipeline"><span aria-hidden="true">⌘</span><strong>管道与服务</strong><small>服务状态与精确白名单控制</small><em>进入服务治理 →</em></a>
   <a href="{{ base_path }}/audit"><span aria-hidden="true">✓</span><strong>审计日志</strong><small>查看最近的受控写操作记录</small><em>查看操作轨迹 →</em></a>
 </nav>
 
