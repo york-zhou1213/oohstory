@@ -1,6 +1,8 @@
 # Changelog
 
-## 2026-08-14
+## web-v20260814-v15-26-oss1（2026-08-14）
+
+版本号：`web-v20260814-v15-26-oss1`
 
 本次同步把 Reader、Admin/书库 Worker 与 Flutter 客户端更新到同一公开基线，主要包括：
 

@@ -1,0 +1,49 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "web-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify version contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '\r\n' < VERSION)"
+          test "$version" = "$GITHUB_REF_NAME"
+          grep -Fq "版本号：\`$version\`" CHANGELOG.md
+
+      - name: Publish versioned GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$GITHUB_REF_NAME"
+          notes="$RUNNER_TEMP/release-notes.md"
+          printf '版本号：`%s`\n\n' "$version" > "$notes"
+          sed -n "/^## ${version}（/,/^## /p" CHANGELOG.md \
+            | sed '$ { /^## /d; }' \
+            | tail -n +4 >> "$notes"
+
+          if gh release view "$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$version" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "OOH Story ${version}" \
+              --notes-file "$notes"
+          else
+            gh release create "$version" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "OOH Story ${version}" \
+              --notes-file "$notes"
+          fi
