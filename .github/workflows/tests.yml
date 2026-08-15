@@ -20,10 +20,26 @@ jobs:
       - run: python scripts/check_repository_secrets.py .
       - name: Run Reader tests in isolated modules
         run: |
-          set -euo pipefail
-          for test_file in tests/test_*.py; do
-            python -m pytest -q "$test_file"
-          done
+          set -uo pipefail
+          log="$RUNNER_TEMP/reader-tests.log"
+          set +e
+          (
+            set -e
+            for test_file in tests/test_*.py; do
+              python -m pytest -q "$test_file"
+            done
+          ) 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "### Reader test failure"
+              echo '```text'
+              tail -n 200 "$log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -42,10 +58,26 @@ jobs:
       - name: Run Admin tests in isolated modules
         working-directory: admin
         run: |
-          set -euo pipefail
-          for test_file in tests/test_*.py; do
-            PYTHONPATH=src python -m pytest -q "$test_file"
-          done
+          set -uo pipefail
+          log="$RUNNER_TEMP/admin-tests.log"
+          set +e
+          (
+            set -e
+            for test_file in tests/test_*.py; do
+              PYTHONPATH=src python -m pytest -q "$test_file"
+            done
+          ) 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "### Admin test failure"
+              echo '```text'
+              tail -n 200 "$log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
       - working-directory: admin
         run: PYTHONPATH=src python -m compileall -q src tests
       - working-directory: admin
