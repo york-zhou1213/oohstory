@@ -145,7 +145,7 @@ def _bounded_files(root: Path, suffix: str, *, older_than: float, limit: int = 1
 def _cleanup_receipts(now: float) -> int:
     removed = 0
     root = settings.audiobook_storage_root / "audiobook-stream-receipts"
-    for suffix in (".complete", ".intent", ".cursor"):
+    for suffix in (".complete", ".intent", ".cursor", ".cursor.lock"):
         for path in _bounded_files(root, suffix, older_than=now - 3600):
             try:
                 path.unlink()

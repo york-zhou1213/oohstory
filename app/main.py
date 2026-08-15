@@ -6,6 +6,7 @@ import asyncio
 from base64 import b64decode, b64encode
 from contextlib import asynccontextmanager, suppress
 from copy import deepcopy
+import fcntl
 from functools import lru_cache
 from hashlib import sha256
 from html import escape
@@ -516,6 +517,8 @@ class AudiobookProgressRequest(BaseModel):
     paragraph_index: int = 0
     item_index: int = 0
     audio_offset_ms: int = 0
+    manifest_hash: str | None = None
+    stream_id: str | None = None
 
     @field_validator("chapter_id")
     @classmethod
@@ -530,6 +533,26 @@ class AudiobookProgressRequest(BaseModel):
         if value < 0:
             raise ValueError("progress values must be non-negative")
         return value
+
+    @field_validator("manifest_hash")
+    @classmethod
+    def valid_progress_manifest_hash(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        clean = value.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", clean):
+            raise ValueError("manifest_hash is invalid")
+        return clean
+
+    @field_validator("stream_id")
+    @classmethod
+    def valid_progress_stream_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        clean = value.strip()
+        if not clean or len(clean) > 128:
+            raise ValueError("stream_id is invalid")
+        return clean
 
 
 class StaleWhileRevalidateSnapshot:
@@ -682,35 +705,105 @@ def _audiobook_stream_cursor_path(
 
 def _read_audiobook_stream_cursor(
     session_id: str, manifest_hash: str, stream_id: str
-) -> int | None:
+) -> tuple[int, int] | None:
     target = _audiobook_stream_cursor_path(session_id, manifest_hash, stream_id)
     try:
         raw = target.read_text(encoding="ascii").strip()
     except OSError:
         return None
     try:
-        return max(0, int(raw))
-    except ValueError:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        try:
+            return max(0, int(raw)), 0
+        except ValueError:
+            return None
+    if not isinstance(payload, dict):
         return None
+    try:
+        segment_index = max(0, int(payload.get("segment_index") or 0))
+        audio_offset_ms = max(0, int(payload.get("audio_offset_ms") or 0))
+        started_at_ms = max(0, int(payload.get("started_at_ms") or 0))
+        duration_ms = max(0, int(payload.get("duration_ms") or 0))
+        next_start = max(segment_index, int(payload.get("next_start") or segment_index))
+    except (TypeError, ValueError):
+        return None
+    if started_at_ms and duration_ms:
+        elapsed_ms = max(0, int(time.time() * 1000) - started_at_ms)
+        audio_offset_ms = min(duration_ms, audio_offset_ms + elapsed_ms)
+        if audio_offset_ms >= duration_ms:
+            return next_start, 0
+    return segment_index, audio_offset_ms
 
 
 def _write_audiobook_stream_cursor(
-    session_id: str, manifest_hash: str, stream_id: str, next_start: int
+    session_id: str,
+    manifest_hash: str,
+    stream_id: str,
+    segment_index: int,
+    *,
+    audio_offset_ms: int = 0,
+    duration_ms: int = 0,
+    started_at_ms: int | None = None,
+    next_start: int | None = None,
+    source: str = "stream",
 ) -> None:
     target = _audiobook_stream_cursor_path(session_id, manifest_hash, stream_id)
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}")
-    try:
-        with temporary.open("x", encoding="ascii") as handle:
-            handle.write(f"{max(0, int(next_start))}\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, target)
-    finally:
+    lock_path = target.with_suffix(".cursor.lock")
+    with lock_path.open("a+b") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        now_ms = int(time.time() * 1000)
+        if source == "stream":
+            try:
+                existing = json.loads(target.read_text(encoding="ascii"))
+            except (OSError, TypeError, ValueError):
+                existing = {}
+            try:
+                existing_updated_at_ms = int(existing.get("updated_at_ms") or 0)
+            except (AttributeError, TypeError, ValueError):
+                existing_updated_at_ms = 0
+            if (
+                isinstance(existing, dict)
+                and existing.get("source") == "playback"
+                and now_ms - existing_updated_at_ms < 15_000
+            ):
+                return
+        payload = {
+            "segment_index": max(0, int(segment_index)),
+            "audio_offset_ms": max(0, int(audio_offset_ms)),
+            "duration_ms": max(0, int(duration_ms)),
+            "started_at_ms": max(0, int(started_at_ms or 0)),
+            "next_start": max(
+                0,
+                int(segment_index if next_start is None else next_start),
+            ),
+            "source": "playback" if source == "playback" else "stream",
+            "updated_at_ms": now_ms,
+        }
+        temporary = target.with_name(
+            f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}"
+        )
         try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+            with temporary.open("x", encoding="ascii") as handle:
+                handle.write(json.dumps(payload, separators=(",", ":")))
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _write_audiobook_stream_cursor_safely(*args: Any, **kwargs: Any) -> bool:
+    try:
+        _write_audiobook_stream_cursor(*args, **kwargs)
+    except OSError:
+        return False
+    return True
 
 
 def _claim_audiobook_stream_intent(
@@ -718,9 +811,9 @@ def _claim_audiobook_stream_intent(
 ) -> bool:
     """Claim one logical play intent across workers and media reconnects.
 
-    Browsers may repeat the same media URL with several Range requests.  Only
-    the first request for a client-generated stream ID consumes request quota;
-    synthesis cost and global TTS leases remain independently enforced.
+    Browsers may repeat the same media URL while playing. Only the first
+    request for a client-generated stream ID consumes request quota; later
+    requests resume from its confirmed playback cursor.
     """
     if not stream_id:
         return True
@@ -2753,6 +2846,8 @@ def save_audiobook_progress(
 ):
     owner = _audiobook_session_owner(request, session_id)
     device = _audiobook_device(request)
+    if bool(payload.manifest_hash) != bool(payload.stream_id):
+        raise HTTPException(400, "听书流进度标识不完整")
     try:
         audiobook_service().save_progress(
             session_id,
@@ -2763,6 +2858,24 @@ def save_audiobook_progress(
             item_index=payload.item_index,
             audio_offset_ms=payload.audio_offset_ms,
         )
+        if payload.manifest_hash and payload.stream_id:
+            manifest = audiobook_service().manifest(
+                session_id, payload.manifest_hash, owner
+            )
+            if int(manifest.get("chapter_id") or 0) != payload.chapter_id:
+                raise KeyError("progress chapter does not match manifest")
+            stream_id = _normalize_audiobook_stream_id(payload.stream_id)
+            if not stream_id:
+                raise KeyError("stream id is invalid")
+            _write_audiobook_stream_cursor_safely(
+                session_id,
+                payload.manifest_hash,
+                stream_id,
+                payload.item_index,
+                audio_offset_ms=payload.audio_offset_ms,
+                next_start=payload.item_index,
+                source="playback",
+            )
     except KeyError as exc:
         raise HTTPException(404, "听书会话不存在") from exc
     return PlainTextResponse("", status_code=204)
@@ -2840,9 +2953,10 @@ async def audiobook_chapter_stream(
 
     Ordinary clients receive one five-segment window. Background-capable
     clients may request the remaining chapter through one media URL; synthesis
-    is still bounded to five concurrent segments at a time. Repeating the same
-    URL always returns the same starting audio because media stacks commonly
-    issue a second GET before playback.
+    is still bounded to five concurrent segments at a time. Media stacks may
+    silently GET that URL again without rewinding ``currentTime``. A repeated
+    stream ID therefore resumes from the latest client-confirmed playback
+    cursor instead of replaying the stale query-string start.
     """
     owner = _audiobook_session_owner(request, session_id)
     ip = _request_ip(request)
@@ -2855,6 +2969,8 @@ async def audiobook_chapter_stream(
     segments = list(manifest.get("segments") or [])
     if start >= len(segments):
         raise HTTPException(404, "听书起始片段不存在")
+    requested_start = start
+    requested_offset_ms = offset_ms
     stream_id = _normalize_audiobook_stream_id(stream_id)
     claimed_stream_intent = await asyncio.to_thread(
         _claim_audiobook_stream_intent,
@@ -2862,6 +2978,35 @@ async def audiobook_chapter_stream(
         manifest_hash,
         stream_id,
     )
+    replay_resumed = False
+    if continuous and stream_id and not claimed_stream_intent:
+        replay_cursor = await asyncio.to_thread(
+            _read_audiobook_stream_cursor,
+            session_id,
+            manifest_hash,
+            stream_id,
+        )
+        if replay_cursor is not None:
+            cursor_start, cursor_offset_ms = replay_cursor
+            if cursor_start >= len(segments):
+                cursor_start = len(segments) - 1
+                cached_target, _cached_lock = _audiobook_session_segment_paths(
+                    session_id, manifest_hash, segments[cursor_start]
+                )
+                cached_audio = await asyncio.to_thread(
+                    _read_audiobook_session_segment, cached_target
+                )
+                if cached_audio:
+                    cached_duration_ms = await asyncio.to_thread(
+                        mp3_duration_ms, cached_audio
+                    )
+                    cursor_offset_ms = max(0, cached_duration_ms - 100)
+            if cursor_start > start or (
+                cursor_start == start and cursor_offset_ms > offset_ms
+            ):
+                start = cursor_start
+                offset_ms = cursor_offset_ms
+                replay_resumed = True
     batch = segments[start : start + AUDIOBOOK_STREAM_BATCH_SEGMENTS]
     batch_end = start + len(batch)
     response_end = len(segments) if full_chapter else batch_end
@@ -2892,6 +3037,9 @@ async def audiobook_chapter_stream(
         "X-Audiobook-Manifest": manifest_hash,
         "X-Audiobook-Start-Segment": str(start),
         "X-Audiobook-Resume-Offset-Ms": str(offset_ms),
+        "X-Audiobook-Requested-Start": str(requested_start),
+        "X-Audiobook-Requested-Offset-Ms": str(requested_offset_ms),
+        "X-Audiobook-Replay-Resumed": "1" if replay_resumed else "0",
         "X-Audiobook-Batch-Start": str(start),
         "X-Audiobook-Batch-End": str(response_end),
         "X-Audiobook-Batch-Size": str(len(batch)),
@@ -2903,14 +3051,18 @@ async def audiobook_chapter_stream(
 
     async def audio_chunks():
         completed = False
+        playback_boundary_ms = int(time.time() * 1000)
+        first_stream_segment = True
         try:
             if continuous and stream_id:
                 await asyncio.to_thread(
-                    _write_audiobook_stream_cursor,
+                    _write_audiobook_stream_cursor_safely,
                     session_id,
                     manifest_hash,
                     stream_id,
                     start,
+                    audio_offset_ms=offset_ms,
+                    next_start=start,
                 )
             starts = range(
                 start,
@@ -2938,9 +3090,9 @@ async def audiobook_chapter_stream(
                         for segment in batch_segments
                     ]
                     for position, (segment, task) in enumerate(zip(batch_segments, tasks)):
+                        if await request.is_disconnected():
+                            return
                         if position % 3 == 0:
-                            if await request.is_disconnected():
-                                return
                             try:
                                 audiobook_service().manifest(
                                     session_id, manifest_hash, owner
@@ -2953,8 +3105,14 @@ async def audiobook_chapter_stream(
                         audio = await task
                         if audio is None:
                             return
+                        duration_ms = await asyncio.to_thread(
+                            mp3_duration_ms, audio
+                        )
                         await asyncio.to_thread(
-                            _record_audiobook_segment_duration, segment, audio
+                            _record_audiobook_segment_duration,
+                            segment,
+                            audio,
+                            duration_ms,
                         )
                         frame_audio = _mp3_frame_payload(audio)
                         segment_index = int(
@@ -2962,22 +3120,55 @@ async def audiobook_chapter_stream(
                             if segment.get("index") is not None
                             else batch_start + position
                         )
-                        if continuous and stream_id:
-                            await asyncio.to_thread(
-                                _write_audiobook_stream_cursor,
-                                session_id,
-                                manifest_hash,
-                                stream_id,
-                                min(segment_index + 1, len(segments) - 1),
-                            )
-                        if first_batch and position == 0 and offset_ms > 0:
-                            yield _mp3_frame_payload(
+                        resume_offset_ms = (
+                            offset_ms if first_batch and position == 0 else 0
+                        )
+                        remaining_duration_ms = max(
+                            0, duration_ms - resume_offset_ms
+                        )
+                        if continuous and stream_id and not first_stream_segment:
+                            prebuffer_ms = min(750, remaining_duration_ms // 4)
+                            wait_ms = playback_boundary_ms - int(time.time() * 1000)
+                            if wait_ms > prebuffer_ms:
+                                await asyncio.sleep((wait_ms - prebuffer_ms) / 1000)
+                            if await request.is_disconnected():
+                                return
+                        if resume_offset_ms > 0:
+                            outgoing_audio = _mp3_frame_payload(
                                 await asyncio.to_thread(
-                                    _trim_mp3_audio, audio, offset_ms
+                                    _trim_mp3_audio, audio, resume_offset_ms
                                 )
                             )
                         else:
-                            yield frame_audio
+                            outgoing_audio = frame_audio
+                        yield outgoing_audio
+                        if continuous and stream_id:
+                            if not first_stream_segment:
+                                wait_ms = playback_boundary_ms - int(
+                                    time.time() * 1000
+                                )
+                                if wait_ms > 0:
+                                    await asyncio.sleep(wait_ms / 1000)
+                            segment_started_at_ms = (
+                                int(time.time() * 1000)
+                                if first_stream_segment
+                                else playback_boundary_ms
+                            )
+                            await asyncio.to_thread(
+                                _write_audiobook_stream_cursor_safely,
+                                session_id,
+                                manifest_hash,
+                                stream_id,
+                                segment_index,
+                                audio_offset_ms=resume_offset_ms,
+                                duration_ms=duration_ms,
+                                started_at_ms=segment_started_at_ms,
+                                next_start=min(segment_index + 1, len(segments)),
+                            )
+                            playback_boundary_ms = (
+                                segment_started_at_ms + remaining_duration_ms
+                            )
+                        first_stream_segment = False
                 finally:
                     for task in tasks:
                         if not task.done():

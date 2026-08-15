@@ -27,6 +27,7 @@ data/
 htmlcov/
 node_modules/
 .dart_tool/
+mobile/android/.kotlin/
 build/
 *.egg-info/
 .DS_Store

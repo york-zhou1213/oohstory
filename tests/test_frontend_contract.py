@@ -35,7 +35,7 @@ def test_reader_assets_use_current_cache_busters() -> None:
     assert 'href="/styles.css?v=20260810-authcoverorbit1"' in html
     assert 'src="/audiobook-lifecycle.js?v=20260811-audiobook-v15-5-preload-contract"' in html
     assert 'src="/audiobook-fallback.js?v=20260811-audiobook-v15-5-preload-contract"' in html
-    assert 'src="/app.js?v=20260814-audiobook-v15-26-background-cursor"' in html
+    assert 'src="/app.js?v=20260815-audiobook-replay-resume1"' in html
     assert 'href="/api/v1/home/hero-cover?variant=mobile"' not in html
     assert "data-hero-primer" not in html
     assert 'src="/account-ui.js?v=20260811-googlefirst1"' in html

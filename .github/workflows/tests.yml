@@ -18,7 +18,12 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements.txt -r requirements-dev.txt
       - run: python scripts/check_repository_secrets.py .
-      - run: python -m pytest -q
+      - name: Run Reader tests in isolated modules
+        run: |
+          set -euo pipefail
+          for test_file in tests/test_*.py; do
+            python -m pytest -q "$test_file"
+          done
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -34,8 +39,13 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install './admin[test]'
-      - working-directory: admin
-        run: PYTHONPATH=src python -m pytest -q tests
+      - name: Run Admin tests in isolated modules
+        working-directory: admin
+        run: |
+          set -euo pipefail
+          for test_file in tests/test_*.py; do
+            PYTHONPATH=src python -m pytest -q "$test_file"
+          done
       - working-directory: admin
         run: PYTHONPATH=src python -m compileall -q src tests
       - working-directory: admin
@@ -85,7 +95,7 @@ jobs:
             --user root \
             --password-file "$RUNNER_TEMP/mysql-password"
           test "$(mysql -N -B -h127.0.0.1 -uroot -e \
-            "SELECT COUNT(*) FROM mysql.user WHERE User IN ('oohstory_library_writer_role','oohstory_library_reader_role','oohstory_public_reader_role')")" = "3"
+            "SELECT COUNT(*) FROM mysql.user WHERE User IN ('oohstory_library_writer_role','oohstory_library_reader_role')")" = "2"
       - name: Refuse a second fresh initializer
         working-directory: admin
         env:
@@ -121,6 +131,7 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: "3.32.4"
           cache: true
       - working-directory: mobile
         run: flutter pub get

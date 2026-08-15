@@ -446,7 +446,7 @@ def test_audiobook_v9_closes_resume_cache_cleanup_and_adaptive_prefetch_contract
     assert "payload.resume?.audio_offset_ms" in app_script
     assert "offset_ms=${encodeURIComponent" in app_script
     assert "/timeline" in app_script
-    assert '(".complete", ".intent", ".cursor")' in maintenance
+    assert '(".complete", ".intent", ".cursor", ".cursor.lock")' in maintenance
     assert 'counts["audio_jobs"] = _cleanup_audio_jobs()' in maintenance
     assert "CPUQuota=35%" in review_unit
     assert "MemoryMax=512M" in review_unit

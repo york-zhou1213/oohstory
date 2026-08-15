@@ -3578,7 +3578,9 @@ async function loadReader(bookId, chapterId) {
           chapter_id: Number(current.chapterId),
           paragraph_index: Math.max(0, Number(current.paragraphIndex) || 0),
           item_index: Math.max(0, Number(activeItem?.index ?? current.absoluteItemIndex ?? current.itemIndex) || 0),
-          audio_offset_ms: Math.max(0, Math.round(itemOffsetSeconds * 1000))
+          audio_offset_ms: Math.max(0, Math.round(itemOffsetSeconds * 1000)),
+          manifest_hash: !ttsSegmentFallbackMode && ttsActiveStreamId ? audiobookManifestHash : null,
+          stream_id: !ttsSegmentFallbackMode && ttsActiveStreamId ? ttsActiveStreamId : null
         })
       }).catch(() => null)
     }

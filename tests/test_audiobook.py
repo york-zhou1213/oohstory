@@ -7,6 +7,7 @@ from dataclasses import replace
 from decimal import Decimal
 import json
 from pathlib import Path
+import time
 
 from app.audiobook import (
     AudiobookService,
@@ -3024,7 +3025,7 @@ def test_duplicate_chapter_stream_get_reuses_session_audio_cache(
     assert "characters" not in charged
 
 
-def test_duplicate_continuous_stream_get_is_idempotent(
+def test_duplicate_continuous_stream_get_resumes_at_live_cursor(
     monkeypatch, tmp_path
 ):
     session_id = "a" * 32
@@ -3077,11 +3078,138 @@ def test_duplicate_continuous_stream_get_is_idempotent(
     assert first.content == b"mp3-0mp3-1mp3-2"
     assert first.headers["x-audiobook-stream-mode"] == "continuous"
     assert duplicate.status_code == 200
-    assert duplicate.content == first.content
-    assert duplicate.headers["x-audiobook-start-segment"] == "0"
+    assert duplicate.content == b"mp3-2"
+    assert duplicate.headers["x-audiobook-start-segment"] == "2"
+    assert duplicate.headers["x-audiobook-requested-start"] == "0"
+    assert duplicate.headers["x-audiobook-replay-resumed"] == "1"
     assert duplicate.headers["x-audiobook-stream-mode"] == "continuous"
     assert sorted(synthesized) == [0, 1, 2]
     assert charged.count("chapter-stream-requests") == 1
+
+
+def test_progress_receipt_moves_repeated_stream_to_confirmed_playback_cursor(
+    monkeypatch, tmp_path
+):
+    session_id = "a" * 32
+    manifest_hash = "b" * 64
+    stream_id = "c" * 32
+    saved: list[dict[str, int | str]] = []
+
+    class FakeService:
+        def save_progress(self, seen_session, _owner, **values):
+            assert seen_session == session_id
+            saved.append(values)
+
+        def manifest(self, seen_session, seen_manifest, _owner):
+            assert (seen_session, seen_manifest) == (session_id, manifest_hash)
+            return {"chapter_id": 3, "segments": [{"index": 7}]}
+
+    monkeypatch.setattr(main, "settings", replace(main.settings, state_root=tmp_path))
+    monkeypatch.setattr(main, "audiobook_service", lambda: FakeService())
+    response = TestClient(main.app).put(
+        f"/api/v1/audiobook/sessions/{session_id}/progress",
+        headers={"X-Audiobook-Client": "client_1234567890123456"},
+        json={
+            "chapter_id": 3,
+            "paragraph_index": 5,
+            "item_index": 7,
+            "audio_offset_ms": 1234,
+            "manifest_hash": manifest_hash,
+            "stream_id": stream_id,
+        },
+    )
+
+    assert response.status_code == 204
+    assert saved[0]["item_index"] == 7
+    assert main._read_audiobook_stream_cursor(
+        session_id, manifest_hash, stream_id
+    ) == (7, 1234)
+
+
+def test_fresh_playback_cursor_wins_over_stream_generator_cursor(
+    monkeypatch, tmp_path
+):
+    session_id = "a" * 32
+    manifest_hash = "b" * 64
+    stream_id = "c" * 32
+    monkeypatch.setattr(main, "settings", replace(main.settings, state_root=tmp_path))
+
+    main._write_audiobook_stream_cursor(
+        session_id,
+        manifest_hash,
+        stream_id,
+        18,
+        audio_offset_ms=2400,
+        next_start=18,
+        source="playback",
+    )
+    main._write_audiobook_stream_cursor(
+        session_id,
+        manifest_hash,
+        stream_id,
+        40,
+        duration_ms=10_000,
+        started_at_ms=int(time.time() * 1000),
+        next_start=41,
+        source="stream",
+    )
+
+    assert main._read_audiobook_stream_cursor(
+        session_id, manifest_hash, stream_id
+    ) == (18, 2400)
+
+
+def test_repeated_stream_uses_confirmed_item_and_in_segment_offset(
+    monkeypatch, tmp_path
+):
+    session_id = "a" * 32
+    manifest_hash = "b" * 64
+    stream_id = "c" * 32
+
+    class FakeService:
+        def manifest(self, *_args):
+            return {
+                "manifest_hash": manifest_hash,
+                "segments": [
+                    {"index": index, "text": f"第{index}句"}
+                    for index in range(10)
+                ],
+            }
+
+    async def fake_segment_bytes(segment):
+        return f"mp3-{segment['index']}".encode()
+
+    monkeypatch.setattr(main, "settings", replace(main.settings, state_root=tmp_path))
+    monkeypatch.setattr(main, "audiobook_service", lambda: FakeService())
+    monkeypatch.setattr(main, "_audiobook_segment_bytes", fake_segment_bytes)
+    monkeypatch.setattr(main, "_audiobook_quota", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        main, "_trim_mp3_audio", lambda audio, offset: b"trimmed-" + audio
+    )
+    assert main._claim_audiobook_stream_intent(
+        session_id, manifest_hash, stream_id
+    )
+    main._write_audiobook_stream_cursor(
+        session_id,
+        manifest_hash,
+        stream_id,
+        7,
+        audio_offset_ms=1234,
+        next_start=7,
+        source="playback",
+    )
+
+    response = TestClient(main.app).get(
+        f"/api/v1/audiobook/sessions/{session_id}/chapters/{manifest_hash}/stream.mp3"
+        f"?start=1&offset_ms=0&stream_id={stream_id}&continuous=1&full_chapter=1",
+        headers={"X-Audiobook-Client": "client_1234567890123456"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-audiobook-start-segment"] == "7"
+    assert response.headers["x-audiobook-resume-offset-ms"] == "1234"
+    assert response.headers["x-audiobook-replay-resumed"] == "1"
+    assert response.content.startswith(b"trimmed-mp3-7mp3-8mp3-9")
 
 
 def test_parallel_duplicate_stream_gets_share_session_audio(monkeypatch, tmp_path):
@@ -3226,8 +3354,10 @@ def test_legacy_stream_ids_are_normalized_before_streaming(
     assert first.content == b"mp3-22mp3-23mp3-24"
     assert first.headers["x-audiobook-start-segment"] == "0"
     assert duplicate.status_code == 200
-    assert duplicate.content == first.content
-    assert duplicate.headers["x-audiobook-start-segment"] == "0"
+    assert duplicate.content == b"mp3-24"
+    assert duplicate.headers["x-audiobook-start-segment"] == "2"
+    assert duplicate.headers["x-audiobook-requested-start"] == "0"
+    assert duplicate.headers["x-audiobook-replay-resumed"] == "1"
     assert completed.status_code == 200
     assert completed.json() == {"complete": True}
     assert sorted(synthesized) == [22, 23, 24]
