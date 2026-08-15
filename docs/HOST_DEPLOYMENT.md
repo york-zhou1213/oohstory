@@ -4,6 +4,13 @@ OOH Story 的正式部署不依赖 Docker。推荐在 Ubuntu 24.04 LTS 或 Debia
 
 本文给出从空主机开始的部署顺序。示例域名、路径和账号必须在私有配置中替换，密码、证书和 `.env` 文件不得提交到 Git。
 
+先安装运行时系统依赖；Admin 使用 ImageMagick 在受限资源下识别来源站占位封面：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y imagemagick
+```
+
 ## 1. 准备系统账号与目录
 
 ```bash
