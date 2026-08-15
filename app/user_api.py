@@ -5,6 +5,7 @@ from __future__ import annotations
 from app.error_boundaries import RECOVERABLE_INTEGRATION_ERRORS
 
 import asyncio
+from decimal import Decimal
 from io import BytesIO
 import os
 import re
@@ -44,6 +45,7 @@ from .accounts import (
     SessionContext,
 )
 from .settings import Settings
+from .library import OOHSTORY_DEFAULT_COVER_URL
 from .email_delivery import send_verification, smtp_configured
 from .upload_security import UploadSecurityError, UploadSecurityScanner
 from .upload_worker import inspect_upload_once
@@ -206,6 +208,29 @@ class RecommendationDonation(BaseModel):
         ):
             raise ValueError("助力事件标识无效")
         return candidate
+
+
+class DeconstructionTaskCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    book_title: str = Field(min_length=1, max_length=160)
+    author: str = Field(default="", max_length=100)
+    request_note: str = Field(default="", max_length=2000)
+
+
+class ReadingPointConversion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    points: int = Field(ge=1, le=1000)
+    request_id: UUID4
+
+
+class DeconstructionPriceUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    download_points: Decimal = Field(ge=0, le=999, decimal_places=2)
+
+
+class DeconstructionPurchase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_points: Decimal = Field(gt=0, le=999, decimal_places=2)
 
 
 class ParagraphCommentCreate(BaseModel):
@@ -512,6 +537,71 @@ def create_user_router(
             decoded = decoded.convert("RGBA" if "A" in decoded.getbands() else "RGB")
         decoded.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
         return decoded
+
+    def catalog_submission_cover(title: str) -> dict[str, Any]:
+        repository = repository_provider()
+        if hasattr(repository, "submission_cover"):
+            try:
+                result = repository.submission_cover(str(title or ""))
+                return {
+                    "book_id": result.get("book_id"),
+                    "cover_url": str(
+                        result.get("cover_url") or OOHSTORY_DEFAULT_COVER_URL
+                    ),
+                    "cover_is_default": bool(result.get("cover_is_default", True)),
+                }
+            except RECOVERABLE_INTEGRATION_ERRORS:
+                pass
+        return {
+            "book_id": None,
+            "cover_url": OOHSTORY_DEFAULT_COVER_URL,
+            "cover_is_default": True,
+        }
+
+    def private_submission_cover_url(
+        submission_type: str, submission_id: str, version: int
+    ) -> str:
+        return (
+            f"/api/v1/me/submissions/{submission_type}/{submission_id}/cover"
+            f"?v={max(int(version or 0), 0)}"
+        )
+
+    def decorate_submission_cover(
+        item: dict[str, Any], submission_type: str, *, published: bool
+    ) -> dict[str, Any]:
+        version = int(item.get("cover_override_version") or 0)
+        if item.get("has_cover_override"):
+            item["cover_url"] = private_submission_cover_url(
+                submission_type, str(item["id"]), version
+            )
+            item["cover_is_default"] = False
+            item["cover_source"] = "custom"
+            return item
+        if not published and submission_type == "novel" and item.get(
+            "has_uploaded_cover"
+        ):
+            item["cover_url"] = private_submission_cover_url(
+                submission_type, str(item["id"]), version
+            )
+            item["cover_is_default"] = False
+            item["cover_source"] = "submitted"
+            return item
+        title = (
+            str(item.get("title") or "")
+            if submission_type == "novel"
+            else str(item.get("output_slug") or item.get("original_filename") or "")
+        )
+        title = re.sub(r"\.zip$", "", title, flags=re.IGNORECASE)
+        catalog = catalog_submission_cover(title) if published else {
+            "book_id": None,
+            "cover_url": OOHSTORY_DEFAULT_COVER_URL,
+            "cover_is_default": True,
+        }
+        item.update(catalog)
+        item["cover_source"] = (
+            "default" if catalog["cover_is_default"] else "library"
+        )
+        return item
 
     async def decode_avatar(file: UploadFile) -> Image.Image:
         raw = bytearray()
@@ -956,6 +1046,78 @@ def create_user_router(
     def reading_level(request: Request) -> dict[str, Any]:
         return store().reading_summary(auth(request).user_id)
 
+    @router.get("/me/wallet")
+    def point_wallet(request: Request) -> dict[str, Any]:
+        return store().wallet_summary(auth(request).user_id)
+
+    @router.post("/me/wallet/convert-reading")
+    def convert_reading_points(
+        payload: ReadingPointConversion, request: Request
+    ) -> dict[str, Any]:
+        session = auth(request, mutation=True)
+        try:
+            return store().convert_reading_to_points(
+                session.user_id, payload.points, str(payload.request_id)
+            )
+        except AccountError as exc:
+            raise error(exc) from exc
+
+    @router.get("/deconstruction-tasks")
+    def deconstruction_tasks(request: Request) -> dict[str, Any]:
+        session = auth(request)
+        return {
+            "items": store().list_deconstruction_tasks(session.user_id),
+            "expires_after_days": 7,
+        }
+
+    @router.post("/deconstruction-tasks", status_code=201)
+    def create_deconstruction_task(
+        payload: DeconstructionTaskCreate, request: Request
+    ) -> dict[str, Any]:
+        session = auth(request, mutation=True)
+        if not session.email_verified:
+            raise HTTPException(status_code=403, detail="验证邮箱后才能发布拆书任务")
+        try:
+            return store().create_deconstruction_task(
+                session.user_id,
+                book_title=payload.book_title,
+                author=payload.author,
+                request_note=payload.request_note,
+            )
+        except AccountError as exc:
+            raise error(exc) from exc
+
+    @router.post("/deconstruction-tasks/{task_id}/claim")
+    def claim_deconstruction_task(task_id: UUID4, request: Request) -> dict[str, Any]:
+        session = auth(request, mutation=True)
+        if not session.email_verified:
+            raise HTTPException(status_code=403, detail="验证邮箱后才能接取拆书任务")
+        try:
+            task = store().claim_deconstruction_task(str(task_id), session.user_id)
+            creator = str(task.get("creator_user_id") or "")
+            if creator:
+                store().create_notification(
+                    creator,
+                    kind="deconstruction_task_claimed",
+                    title="拆书任务已被接取",
+                    message=f"“{task.get('book_title') or '拆书任务'}”已由 {session.display_name} 接取。",
+                    action_url="#/account/deconstruction-tasks",
+                    resource_type="deconstruction_task",
+                    resource_id=str(task_id),
+                    dedupe_key=f"task-claimed:{task_id}:{session.user_id}",
+                )
+            return task
+        except AccountError as exc:
+            raise error(exc) from exc
+
+    @router.delete("/deconstruction-tasks/{task_id}/claim")
+    def release_deconstruction_task(task_id: UUID4, request: Request) -> dict[str, Any]:
+        session = auth(request, mutation=True)
+        try:
+            return store().release_deconstruction_task(str(task_id), session.user_id)
+        except AccountError as exc:
+            raise error(exc) from exc
+
     @router.post("/me/reading-heartbeat")
     def reading_heartbeat(
         payload: ReadingHeartbeat, request: Request
@@ -1297,7 +1459,148 @@ def create_user_router(
     def upload_history(request: Request) -> dict[str, Any]:
         session = auth(request)
         reconcile_results(store(), settings, user_id=session.user_id)
-        return {"items": store().uploads(session.user_id)}
+        return {
+            "items": [
+                decorate_submission_cover(item, "deconstruction", published=False)
+                for item in store().uploads(session.user_id)
+            ]
+        }
+
+    @router.get("/me/published-submissions")
+    def published_submissions(request: Request) -> dict[str, Any]:
+        """Return only contributions that completed review and public ingestion."""
+        session = auth(request)
+        reconcile_results(store(), settings, user_id=session.user_id)
+        account_store = store()
+        novels = account_store.novel_submissions(
+            session.user_id, published_only=True
+        )
+        deconstructions = account_store.uploads(
+            session.user_id, published_only=True
+        )
+        return {
+            "novels": [
+                decorate_submission_cover(item, "novel", published=True)
+                for item in novels
+            ],
+            "deconstructions": [
+                decorate_submission_cover(item, "deconstruction", published=True)
+                for item in deconstructions
+            ],
+        }
+
+    @router.get("/me/submissions/{submission_type}/{submission_id}/cover")
+    def get_submission_cover(
+        submission_type: str, submission_id: UUID4, request: Request
+    ) -> FileResponse:
+        session = auth(request)
+        try:
+            record = store().submission_cover_record(
+                session.user_id,
+                submission_type,
+                str(submission_id),
+            )
+        except AccountError as exc:
+            raise error(exc) from exc
+        relative_path = str(record.get("path") or "")
+        root = settings.user_upload_root.resolve()
+        path = (root / relative_path).resolve() if relative_path else root
+        if (
+            not relative_path
+            or root not in path.parents
+            or path.is_symlink()
+            or not path.is_file()
+        ):
+            raise HTTPException(status_code=404, detail="投稿封面不存在")
+        return FileResponse(
+            path,
+            media_type="image/png",
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Disposition": 'inline; filename="submission-cover.png"',
+            },
+        )
+
+    @router.post("/me/submissions/{submission_type}/{submission_id}/cover")
+    async def update_submission_cover(
+        submission_type: str,
+        submission_id: UUID4,
+        request: Request,
+        file: UploadFile = File(...),
+    ) -> dict[str, Any]:
+        session = auth(request, mutation=True)
+        canonical_id = str(submission_id)
+        try:
+            store().submission_cover_record(
+                session.user_id,
+                submission_type,
+                canonical_id,
+                published_only=True,
+            )
+        except AccountError as exc:
+            await file.close()
+            raise error(exc) from exc
+        raw = bytearray()
+        try:
+            while chunk := await file.read(256 * 1024):
+                raw.extend(chunk)
+                if len(raw) > settings.max_avatar_bytes:
+                    raise HTTPException(
+                        status_code=413, detail="封面文件不能超过上传大小限制"
+                    )
+        finally:
+            await file.close()
+        root = settings.user_upload_root.resolve()
+        directory = (root / session.user_id / canonical_id).resolve()
+        if root not in directory.parents:
+            raise HTTPException(status_code=422, detail="投稿封面路径无效")
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(directory, 0o700)
+        raw_path = directory / f".cover-scan-{secrets.token_hex(8)}.tmp"
+        temporary = directory / f".published-cover-{secrets.token_hex(8)}.tmp"
+        target = directory / "published-cover.png"
+        image: Image.Image | None = None
+        converted: Image.Image | None = None
+        try:
+            raw_path.write_bytes(raw)
+            os.chmod(raw_path, 0o600)
+            await asyncio.to_thread(
+                UploadSecurityScanner().scan_binary,
+                raw_path,
+                max_bytes=settings.max_avatar_bytes,
+            )
+            image = decode_image_bytes(raw)
+            converted = image.convert("RGB")
+            with temporary.open("xb") as handle:
+                converted.save(handle, format="PNG", optimize=True)
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, target)
+            relative_path = str(target.relative_to(root))
+            version = store().update_published_submission_cover(
+                session.user_id,
+                submission_type,
+                canonical_id,
+                relative_path,
+            )
+        except UploadSecurityError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AccountError as exc:
+            raise error(exc) from exc
+        finally:
+            raw_path.unlink(missing_ok=True)
+            temporary.unlink(missing_ok=True)
+            if converted is not None:
+                converted.close()
+            if image is not None:
+                image.close()
+        return {
+            "cover_url": private_submission_cover_url(
+                submission_type, canonical_id, version
+            ),
+            "cover_source": "custom",
+            "message": "封面已更新",
+        }
 
     @router.get("/me/notifications")
     def notification_history(
@@ -1341,6 +1644,7 @@ def create_user_router(
         request: Request,
         background_tasks: BackgroundTasks,
         file: UploadFile = File(...),
+        task_id: str = Form(""),
     ) -> dict[str, Any]:
         session = auth(request, mutation=True)
         if not session.email_verified:
@@ -1361,9 +1665,15 @@ def create_user_router(
             raise HTTPException(
                 status_code=415, detail="请上传 oh-story-claudecode 结构的 ZIP 文件"
             )
-        upload_id = store().create_upload(
-            session.user_id, original, file.content_type or ""
-        )
+        try:
+            upload_id = store().create_upload(
+                session.user_id,
+                original,
+                file.content_type or "",
+                task_id=task_id,
+            )
+        except AccountError as exc:
+            raise error(exc) from exc
         directory = settings.user_upload_root / session.user_id / upload_id
         directory.mkdir(parents=True, exist_ok=False, mode=0o700)
         target = directory / "source.zip"
@@ -1397,11 +1707,24 @@ def create_user_router(
             kind="submission_received",
             title="拆书文上传成功",
             message=f"“{original}”上传成功，正在等待审核。",
-            action_url="#/account/submissions",
+            action_url="#/account/submit",
             resource_type="deconstruction",
             resource_id=upload_id,
             dedupe_key=f"received:deconstruction:{upload_id}",
         )
+        if task_id:
+            task_creator = account_store.task_creator_user_id(task_id)
+            if task_creator and task_creator != session.user_id:
+                account_store.create_notification(
+                    task_creator,
+                    kind="deconstruction_task_submitted",
+                    title="拆书任务已提交档案",
+                    message=f"{session.display_name} 已上传“{original}”，档案正在审核。",
+                    action_url="#/account/deconstruction-tasks",
+                    resource_type="deconstruction_task",
+                    resource_id=task_id,
+                    dedupe_key=f"task-submitted:{task_id}:{upload_id}",
+                )
         background_tasks.add_task(
             inspect_upload_once,
             settings,
@@ -1413,14 +1736,19 @@ def create_user_router(
             "status": "quarantined",
             "bytes": size,
             "original_filename": original,
-            "message": "上传成功，正在等待审核",
+            "message": "上传成功，正在统计原文字数并等待审核",
         }
 
     @router.get("/me/novel-submissions")
     def novel_submission_history(request: Request) -> dict[str, Any]:
         session = auth(request)
         reconcile_results(store(), settings, user_id=session.user_id)
-        return {"items": store().novel_submissions(session.user_id)}
+        return {
+            "items": [
+                decorate_submission_cover(item, "novel", published=False)
+                for item in store().novel_submissions(session.user_id)
+            ]
+        }
 
     @router.post("/me/novel-submissions", status_code=201)
     async def submit_novel(
@@ -1536,13 +1864,19 @@ def create_user_router(
         request: Request,
         background_tasks: BackgroundTasks,
     ) -> FileResponse:
-        auth(request)
+        session = auth(request)
         allowed = {
             str(item.get("slug"))
             for item in repository_provider().list_deconstructions()
         }
         if slug not in allowed:
             raise HTTPException(status_code=404, detail="拆书档案不存在")
+        access = store().deconstruction_access(session.user_id, slug)
+        if not access["can_download"]:
+            raise HTTPException(
+                status_code=402,
+                detail=f"下载该档案需要 {access['download_points']} 积分",
+            )
         root = (settings.deconstruction_root / slug).resolve()
         if root.parent != settings.deconstruction_root.resolve() or not root.is_dir():
             raise HTTPException(status_code=404, detail="拆书档案不存在")
@@ -1586,6 +1920,62 @@ def create_user_router(
         except BaseException:
             Path(archive_name).unlink(missing_ok=True)
             raise
+
+    @router.get("/me/deconstructions/{slug}/access")
+    def deconstruction_download_access(
+        slug: str,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        session = auth(request)
+        allowed = {
+            str(item.get("slug"))
+            for item in repository_provider().list_deconstructions()
+        }
+        if slug not in allowed:
+            raise HTTPException(status_code=404, detail="拆书档案不存在")
+        response.headers["Cache-Control"] = "private, no-store"
+        return store().deconstruction_access(session.user_id, slug) | {
+            "balance": store().wallet_summary(session.user_id)["balance"]
+        }
+
+    @router.patch("/me/deconstructions/{slug}/price")
+    def update_deconstruction_download_price(
+        slug: str,
+        payload: DeconstructionPriceUpdate,
+        request: Request,
+    ) -> dict[str, Any]:
+        session = auth(request, mutation=True)
+        try:
+            return store().update_deconstruction_price(
+                session.user_id,
+                slug,
+                payload.download_points,
+            )
+        except AccountError as exc:
+            raise error(exc) from exc
+
+    @router.post("/me/deconstructions/{slug}/purchase")
+    def purchase_deconstruction(
+        slug: str,
+        request: Request,
+        payload: DeconstructionPurchase | None = None,
+    ) -> dict[str, Any]:
+        session = auth(request, mutation=True)
+        allowed = {
+            str(item.get("slug"))
+            for item in repository_provider().list_deconstructions()
+        }
+        if slug not in allowed:
+            raise HTTPException(status_code=404, detail="拆书档案不存在")
+        try:
+            return store().purchase_deconstruction(
+                session.user_id,
+                slug,
+                expected_points=(payload.expected_points if payload else None),
+            )
+        except AccountError as exc:
+            raise error(exc) from exc
 
     @router.get("/deconstructions/{slug}/likes")
     def deconstruction_likes(slug: str, request: Request) -> dict[str, Any]:

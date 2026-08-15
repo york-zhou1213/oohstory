@@ -7,7 +7,10 @@ from typing import Any
 
 from .accounts import AccountError, AccountStore
 from .settings import Settings
-from .submissions import inspect_deconstruction_structure
+from .submissions import (
+    inspect_deconstruction_original,
+    inspect_deconstruction_structure,
+)
 from .upload_security import UploadSecurityError, UploadSecurityScanner
 
 
@@ -39,6 +42,8 @@ def inspect_upload_once(
         shutil.rmtree(extracted, ignore_errors=True)
         names = UploadSecurityScanner.safe_extract_zip(source, extracted)
         structure = inspect_deconstruction_structure(names)
+        if structure.get("valid"):
+            structure.update(inspect_deconstruction_original(extracted, structure))
         store.finish_upload(
             claimed_id,
             user_id,
@@ -49,7 +54,7 @@ def inspect_upload_once(
             structure=structure,
         )
         return {"id": claimed_id, "status": "ai_pending", "structure": structure}
-    except (UploadSecurityError, AccountError) as exc:
+    except (UploadSecurityError, AccountError, ValueError) as exc:
         shutil.rmtree(directory, ignore_errors=True)
         store.reject_upload(claimed_id, user_id, str(exc))
         store.create_notification(
@@ -57,7 +62,7 @@ def inspect_upload_once(
             kind="submission_scan",
             title="拆书文安全检查未通过",
             message=str(exc),
-            action_url="#/account/submissions",
+            action_url="#/account/submit",
             resource_type="deconstruction",
             resource_id=claimed_id,
             dedupe_key=f"scan:deconstruction:{claimed_id}:rejected",

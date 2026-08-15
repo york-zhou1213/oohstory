@@ -25,6 +25,14 @@ from argon2.exceptions import InvalidHashError, VerifyMismatchError
 from email_validator import EmailNotValidError, validate_email
 
 from .comment_moderation import moderate_comment, moderate_display_name
+from .point_pricing import (
+    MAX_DOWNLOAD_POINT_UNITS,
+    POINT_SCALE,
+    deconstruction_reward_units,
+    point_label,
+    point_units,
+    point_value,
+)
 
 
 PASSWORD_HASHER = PasswordHasher(
@@ -59,6 +67,9 @@ READING_LEVELS: tuple[tuple[str, str, int], ...] = (
     ("ⅩⅧ", "水月镜花", 100_000),
 )
 RECOMMENDATION_COST_SECONDS = 3_600
+POINT_READING_SECONDS = 3_600
+DECONSTRUCTION_TASK_TTL_DAYS = 7
+MAX_ACTIVE_DECONSTRUCTION_TASKS = 10
 RECOMMENDATION_EVENT_NAMESPACE = uuid.UUID("09abdf73-f981-45bb-91ef-7317c610281f")
 
 
@@ -424,7 +435,15 @@ CREATE TABLE IF NOT EXISTS deconstruction_uploads (
   scanned_at TEXT,
   queued_at TEXT,
   completed_at TEXT,
-  output_slug TEXT
+  output_slug TEXT,
+  task_id TEXT,
+  download_points INTEGER NOT NULL DEFAULT 0 CHECK(download_points BETWEEN 0 AND 999),
+  download_point_units INTEGER NOT NULL DEFAULT 0
+    CHECK(download_point_units BETWEEN 0 AND 99900),
+  reward_point_units INTEGER NOT NULL DEFAULT 0
+    CHECK(reward_point_units BETWEEN 0 AND 99900),
+  cover_override_path TEXT,
+  cover_override_version INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_upload_user_history
   ON deconstruction_uploads(user_id, created_at DESC);
@@ -436,6 +455,71 @@ CREATE TABLE IF NOT EXISTS deconstruction_download_metrics (
   slug TEXT PRIMARY KEY,
   download_count INTEGER NOT NULL DEFAULT 0 CHECK(download_count >= 0),
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deconstruction_tasks (
+  id TEXT PRIMARY KEY,
+  creator_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  book_title TEXT NOT NULL,
+  author TEXT NOT NULL DEFAULT '',
+  request_note TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','claimed','submitted','completed','cancelled','expired')),
+  claimed_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  submission_id TEXT,
+  output_slug TEXT,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  claimed_at TEXT,
+  submitted_at TEXT,
+  completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_deconstruction_tasks_status_expiry
+  ON deconstruction_tasks(status,expires_at,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_deconstruction_tasks_creator
+  ON deconstruction_tasks(creator_user_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_deconstruction_tasks_claimer
+  ON deconstruction_tasks(claimed_by_user_id,created_at DESC);
+
+CREATE TABLE IF NOT EXISTS user_point_wallets (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  balance INTEGER NOT NULL DEFAULT 0 CHECK(balance >= 0),
+  balance_units INTEGER NOT NULL DEFAULT 0 CHECK(balance_units >= 0),
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_point_ledger (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  delta INTEGER NOT NULL,
+  balance_after INTEGER NOT NULL CHECK(balance_after >= 0),
+  delta_units INTEGER NOT NULL DEFAULT 0,
+  balance_after_units INTEGER NOT NULL DEFAULT 0 CHECK(balance_after_units >= 0),
+  kind TEXT NOT NULL,
+  reference_type TEXT NOT NULL DEFAULT '',
+  reference_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  UNIQUE(user_id,kind,reference_type,reference_id)
+);
+CREATE INDEX IF NOT EXISTS idx_point_ledger_user_created
+  ON user_point_ledger(user_id,created_at DESC);
+
+CREATE TABLE IF NOT EXISTS deconstruction_products (
+  slug TEXT PRIMARY KEY,
+  contributor_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  task_id TEXT,
+  download_points INTEGER NOT NULL DEFAULT 0 CHECK(download_points BETWEEN 0 AND 999),
+  download_point_units INTEGER NOT NULL DEFAULT 0
+    CHECK(download_point_units BETWEEN 0 AND 99900),
+  published_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deconstruction_purchases (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  slug TEXT NOT NULL,
+  points_spent INTEGER NOT NULL CHECK(points_spent > 0),
+  point_units_spent INTEGER NOT NULL DEFAULT 0 CHECK(point_units_spent >= 0),
+  purchased_at TEXT NOT NULL,
+  PRIMARY KEY(user_id,slug)
 );
 
 CREATE TABLE IF NOT EXISTS deconstruction_likes (
@@ -467,6 +551,10 @@ CREATE TABLE IF NOT EXISTS novel_submissions (
   review_result TEXT,
   rejection_reason TEXT,
   handoff_manifest TEXT,
+  catalog_id TEXT,
+  public_id TEXT,
+  cover_override_path TEXT,
+  cover_override_version INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   reviewed_at TEXT,
   completed_at TEXT
@@ -635,11 +723,32 @@ class AccountStore:
             "reviewed_at": "TEXT",
             "handoff_manifest": "TEXT",
             "review_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "task_id": "TEXT",
+            "download_points": "INTEGER NOT NULL DEFAULT 0",
+            "download_point_units": "INTEGER NOT NULL DEFAULT 0",
+            "reward_point_units": "INTEGER NOT NULL DEFAULT 0",
+            "cover_override_path": "TEXT",
+            "cover_override_version": "INTEGER NOT NULL DEFAULT 0",
         }
         for name, ddl in columns.items():
             if name not in existing:
                 connection.execute(
                     f"ALTER TABLE deconstruction_uploads ADD COLUMN {name} {ddl}"
+                )
+        novel_existing = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(novel_submissions)")
+        }
+        novel_columns = {
+            "catalog_id": "TEXT",
+            "public_id": "TEXT",
+            "cover_override_path": "TEXT",
+            "cover_override_version": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, ddl in novel_columns.items():
+            if name not in novel_existing:
+                connection.execute(
+                    f"ALTER TABLE novel_submissions ADD COLUMN {name} {ddl}"
                 )
         reaction_columns = {
             str(row[1])
@@ -656,6 +765,11 @@ class AccountStore:
             "ON deconstruction_uploads(sha256) WHERE sha256 IS NOT NULL "
             "AND status IN ('ai_pending','reviewing','approved','completed')"
         )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_upload_active_task "
+            "ON deconstruction_uploads(task_id) WHERE task_id IS NOT NULL "
+            "AND status!='rejected'"
+        )
         user_columns = {
             str(row[1]) for row in connection.execute("PRAGMA table_info(users)")
         }
@@ -669,6 +783,89 @@ class AccountStore:
         # Public registrations must always remain ordinary users unless an
         # operator role was provisioned through a separate, explicit process.
         # Never infer administrative access from user count or verification.
+        unit_columns = {
+            "user_point_wallets": {
+                "balance_units": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "user_point_ledger": {
+                "delta_units": "INTEGER NOT NULL DEFAULT 0",
+                "balance_after_units": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "deconstruction_products": {
+                "download_point_units": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "deconstruction_purchases": {
+                "point_units_spent": "INTEGER NOT NULL DEFAULT 0",
+            },
+        }
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            for table, additions in unit_columns.items():
+                current = {
+                    str(row[1])
+                    for row in connection.execute(f"PRAGMA table_info({table})")
+                }
+                for name, ddl in additions.items():
+                    if name not in current:
+                        connection.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"
+                        )
+            connection.execute(
+                "UPDATE deconstruction_uploads SET download_point_units="
+                "CAST(ROUND(download_points*100) AS INTEGER) "
+                "WHERE download_point_units=0 AND COALESCE(download_points,0)!=0"
+            )
+            connection.execute(
+                "UPDATE deconstruction_products SET download_point_units="
+                "CAST(ROUND(download_points*100) AS INTEGER) "
+                "WHERE download_point_units=0 AND COALESCE(download_points,0)!=0"
+            )
+            connection.execute(
+                "UPDATE deconstruction_purchases SET point_units_spent="
+                "CAST(ROUND(points_spent*100) AS INTEGER) "
+                "WHERE point_units_spent=0 AND COALESCE(points_spent,0)!=0"
+            )
+            connection.execute(
+                "UPDATE user_point_wallets SET balance_units="
+                "CAST(ROUND(balance*100) AS INTEGER) "
+                "WHERE balance_units=0 AND COALESCE(balance,0)!=0"
+            )
+            connection.execute(
+                "UPDATE user_point_ledger SET delta_units="
+                "CAST(ROUND(delta*100) AS INTEGER) "
+                "WHERE delta_units=0 AND COALESCE(delta,0)!=0"
+            )
+            connection.execute(
+                "UPDATE user_point_ledger SET balance_after_units="
+                "CAST(ROUND(balance_after*100) AS INTEGER) "
+                "WHERE balance_after_units=0 AND COALESCE(balance_after,0)!=0"
+            )
+            for row in connection.execute(
+                "SELECT id,structure_report FROM deconstruction_uploads "
+                "WHERE reward_point_units=0 AND structure_report IS NOT NULL "
+                "AND structure_report!=''"
+            ):
+                try:
+                    structure = json.loads(str(row["structure_report"]))
+                    reward_units = int(
+                        structure.get("reward_point_units")
+                        or structure.get("download_point_units")
+                        or deconstruction_reward_units(
+                            int(structure.get("original_text_char_count") or 0)
+                        )
+                    )
+                except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if 0 < reward_units <= MAX_DOWNLOAD_POINT_UNITS:
+                    connection.execute(
+                        "UPDATE deconstruction_uploads SET reward_point_units=? "
+                        "WHERE id=? AND reward_point_units=0",
+                        (reward_units, row["id"]),
+                    )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
 
     @staticmethod
     def _user_from_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -1570,6 +1767,107 @@ class AccountStore:
             ).fetchone()
         return reading_level_summary(int(row["active_seconds"]) if row else 0)
 
+    def wallet_summary(self, user_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(w.balance_units,0) AS balance_units,"
+                "COALESCE(r.active_seconds,0) AS active_seconds "
+                "FROM users u LEFT JOIN user_point_wallets w ON w.user_id=u.id "
+                "LEFT JOIN user_reading_totals r ON r.user_id=u.id WHERE u.id=?",
+                (user_id,),
+            ).fetchone()
+            ledger = [
+                dict(item)
+                for item in connection.execute(
+                    "SELECT delta_units,balance_after_units,kind,reference_type,reference_id,created_at "
+                    "FROM user_point_ledger WHERE user_id=? ORDER BY created_at DESC LIMIT 20",
+                    (user_id,),
+                )
+            ]
+        if row is None:
+            raise AccountError("账户不存在", 404)
+        active_seconds = int(row["active_seconds"] or 0)
+        for item in ledger:
+            item["delta"] = point_value(item.pop("delta_units", 0))
+            item["balance_after"] = point_value(
+                item.pop("balance_after_units", 0)
+            )
+        return {
+            "balance": point_value(row["balance_units"] or 0),
+            "reading_seconds": active_seconds,
+            "exchangeable_points": active_seconds // POINT_READING_SECONDS,
+            "seconds_per_point": POINT_READING_SECONDS,
+            "cash_recharge_enabled": False,
+            "ledger": ledger,
+        }
+
+    def convert_reading_to_points(
+        self, user_id: str, points: int, request_id: str
+    ) -> dict[str, Any]:
+        amount = int(points)
+        if amount < 1 or amount > 1_000:
+            raise AccountError("单次兑换积分必须在 1 至 1000 之间")
+        try:
+            canonical_request_id = str(uuid.UUID(str(request_id)))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise AccountError("兑换事件标识无效") from exc
+        required_seconds = amount * POINT_READING_SECONDS
+        now = iso()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT balance_after FROM user_point_ledger WHERE user_id=? "
+                "AND kind='reading_exchange' AND reference_type='request' AND reference_id=?",
+                (user_id, canonical_request_id),
+            ).fetchone()
+            if existing:
+                connection.commit()
+                return self.wallet_summary(user_id) | {"converted": 0, "idempotent": True}
+            reading = connection.execute(
+                "SELECT active_seconds FROM user_reading_totals WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+            if reading is None or int(reading["active_seconds"] or 0) < required_seconds:
+                connection.rollback()
+                raise AccountError("可兑换阅读时长不足", 409)
+            wallet = connection.execute(
+                "SELECT balance_units FROM user_point_wallets WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+            balance_units = int(wallet["balance_units"] if wallet else 0) + (
+                amount * POINT_SCALE
+            )
+            balance = point_value(balance_units)
+            connection.execute(
+                "UPDATE user_reading_totals SET active_seconds=active_seconds-?,updated_at=? WHERE user_id=?",
+                (required_seconds, now, user_id),
+            )
+            connection.execute(
+                "INSERT INTO user_point_wallets(user_id,balance,balance_units,updated_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+                "balance=excluded.balance,balance_units=excluded.balance_units,"
+                "updated_at=excluded.updated_at",
+                (user_id, balance, balance_units, now),
+            )
+            connection.execute(
+                "INSERT INTO user_point_ledger(id,user_id,delta,balance_after,delta_units,balance_after_units,"
+                "kind,reference_type,reference_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(uuid.uuid4()),
+                    user_id,
+                    amount,
+                    balance,
+                    amount * POINT_SCALE,
+                    balance_units,
+                    "reading_exchange",
+                    "request",
+                    canonical_request_id,
+                    now,
+                ),
+            )
+            connection.commit()
+        return self.wallet_summary(user_id) | {"converted": amount, "idempotent": False}
+
     def recommendation_status(self, user_id: str, book_id: str) -> dict[str, Any]:
         with self._connect() as connection:
             row = connection.execute(
@@ -2141,14 +2439,197 @@ class AccountStore:
             ).fetchall()
         return {str(row["book_id"]): int(row["favorite_count"]) for row in rows}
 
-    def create_upload(self, user_id: str, filename: str, media_type: str) -> str:
-        upload_id = str(uuid.uuid4())
-        with self._connect() as connection:
+    @staticmethod
+    def _expire_deconstruction_tasks(connection: sqlite3.Connection) -> int:
+        return int(
             connection.execute(
-                "INSERT INTO deconstruction_uploads(id,user_id,original_filename,media_type,status,created_at) "
-                "VALUES(?,?,?,?,?,?)",
-                (upload_id, user_id, filename, media_type[:100], "quarantined", iso()),
+                "UPDATE deconstruction_tasks SET status='expired' "
+                "WHERE status IN ('open','claimed') AND expires_at<=?",
+                (iso(),),
+            ).rowcount
+        )
+
+    def create_deconstruction_task(
+        self, user_id: str, *, book_title: str, author: str, request_note: str
+    ) -> dict[str, Any]:
+        title = clean_profile_text(book_title, field="书名", max_length=160)
+        creator = clean_profile_text(author, field="作者", max_length=100)
+        note = clean_profile_text(request_note, field="任务说明", max_length=2000)
+        if not title:
+            raise AccountError("请填写需要拆解的书名")
+        for value in (title, creator, note):
+            if value:
+                moderation = moderate_comment(value)
+                if not moderation.allowed:
+                    raise AccountError(moderation.detail, 422)
+        task_id = str(uuid.uuid4())
+        now = utcnow()
+        created_at = iso(now)
+        expires_at = iso(now + timedelta(days=DECONSTRUCTION_TASK_TTL_DAYS))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_deconstruction_tasks(connection)
+            count = connection.execute(
+                "SELECT COUNT(*) FROM deconstruction_tasks WHERE creator_user_id=? "
+                "AND status IN ('open','claimed','submitted')",
+                (user_id,),
+            ).fetchone()[0]
+            if int(count) >= MAX_ACTIVE_DECONSTRUCTION_TASKS:
+                connection.rollback()
+                raise AccountError("同时进行的拆书任务不能超过 10 个", 409)
+            connection.execute(
+                "INSERT INTO deconstruction_tasks(id,creator_user_id,book_title,author,request_note,status,created_at,expires_at) "
+                "VALUES(?,?,?,?,?,'open',?,?)",
+                (task_id, user_id, title, creator, note, created_at, expires_at),
             )
+            connection.commit()
+        return self.deconstruction_task(task_id, user_id)
+
+    def deconstruction_task(
+        self, task_id: str, viewer_user_id: str
+    ) -> dict[str, Any]:
+        items = self.list_deconstruction_tasks(viewer_user_id, task_id=task_id)
+        if not items:
+            raise AccountError("拆书任务不存在", 404)
+        return items[0]
+
+    def list_deconstruction_tasks(
+        self, viewer_user_id: str, *, task_id: str = ""
+    ) -> list[dict[str, Any]]:
+        where = "WHERE t.id=?" if task_id else ""
+        params: tuple[Any, ...] = (task_id,) if task_id else ()
+        now = utcnow()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_deconstruction_tasks(connection)
+            rows = connection.execute(
+                "SELECT t.*,creator.display_name AS creator_display_name,"
+                "claimer.display_name AS claimer_display_name FROM deconstruction_tasks t "
+                "JOIN users creator ON creator.id=t.creator_user_id "
+                "LEFT JOIN users claimer ON claimer.id=t.claimed_by_user_id "
+                f"{where} ORDER BY CASE t.status WHEN 'open' THEN 0 WHEN 'claimed' THEN 1 "
+                "WHEN 'submitted' THEN 2 WHEN 'completed' THEN 3 ELSE 4 END,t.created_at DESC LIMIT 500",
+                params,
+            ).fetchall()
+            connection.commit()
+        result: list[dict[str, Any]] = []
+        for source in rows:
+            item = dict(source)
+            try:
+                remaining = max(
+                    0,
+                    int((datetime.fromisoformat(str(item["expires_at"])) - now).total_seconds()),
+                )
+            except (ValueError, TypeError):
+                remaining = 0
+            item.update(
+                {
+                    "remaining_seconds": remaining,
+                    "viewer_is_creator": item["creator_user_id"] == viewer_user_id,
+                    "viewer_is_claimer": item.get("claimed_by_user_id") == viewer_user_id,
+                    "can_claim": item["status"] == "open" and item["creator_user_id"] != viewer_user_id,
+                }
+            )
+            result.append(item)
+        return result
+
+    def claim_deconstruction_task(self, task_id: str, user_id: str) -> dict[str, Any]:
+        now = iso()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_deconstruction_tasks(connection)
+            row = connection.execute(
+                "SELECT creator_user_id,status FROM deconstruction_tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise AccountError("拆书任务不存在", 404)
+            if str(row["creator_user_id"]) == user_id:
+                connection.rollback()
+                raise AccountError("不能接取自己发布的任务", 409)
+            if str(row["status"]) != "open":
+                connection.rollback()
+                raise AccountError("任务已被接取或已经过期", 409)
+            connection.execute(
+                "UPDATE deconstruction_tasks SET status='claimed',claimed_by_user_id=?,claimed_at=? WHERE id=? AND status='open'",
+                (user_id, now, task_id),
+            )
+            connection.commit()
+        return self.deconstruction_task(task_id, user_id)
+
+    def release_deconstruction_task(self, task_id: str, user_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_deconstruction_tasks(connection)
+            cursor = connection.execute(
+                "UPDATE deconstruction_tasks SET status='open',claimed_by_user_id=NULL,claimed_at=NULL "
+                "WHERE id=? AND claimed_by_user_id=? AND status='claimed'",
+                (task_id, user_id),
+            )
+            if int(cursor.rowcount) != 1:
+                connection.rollback()
+                raise AccountError("当前任务不能取消接取", 409)
+            connection.commit()
+        return self.deconstruction_task(task_id, user_id)
+
+    def task_creator_user_id(self, task_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT creator_user_id FROM deconstruction_tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+        return str(row["creator_user_id"]) if row else None
+
+    def create_upload(
+        self,
+        user_id: str,
+        filename: str,
+        media_type: str,
+        *,
+        task_id: str = "",
+        download_points: Any = 0,
+    ) -> str:
+        upload_id = str(uuid.uuid4())
+        # Kept as an ignored keyword for old web/app clients. The authoritative
+        # price is derived from 原文/原文.txt after safe extraction.
+        _ = download_points
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expire_deconstruction_tasks(connection)
+            linked_task_id = str(task_id or "").strip()
+            if linked_task_id:
+                task = connection.execute(
+                    "SELECT status,claimed_by_user_id FROM deconstruction_tasks WHERE id=?",
+                    (linked_task_id,),
+                ).fetchone()
+                if task is None:
+                    connection.rollback()
+                    raise AccountError("拆书任务不存在", 404)
+                if task["status"] != "claimed" or task["claimed_by_user_id"] != user_id:
+                    connection.rollback()
+                    raise AccountError("请先接取该任务再上传档案", 409)
+            connection.execute(
+                "INSERT INTO deconstruction_uploads(id,user_id,original_filename,media_type,status,created_at,"
+                "task_id,download_points,download_point_units) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    upload_id,
+                    user_id,
+                    filename,
+                    media_type[:100],
+                    "quarantined",
+                    iso(),
+                    linked_task_id or None,
+                    0,
+                    0,
+                ),
+            )
+            if linked_task_id:
+                connection.execute(
+                    "UPDATE deconstruction_tasks SET status='submitted',submission_id=?,submitted_at=? WHERE id=?",
+                    (upload_id, iso(), linked_task_id),
+                )
+            connection.commit()
         return upload_id
 
     def receive_upload(
@@ -2257,12 +2738,19 @@ class AccountStore:
         scanner: dict[str, Any],
         structure: dict[str, Any],
     ) -> None:
+        reward_units = int(
+            structure.get("reward_point_units")
+            or structure.get("download_point_units")
+            or 0
+        )
+        if reward_units < 0 or reward_units > MAX_DOWNLOAD_POINT_UNITS:
+            raise AccountError("拆书档案审核奖励超出允许范围")
         with self._connect() as connection:
             try:
                 cursor = connection.execute(
                     "UPDATE deconstruction_uploads SET stored_filename=?,bytes=?,sha256=?,status='ai_pending',"
                     "scanner_engine=?,scanner_result=?,structure_profile=?,structure_report=?,"
-                    "scanned_at=?,queued_at=?,rejection_reason='' "
+                    "reward_point_units=?,scanned_at=?,queued_at=?,rejection_reason='' "
                     "WHERE id=? AND user_id=? AND status='scanning'",
                     (
                         stored_filename,
@@ -2276,6 +2764,7 @@ class AccountStore:
                         json.dumps(
                             structure, ensure_ascii=False, separators=(",", ":")
                         )[:20_000],
+                        reward_units,
                         iso(),
                         iso(),
                         upload_id,
@@ -2289,21 +2778,46 @@ class AccountStore:
 
     def reject_upload(self, upload_id: str, user_id: str, reason: str) -> None:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT task_id FROM deconstruction_uploads WHERE id=? AND user_id=?",
+                (upload_id, user_id),
+            ).fetchone()
             connection.execute(
                 "UPDATE deconstruction_uploads SET status='rejected',rejection_reason=?,scanned_at=? "
                 "WHERE id=? AND user_id=?",
                 (reason[:500], iso(), upload_id, user_id),
             )
+            if row and row["task_id"]:
+                connection.execute(
+                    "UPDATE deconstruction_tasks SET status=CASE WHEN expires_at<=? THEN 'expired' ELSE 'claimed' END,"
+                    "submission_id=NULL,submitted_at=NULL WHERE id=? AND submission_id=? AND status='submitted'",
+                    (iso(), row["task_id"], upload_id),
+                )
+            connection.commit()
 
-    def uploads(self, user_id: str) -> list[dict[str, Any]]:
+    def uploads(
+        self, user_id: str, *, published_only: bool = False
+    ) -> list[dict[str, Any]]:
+        publication_filter = (
+            " AND u.status='completed' AND p.slug IS NOT NULL"
+            if published_only
+            else ""
+        )
         with self._connect() as connection:
             rows = [
                 dict(row)
                 for row in connection.execute(
-                    "SELECT id,original_filename,bytes,sha256,media_type,status,scanner_engine,"
-                    "rejection_reason,created_at,scanned_at,queued_at,completed_at,output_slug,"
-                    "structure_profile,structure_report,review_result,reviewed_at,handoff_manifest "
-                    "FROM deconstruction_uploads WHERE user_id=? ORDER BY created_at DESC LIMIT 200",
+                    "SELECT u.id,u.original_filename,u.bytes,u.sha256,u.media_type,u.status,u.scanner_engine,"
+                    "u.rejection_reason,u.created_at,u.scanned_at,u.queued_at,u.completed_at,u.output_slug,"
+                    "u.structure_profile,u.structure_report,u.review_result,u.reviewed_at,u.handoff_manifest,"
+                    "u.task_id,u.reward_point_units,u.cover_override_path,u.cover_override_version,"
+                    "COALESCE(p.download_point_units,u.download_point_units,0) AS download_point_units,"
+                    "CASE WHEN p.slug IS NULL THEN 0 ELSE 1 END AS product_available,"
+                    "COALESCE((SELECT COUNT(*) FROM deconstruction_purchases purchase WHERE purchase.slug=p.slug),0) AS purchase_count,"
+                    "COALESCE((SELECT SUM(point_units_spent) FROM deconstruction_purchases purchase WHERE purchase.slug=p.slug),0) AS points_earned_units "
+                    "FROM deconstruction_uploads u LEFT JOIN deconstruction_products p ON p.slug=u.output_slug "
+                    f"WHERE u.user_id=?{publication_filter} ORDER BY u.created_at DESC LIMIT 200",
                     (user_id,),
                 )
             ]
@@ -2314,6 +2828,18 @@ class AccountStore:
                 except (TypeError, ValueError, json.JSONDecodeError):
                     row[key] = None
             row["handoff_ready"] = bool(row.pop("handoff_manifest", None))
+            row["has_cover_override"] = bool(row.pop("cover_override_path", None))
+            row["cover_override_version"] = int(
+                row.get("cover_override_version") or 0
+            )
+            row["product_available"] = bool(row.get("product_available"))
+            row["download_points"] = point_value(
+                row.pop("download_point_units", 0)
+            )
+            row["reward_points"] = point_value(
+                row.pop("reward_point_units", 0)
+            )
+            row["points_earned"] = point_value(row.pop("points_earned_units", 0))
         return rows
 
     def create_notification(
@@ -2511,14 +3037,18 @@ class AccountStore:
                 (reason[:2000], iso(), submission_id, user_id),
             )
 
-    def novel_submissions(self, user_id: str) -> list[dict[str, Any]]:
+    def novel_submissions(
+        self, user_id: str, *, published_only: bool = False
+    ) -> list[dict[str, Any]]:
+        publication_filter = " AND status='completed'" if published_only else ""
         with self._connect() as connection:
             rows = [
                 dict(row)
                 for row in connection.execute(
-                    "SELECT id,title,author,category,serialization_status,summary,source,status,bytes,"
-                    "rejection_reason,review_result,created_at,reviewed_at,completed_at,handoff_manifest "
-                    "FROM novel_submissions WHERE user_id=? ORDER BY created_at DESC LIMIT 200",
+                    "SELECT id,title,author,category,serialization_status,summary,source,manuscript_filename,status,bytes,"
+                    "rejection_reason,review_result,created_at,reviewed_at,completed_at,handoff_manifest,"
+                    "cover_path,catalog_id,public_id,cover_override_path,cover_override_version "
+                    f"FROM novel_submissions WHERE user_id=?{publication_filter} ORDER BY created_at DESC LIMIT 200",
                     (user_id,),
                 )
             ]
@@ -2532,7 +3062,109 @@ class AccountStore:
             except (TypeError, ValueError, json.JSONDecodeError):
                 row["review_result"] = None
             row["handoff_ready"] = bool(row.pop("handoff_manifest", None))
+            row["has_uploaded_cover"] = bool(row.pop("cover_path", None))
+            row["has_cover_override"] = bool(row.pop("cover_override_path", None))
+            row["cover_override_version"] = int(
+                row.get("cover_override_version") or 0
+            )
         return rows
+
+    @staticmethod
+    def _submission_cover_table(submission_type: str) -> str:
+        kind = str(submission_type or "").casefold()
+        if kind == "novel":
+            return "novel_submissions"
+        if kind == "deconstruction":
+            return "deconstruction_uploads"
+        raise AccountError("投稿类型无效", 404)
+
+    def submission_cover_record(
+        self,
+        user_id: str,
+        submission_type: str,
+        submission_id: str,
+        *,
+        published_only: bool = False,
+    ) -> dict[str, Any]:
+        table = self._submission_cover_table(submission_type)
+        with self._connect() as connection:
+            if table == "novel_submissions":
+                row = connection.execute(
+                    "SELECT id,status,cover_path,cover_override_path,"
+                    "cover_override_version FROM novel_submissions "
+                    "WHERE id=? AND user_id=?",
+                    (str(submission_id), str(user_id)),
+                ).fetchone()
+                published = bool(row and row["status"] == "completed")
+                original_path = str(row["cover_path"] or "") if row else ""
+            else:
+                row = connection.execute(
+                    "SELECT u.id,u.status,u.cover_override_path,"
+                    "u.cover_override_version,p.slug AS product_slug "
+                    "FROM deconstruction_uploads u "
+                    "LEFT JOIN deconstruction_products p ON p.slug=u.output_slug "
+                    "WHERE u.id=? AND u.user_id=?",
+                    (str(submission_id), str(user_id)),
+                ).fetchone()
+                published = bool(
+                    row and row["status"] == "completed" and row["product_slug"]
+                )
+                original_path = ""
+            if row is None:
+                raise AccountError("投稿不存在", 404)
+            if published_only and not published:
+                raise AccountError("投稿尚未完成正式入库", 409)
+            override_path = str(row["cover_override_path"] or "")
+            return {
+                "id": str(row["id"]),
+                "published": published,
+                "path": override_path or original_path,
+                "has_override": bool(override_path),
+                "version": int(row["cover_override_version"] or 0),
+            }
+
+    def update_published_submission_cover(
+        self,
+        user_id: str,
+        submission_type: str,
+        submission_id: str,
+        relative_path: str,
+    ) -> int:
+        table = self._submission_cover_table(submission_type)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if table == "novel_submissions":
+                row = connection.execute(
+                    "SELECT status,cover_override_version FROM novel_submissions "
+                    "WHERE id=? AND user_id=?",
+                    (str(submission_id), str(user_id)),
+                ).fetchone()
+                published = bool(row and row["status"] == "completed")
+            else:
+                row = connection.execute(
+                    "SELECT u.status,u.cover_override_version,p.slug AS product_slug "
+                    "FROM deconstruction_uploads u "
+                    "LEFT JOIN deconstruction_products p ON p.slug=u.output_slug "
+                    "WHERE u.id=? AND u.user_id=?",
+                    (str(submission_id), str(user_id)),
+                ).fetchone()
+                published = bool(
+                    row and row["status"] == "completed" and row["product_slug"]
+                )
+            if row is None:
+                connection.rollback()
+                raise AccountError("投稿不存在", 404)
+            if not published:
+                connection.rollback()
+                raise AccountError("只有正式入库的投稿可以更新封面", 409)
+            version = int(row["cover_override_version"] or 0) + 1
+            connection.execute(
+                f"UPDATE {table} SET cover_override_path=?,cover_override_version=? "
+                "WHERE id=? AND user_id=?",
+                (str(relative_path), version, str(submission_id), str(user_id)),
+            )
+            connection.commit()
+        return version
 
     def claim_review(self) -> dict[str, Any] | None:
         """Atomically claim one queued review across both submission types."""
@@ -2606,7 +3238,7 @@ class AccountStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                f"SELECT user_id FROM {table} WHERE id=? AND status='reviewing'",
+                f"SELECT user_id{',task_id' if table == 'deconstruction_uploads' else ''} FROM {table} WHERE id=? AND status='reviewing'",
                 (submission_id,),
             ).fetchone()
             if not row:
@@ -2626,6 +3258,12 @@ class AccountStore:
                     submission_id,
                 ),
             )
+            if not approved and table == "deconstruction_uploads" and row["task_id"]:
+                connection.execute(
+                    "UPDATE deconstruction_tasks SET status=CASE WHEN expires_at<=? THEN 'expired' ELSE 'claimed' END,"
+                    "submission_id=NULL,submitted_at=NULL WHERE id=? AND submission_id=? AND status='submitted'",
+                    (iso(), row["task_id"], submission_id),
+                )
             connection.commit()
         return {"user_id": str(row["user_id"]), "status": status}
 
@@ -2652,9 +3290,120 @@ class AccountStore:
                 )
         return records
 
+    @staticmethod
+    def _credit_deconstruction_reward(
+        connection: sqlite3.Connection,
+        *,
+        user_id: str,
+        submission_id: str,
+        reward_units: int,
+        created_at: str,
+    ) -> bool:
+        """Credit one published submission exactly once inside its transaction."""
+        units = int(reward_units or 0)
+        if units <= 0:
+            return False
+        existing = connection.execute(
+            "SELECT 1 FROM user_point_ledger WHERE user_id=? "
+            "AND kind='deconstruction_upload_reward' "
+            "AND reference_type='submission' AND reference_id=?",
+            (user_id, submission_id),
+        ).fetchone()
+        if existing:
+            return False
+        wallet = connection.execute(
+            "SELECT balance_units FROM user_point_wallets WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        balance_units = int(wallet["balance_units"] if wallet else 0) + units
+        balance = point_value(balance_units)
+        connection.execute(
+            "INSERT INTO user_point_wallets(user_id,balance,balance_units,updated_at) "
+            "VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+            "balance=excluded.balance,balance_units=excluded.balance_units,"
+            "updated_at=excluded.updated_at",
+            (user_id, balance, balance_units, created_at),
+        )
+        connection.execute(
+            "INSERT INTO user_point_ledger(id,user_id,delta,balance_after,delta_units,"
+            "balance_after_units,kind,reference_type,reference_id,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                str(uuid.uuid4()),
+                user_id,
+                point_value(units),
+                balance,
+                units,
+                balance_units,
+                "deconstruction_upload_reward",
+                "submission",
+                submission_id,
+                created_at,
+            ),
+        )
+        return True
+
+    def grant_completed_deconstruction_reward(
+        self, submission_id: str
+    ) -> dict[str, Any]:
+        """Idempotently backfill/reconcile one formally published contribution."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT u.user_id,u.status,u.output_slug,u.reward_point_units,"
+                "u.structure_report,p.slug AS product_slug "
+                "FROM deconstruction_uploads u "
+                "LEFT JOIN deconstruction_products p ON p.slug=u.output_slug "
+                "WHERE u.id=?",
+                (str(submission_id),),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise AccountError("拆文投稿不存在", 404)
+            if row["status"] != "completed" or not row["product_slug"]:
+                connection.rollback()
+                raise AccountError("拆文尚未完成审核入库，不能发放奖励", 409)
+            reward_units = int(row["reward_point_units"] or 0)
+            if reward_units <= 0:
+                try:
+                    structure = json.loads(str(row["structure_report"] or "{}"))
+                    reward_units = int(
+                        structure.get("reward_point_units")
+                        or structure.get("download_point_units")
+                        or deconstruction_reward_units(
+                            int(structure.get("original_text_char_count") or 0)
+                        )
+                    )
+                except (
+                    AttributeError,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ) as exc:
+                    connection.rollback()
+                    raise AccountError("拆文原文字数不可用，不能发放奖励", 409) from exc
+                connection.execute(
+                    "UPDATE deconstruction_uploads SET reward_point_units=? WHERE id=?",
+                    (reward_units, str(submission_id)),
+                )
+            now = iso()
+            granted = self._credit_deconstruction_reward(
+                connection,
+                user_id=str(row["user_id"]),
+                submission_id=str(submission_id),
+                reward_units=reward_units,
+                created_at=now,
+            )
+            connection.commit()
+        return self.wallet_summary(str(row["user_id"])) | {
+            "submission_id": str(submission_id),
+            "reward_points": point_value(reward_units),
+            "granted": granted,
+        }
+
     def complete_handoff(
         self, submission_type: str, submission_id: str, result: dict[str, Any]
-    ) -> dict[str, str] | None:
+    ) -> dict[str, Any] | None:
         table = (
             "deconstruction_uploads"
             if submission_type == "deconstruction"
@@ -2665,10 +3414,14 @@ class AccountStore:
         message = str(
             result.get("message") or ("投稿已入库" if succeeded else "入库阶段未通过")
         )[:2000]
+        task_creator_user_id = ""
+        completed_task_id = ""
+        reward_units = 0
+        reward_granted = False
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                f"SELECT user_id FROM {table} WHERE id=? AND status='approved'",
+                f"SELECT user_id{',task_id,download_points,download_point_units,reward_point_units' if table == 'deconstruction_uploads' else ''} FROM {table} WHERE id=? AND status='approved'",
                 (submission_id,),
             ).fetchone()
             if not row:
@@ -2683,12 +3436,280 @@ class AccountStore:
             if table == "deconstruction_uploads":
                 extra = ",output_slug=?"
                 values.append(str(result.get("output_slug") or "")[:160])
+            elif succeeded:
+                extra = ",catalog_id=?,public_id=?"
+                values.extend(
+                    [
+                        str(result.get("catalog_id") or "")[:80],
+                        str(result.get("public_id") or "")[:80],
+                    ]
+                )
             connection.execute(
                 f"UPDATE {table} SET status=?,completed_at=?,rejection_reason=?{extra} WHERE id=? AND status='approved'",
                 (*values, submission_id),
             )
+            if table == "deconstruction_uploads":
+                task_id = str(row["task_id"] or "")
+                completed_task_id = task_id
+                output_slug = str(result.get("output_slug") or "")[:160]
+                if succeeded and output_slug:
+                    connection.execute(
+                        "INSERT INTO deconstruction_products(slug,contributor_user_id,task_id,download_points,"
+                        "download_point_units,published_at) VALUES(?,?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET "
+                        "contributor_user_id=excluded.contributor_user_id,task_id=excluded.task_id,"
+                        "download_points=excluded.download_points,download_point_units=excluded.download_point_units,"
+                        "published_at=excluded.published_at",
+                        (
+                            output_slug,
+                            row["user_id"],
+                            task_id or None,
+                            point_value(row["download_point_units"] or 0),
+                            int(row["download_point_units"] or 0),
+                            iso(),
+                        ),
+                    )
+                    reward_units = int(row["reward_point_units"] or 0)
+                    reward_granted = self._credit_deconstruction_reward(
+                        connection,
+                        user_id=str(row["user_id"]),
+                        submission_id=str(submission_id),
+                        reward_units=reward_units,
+                        created_at=iso(),
+                    )
+                    if task_id:
+                        creator = connection.execute(
+                            "SELECT creator_user_id FROM deconstruction_tasks WHERE id=?",
+                            (task_id,),
+                        ).fetchone()
+                        task_creator_user_id = str(creator["creator_user_id"]) if creator else ""
+                        connection.execute(
+                            "UPDATE deconstruction_tasks SET status='completed',output_slug=?,completed_at=? "
+                            "WHERE id=? AND submission_id=?",
+                            (output_slug, iso(), task_id, submission_id),
+                        )
+                elif task_id:
+                    connection.execute(
+                        "UPDATE deconstruction_tasks SET status=CASE WHEN expires_at<=? THEN 'expired' ELSE 'claimed' END,"
+                        "submission_id=NULL,submitted_at=NULL WHERE id=? AND submission_id=?",
+                        (iso(), task_id, submission_id),
+                    )
             connection.commit()
-        return {"user_id": str(row["user_id"]), "status": status, "message": message}
+        return {
+            "user_id": str(row["user_id"]),
+            "status": status,
+            "message": message,
+            "task_creator_user_id": task_creator_user_id,
+            "task_id": completed_task_id,
+            "reward_points": point_value(reward_units),
+            "reward_granted": reward_granted,
+        }
+
+    def deconstruction_access(self, user_id: str, slug: str) -> dict[str, Any]:
+        normalized = str(slug or "").strip()[:160]
+        with self._connect() as connection:
+            product = connection.execute(
+                "SELECT p.download_point_units,p.contributor_user_id,p.task_id,t.creator_user_id "
+                "FROM deconstruction_products p LEFT JOIN deconstruction_tasks t ON t.id=p.task_id "
+                "WHERE p.slug=?",
+                (normalized,),
+            ).fetchone()
+            purchased = connection.execute(
+                "SELECT point_units_spent,purchased_at FROM deconstruction_purchases WHERE user_id=? AND slug=?",
+                (user_id, normalized),
+            ).fetchone()
+        if product is None:
+            return {
+                "slug": normalized,
+                "download_points": 0,
+                "can_download": True,
+                "purchased": False,
+                "is_contributor": False,
+                "is_requester": False,
+            }
+        is_contributor = str(product["contributor_user_id"]) == user_id
+        is_requester = str(product["creator_user_id"] or "") == user_id
+        price_units = int(product["download_point_units"] or 0)
+        return {
+            "slug": normalized,
+            "download_points": point_value(price_units),
+            "can_download": price_units == 0
+            or is_contributor
+            or is_requester
+            or purchased is not None,
+            "purchased": purchased is not None,
+            "is_contributor": is_contributor,
+            "is_requester": is_requester,
+            "purchased_at": str(purchased["purchased_at"]) if purchased else None,
+        }
+
+    def update_deconstruction_price(
+        self, user_id: str, slug: str, download_points: Any
+    ) -> dict[str, Any]:
+        """Update a contributor-owned product and its completed submission mirror."""
+        normalized = str(slug or "").strip()[:160]
+        if not normalized:
+            raise AccountError("拆书档案不存在", 404)
+        try:
+            price_units = point_units(download_points)
+        except ValueError as exc:
+            raise AccountError(str(exc)) from exc
+        price = point_value(price_units)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            product = connection.execute(
+                "SELECT contributor_user_id FROM deconstruction_products WHERE slug=?",
+                (normalized,),
+            ).fetchone()
+            if product is None:
+                connection.rollback()
+                raise AccountError("拆书档案尚未完成入库", 409)
+            if str(product["contributor_user_id"]) != user_id:
+                connection.rollback()
+                raise AccountError("只有档案贡献者可以修改下载积分", 403)
+            connection.execute(
+                "UPDATE deconstruction_products SET download_points=?,download_point_units=? "
+                "WHERE slug=?",
+                (price, price_units, normalized),
+            )
+            connection.execute(
+                "UPDATE deconstruction_uploads SET download_points=?,download_point_units=? "
+                "WHERE user_id=? AND output_slug=? AND status='completed'",
+                (price, price_units, user_id, normalized),
+            )
+            sales = connection.execute(
+                "SELECT COUNT(*) AS purchase_count,"
+                "COALESCE(SUM(point_units_spent),0) AS points_earned_units "
+                "FROM deconstruction_purchases WHERE slug=?",
+                (normalized,),
+            ).fetchone()
+            connection.commit()
+        return {
+            "slug": normalized,
+            "download_points": price,
+            "purchase_count": int(sales["purchase_count"] or 0),
+            "points_earned": point_value(sales["points_earned_units"] or 0),
+            "updated_at": iso(),
+        }
+
+    def purchase_deconstruction(
+        self,
+        user_id: str,
+        slug: str,
+        *,
+        expected_points: Any | None = None,
+    ) -> dict[str, Any]:
+        normalized = str(slug or "").strip()[:160]
+        now = iso()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            product = connection.execute(
+                "SELECT p.download_point_units,p.contributor_user_id,t.creator_user_id "
+                "FROM deconstruction_products p LEFT JOIN deconstruction_tasks t ON t.id=p.task_id WHERE p.slug=?",
+                (normalized,),
+            ).fetchone()
+            if product is None:
+                connection.rollback()
+                raise AccountError("该档案无需积分购买", 409)
+            price_units = int(product["download_point_units"] or 0)
+            price = point_value(price_units)
+            if price_units == 0 or user_id in {
+                str(product["contributor_user_id"]),
+                str(product["creator_user_id"] or ""),
+            }:
+                connection.commit()
+                return self.deconstruction_access(user_id, normalized) | {"charged": 0}
+            existing = connection.execute(
+                "SELECT 1 FROM deconstruction_purchases WHERE user_id=? AND slug=?",
+                (user_id, normalized),
+            ).fetchone()
+            if existing:
+                connection.commit()
+                return self.deconstruction_access(user_id, normalized) | {"charged": 0}
+            if expected_points is not None:
+                try:
+                    expected_units = point_units(expected_points)
+                except ValueError as exc:
+                    connection.rollback()
+                    raise AccountError(str(exc)) from exc
+                if price_units != expected_units:
+                    connection.rollback()
+                    raise AccountError(
+                        f"档案下载积分已更新为 {point_label(price_units)}，请确认最新价格后再购买",
+                        409,
+                    )
+            wallet = connection.execute(
+                "SELECT balance_units FROM user_point_wallets WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+            balance_units = int(wallet["balance_units"] if wallet else 0)
+            if balance_units < price_units:
+                connection.rollback()
+                raise AccountError("积分不足，可用阅读时长兑换积分", 409)
+            new_balance_units = balance_units - price_units
+            new_balance = point_value(new_balance_units)
+            contributor_user_id = str(product["contributor_user_id"])
+            contributor_wallet = connection.execute(
+                "SELECT balance_units FROM user_point_wallets WHERE user_id=?",
+                (contributor_user_id,),
+            ).fetchone()
+            contributor_balance_units = int(
+                contributor_wallet["balance_units"] if contributor_wallet else 0
+            ) + price_units
+            contributor_balance = point_value(contributor_balance_units)
+            connection.execute(
+                "UPDATE user_point_wallets SET balance=?,balance_units=?,updated_at=? WHERE user_id=?",
+                (new_balance, new_balance_units, now, user_id),
+            )
+            connection.execute(
+                "INSERT INTO user_point_wallets(user_id,balance,balance_units,updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET balance=excluded.balance,"
+                "balance_units=excluded.balance_units,updated_at=excluded.updated_at",
+                (
+                    contributor_user_id,
+                    contributor_balance,
+                    contributor_balance_units,
+                    now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO deconstruction_purchases(user_id,slug,points_spent,point_units_spent,purchased_at) "
+                "VALUES(?,?,?,?,?)",
+                (user_id, normalized, price, price_units, now),
+            )
+            connection.execute(
+                "INSERT INTO user_point_ledger(id,user_id,delta,balance_after,delta_units,balance_after_units,"
+                "kind,reference_type,reference_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(uuid.uuid4()),
+                    user_id,
+                    -price,
+                    new_balance,
+                    -price_units,
+                    new_balance_units,
+                    "deconstruction_purchase",
+                    "slug",
+                    normalized,
+                    now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO user_point_ledger(id,user_id,delta,balance_after,delta_units,balance_after_units,"
+                "kind,reference_type,reference_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(uuid.uuid4()),
+                    contributor_user_id,
+                    price,
+                    contributor_balance,
+                    price_units,
+                    contributor_balance_units,
+                    "deconstruction_sale",
+                    "purchase",
+                    f"{normalized}:{user_id}",
+                    now,
+                ),
+            )
+            connection.commit()
+        return self.deconstruction_access(user_id, normalized) | {"charged": price, "balance": new_balance}
 
     def deconstruction_engagement(
         self, slugs: list[str], *, viewer_user_id: str | None = None

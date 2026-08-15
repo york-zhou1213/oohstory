@@ -1993,6 +1993,32 @@ class LibraryRepository:
             f"local-cover:{catalog_id}" if has_real_cover else None,
         )
 
+    def submission_cover(self, title: str) -> dict[str, Any]:
+        """Resolve an account contribution to its authoritative catalog cover."""
+        clean_title = self._deconstruction_title(_clean_text(title, 160))
+        if not clean_title:
+            return {
+                "book_id": None,
+                "cover_url": OOHSTORY_DEFAULT_COVER_URL,
+                "cover_is_default": True,
+            }
+        try:
+            book_id = self._find_public_id(clean_title)
+            if not book_id:
+                raise NotFoundError("作品不存在")
+            book = self.get_book(book_id)
+            return {
+                "book_id": book_id,
+                "cover_url": str(book.get("cover_url") or OOHSTORY_DEFAULT_COVER_URL),
+                "cover_is_default": bool(book.get("cover_is_default", True)),
+            }
+        except (LibraryError, OSError, TypeError, ValueError):
+            return {
+                "book_id": None,
+                "cover_url": OOHSTORY_DEFAULT_COVER_URL,
+                "cover_is_default": True,
+            }
+
     def list_deconstructions(self) -> list[dict[str, Any]]:
         items = []
         for name in self._deconstruction_names():

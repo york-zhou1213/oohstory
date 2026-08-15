@@ -514,6 +514,14 @@ class RateLimiter:
         if not is_api:
             return None
 
+        # Authentication endpoints already use durable, operation-specific
+        # limits in AccountStore. Unrelated reading or comment traffic must
+        # not consume the generic IP bucket and turn a valid session probe or
+        # login into a misleading 429 response. Permanent IP and bot blocks
+        # above still apply.
+        if path.startswith("/api/v1/auth/"):
+            return None
+
         with self._lock:
             self._cleanup()
 

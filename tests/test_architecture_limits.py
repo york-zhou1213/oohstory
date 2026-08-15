@@ -19,7 +19,10 @@ def test_frontend_monolith_cannot_regrow_legacy_audiobook_logic() -> None:
     assert fallback_script.is_file()
     assert len(fallback_script.read_text(encoding="utf-8").splitlines()) <= 220
     assert account_script.is_file()
-    assert len(account_script.read_text(encoding="utf-8").splitlines()) <= 2000
+    # Submission tasks, approved-work management, cover maintenance and the
+    # responsive atelier now live in this account surface. Keep a bounded
+    # ceiling while allowing that intentionally cohesive UI to remain local.
+    assert len(account_script.read_text(encoding="utf-8").splitlines()) <= 2400
     assert "/api/v1/tts/speak" not in app_script
     assert "buildDialoguePlan" not in app_script
     assert "const ttsPlaybackBlocked" not in app_script

@@ -314,7 +314,7 @@ def review_once(settings: Settings | None = None) -> dict[str, Any] | None:
                     if approved
                     else f"《{submission_name}》：{result['reason']}"
                 ),
-                action_url="#/account/submissions",
+                action_url="#/account/submit",
                 resource_type=kind,
                 resource_id=str(item["id"]),
                 dedupe_key=f"review:{kind}:{item['id']}:{completed['status']}",
@@ -372,6 +372,14 @@ def reconcile_results(
             continue
         succeeded = completed["status"] == "completed"
         submission_name = _submission_name(item)
+        reward_points = completed.get("reward_points", 0)
+        reward_note = (
+            f"；按原文字数发放的审核奖励 {reward_points} 积分已到账"
+            if succeeded
+            and str(item["submission_type"]) == "deconstruction"
+            and completed.get("reward_granted")
+            else ""
+        )
         store.create_notification(
             completed["user_id"],
             kind="submission_ingestion",
@@ -380,12 +388,24 @@ def reconcile_results(
                 if succeeded
                 else f"《{submission_name}》投稿入库被驳回"
             ),
-            message=f"《{submission_name}》：{completed['message']}",
-            action_url="#/account/submissions",
+            message=f"《{submission_name}》：{completed['message']}{reward_note}",
+            action_url="#/account/submit",
             resource_type=str(item["submission_type"]),
             resource_id=str(item["id"]),
             dedupe_key=f"handoff:{item['submission_type']}:{item['id']}:{completed['status']}",
         )
+        task_creator_user_id = str(completed.get("task_creator_user_id") or "")
+        if succeeded and task_creator_user_id and task_creator_user_id != completed["user_id"]:
+            store.create_notification(
+                task_creator_user_id,
+                kind="deconstruction_task_completed",
+                title=f"《{submission_name}》拆书任务已交付",
+                message=f"《{submission_name}》已审核通过并完成入库，你现在可以免费下载。",
+                action_url="#/account/deconstruction-tasks",
+                resource_type="deconstruction_task",
+                resource_id=str(completed.get("task_id") or item["id"]),
+                dedupe_key=f"task-handoff:{completed.get('task_id') or item['id']}:completed",
+            )
         updated += 1
     return updated
 

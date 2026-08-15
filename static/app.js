@@ -4968,6 +4968,9 @@ function renderMarkdownText(text) {
 
 async function loadDeconstruction(slug) {
   const data = await api(`/api/v1/deconstructions/${encodeURIComponent(slug)}`)
+  const access = state.account
+    ? await accountApi(`/api/v1/me/deconstructions/${encodeURIComponent(slug)}/access`).catch(() => null)
+    : null
   const deconstructionCanonical = publicUrl(`/deconstructions/${encodeURIComponent(data.slug || slug)}`)
   const documentLabels = data.documents.map(document => cleanSeoText(document.label, 40)).filter(Boolean)
   const subdirs = Array.isArray(data.subdirectories) ? data.subdirectories : []
@@ -5031,6 +5034,32 @@ async function loadDeconstruction(slug) {
       }
     }
   }, likeLabel)
+  const downloadAction = (() => {
+    if (!state.account) return node('button', {
+      class: 'ghost-button', type: 'button', text: '登录后下载档案', onclick: () => openAuthDialog('login')
+    })
+    if (!access || access.can_download) return node('a', {
+      class: 'ghost-button', href: `/api/v1/me/deconstructions/${encodeURIComponent(slug)}/download`, download: '', text: '下载完整档案 ZIP'
+    })
+    const button = node('button', { class: 'ghost-button', type: 'button', text: `${access.download_points} 积分购买并下载` })
+    button.addEventListener('click', async () => {
+      button.disabled = true
+      try {
+        await accountApi(`/api/v1/me/deconstructions/${encodeURIComponent(slug)}/purchase`, {
+          method: 'POST', body: { expected_points: Number(access.download_points) }
+        })
+        window.location.href = `/api/v1/me/deconstructions/${encodeURIComponent(slug)}/download`
+      } catch (error) {
+        button.textContent = error.message
+        if (/积分已更新/.test(String(error.message || ''))) {
+          window.setTimeout(() => loadDeconstruction(slug), 900)
+        } else {
+          window.setTimeout(() => { button.textContent = `${access.download_points} 积分购买并下载`; button.disabled = false }, 1800)
+        }
+      }
+    })
+    return button
+  })()
 
   async function loadSubdirFile(subdirName, filePath) {
     const cacheKey = `${subdirName}/${filePath}`
@@ -5130,19 +5159,7 @@ async function loadDeconstruction(slug) {
       node('div', { class: 'report-head-actions' }, [
         data.public_id ? node('a', { class: 'primary-button', href: `/books/${data.public_id}`, text: '打开原作' }) : null,
         likeButton,
-        state.account
-          ? node('a', {
-              class: 'ghost-button',
-              href: `/api/v1/me/deconstructions/${encodeURIComponent(slug)}/download`,
-              download: '',
-              text: '下载完整档案 ZIP'
-            })
-          : node('button', {
-              class: 'ghost-button',
-              type: 'button',
-              text: '登录后下载档案',
-              onclick: () => openAuthDialog('login')
-            })
+        downloadAction
       ])
     ]),
     tabs,
@@ -5157,7 +5174,7 @@ function pathFromLocation() {
   const pathname = location.pathname.replace(/\/+$/, '') || '/'
   if (pathname === '/' || pathname === '/library' || pathname === '/rankings' || pathname === '/deconstructions' || pathname === '/account'
     || /^\/(?:about|disclaimer|guide|contact|client)$/.test(pathname)
-    || /^\/account\/(?:history|favorites|bookshelf|profile)$/.test(pathname)) return pathname
+    || /^\/account\/(?:history|favorites|bookshelf|deconstruction-tasks|submit|submissions|notifications|profile)$/.test(pathname)) return pathname
   const bookMatch = pathname.match(/^\/books\/([A-Za-z0-9_-]{22})$/)
   if (bookMatch) return `/book/${bookMatch[1]}`
   const chapterMatch = pathname.match(/^\/books\/([A-Za-z0-9_-]{22})\/chapters\/(\d+)$/)
@@ -5202,20 +5219,53 @@ function loadAbout() {
 }
 
 function loadDisclaimer() {
-  staticPage('免责声明', 'Disclaimer', [
-    node('h2', { text: '内容声明' }),
-    node('p', { text: '本站所有小说内容均由书友制作上传，电子书版权归原作者或出版社所有。本站仅提供知识阅读服务，不以盈利为目的。' }),
-    node('h2', { text: '版权保护' }),
-    node('p', { text: '本站尊重并保护知识产权。如果您发现本站收录的作品侵犯了您的权益，请及时与我们联系，我们将在确认后第一时间删除相关内容。' }),
-    node('h2', { text: '免责条款' }),
+  staticPage('版权声明与 DMCA 政策', 'Copyright & DMCA Policy', [
+    node('p', { text: '最近更新：2026 年 7 月 12 日。本政策适用于 OOH Story 网站、移动端及其相关服务。' }),
+    node('h2', { text: '1. 平台性质与用户生成内容（UGC）' }),
+    node('p', { text: 'OOH Story（以下简称“本平台”）上的书籍、文档及其他文件主要由注册用户或第三方自发上传、提交或分享。本平台仅提供数据存储、展示、检索、分享与交流所需的技术服务空间，不主动代表用户编辑、修改或上传相关内容。' }),
+    node('p', { text: '页面展示、自动化排序、搜索结果或技术处理不代表本平台对相关内容的版权状态作出确认、授权或背书。相关内容的著作权及其他合法权利归原权利人所有。' }),
+    node('h2', { text: '2. 版权保护与“通知—删除”机制' }),
+    node('p', { text: '本平台尊重知识产权，并按照适用的版权法律法规处理侵权投诉，包括适用时依据美国《数字千年版权法案》（Digital Millennium Copyright Act，DMCA）执行“通知—删除”程序。' }),
+    node('p', { text: '如果您是版权权利人或经合法授权的代理人，并确信本平台上的用户上传内容侵犯了您的合法权益，请向下方版权投诉邮箱发送正式侵权通知（Notice of Infringement）。' }),
+    node('h2', { text: '3. 有效侵权通知应包含的信息' }),
+    node('p', { text: '为便于我们准确定位并有效处理，请在通知中完整提供：' }),
     node('ul', {}, [
-      node('li', { text: '本站不对所收录作品的内容准确性、完整性作任何保证' }),
-      node('li', { text: '用户在本站的阅读行为产生的一切后果由用户自行承担' }),
-      node('li', { text: '本站可能随时修改服务条款，用户继续使用即视为接受修改' }),
-      node('li', { text: '因不可抗力导致的服务中断，本站不承担任何责任' })
+      node('li', { text: '权利人或其授权代理人的真实姓名／名称、联系电话、电子邮箱及详细联系地址。' }),
+      node('li', { text: '主张受到侵害的版权作品名称、作者及足以识别该作品的说明；涉及多项作品时，可提交具有代表性的清单。' }),
+      node('li', { text: '涉嫌侵权内容在本平台上的具体网页链接（URL）、章节、文件名或其他精确定位信息。仅提供网站首页或搜索结果页可能无法完成定位。' }),
+      node('li', { text: '能够证明您拥有相关版权或投诉授权的权属材料，例如版权登记证书、授权书、首次发表证明或其他有效证明。' }),
+      node('li', { text: '一份善意声明，说明您确信被投诉内容的使用未获得版权人、其代理人或法律授权。' }),
+      node('li', { text: '一份真实性与授权声明，确认通知中的信息准确，并在承担伪证责任的前提下声明您是权利人或有权代表权利人提出投诉。' }),
+      node('li', { text: '权利人或其授权代理人的手写签名或有效电子签名。' })
     ]),
-    node('h2', { text: '正版支持' }),
-    node('p', { text: '本站支持和鼓励读者购买正版小说。如果您喜欢某本作品，请购买正版图书支持原作者的创作。' })
+    node('h2', { text: '4. 审查与处理时效' }),
+    node('p', { text: '对于材料完整、权属关系明确且能够准确定位涉嫌侵权内容的正式通知，我们将在收到后的 24 至 48 小时内完成审查，并根据审查结果采取下架、屏蔽、删除内容或断开相关链接等必要措施。' }),
+    node('p', { text: '如通知信息不完整、权属存在争议或无法定位具体内容，我们可能要求您补充材料；处理时效自收到完整材料后起算。为防止重复提交，请在同一邮件会话中补充信息。' }),
+    node('h2', { text: '5. 反通知（Counter-Notice）' }),
+    node('p', { text: '如果相关内容因版权通知被移除或限制，而上传者确信该措施源于错误识别或误删，可以通过同一邮箱提交反通知。反通知应包含上传者的真实联系信息、被移除内容及原位置、错误或误认声明、依法接受相关司法管辖的声明，以及手写或有效电子签名。' }),
+    node('p', { text: '在适用法律允许的范围内，我们可将合格的反通知转交原投诉方，并依照法定程序决定是否恢复相关内容。' }),
+    node('h2', { text: '6. 重复侵权与虚假投诉' }),
+    node('p', { text: '对于经核实的重复侵权用户，本平台可视情节限制或终止其账户及上传权限。故意提交虚假、误导性或恶意通知／反通知，可能导致投诉人承担相应法律责任。' }),
+    node('h2', { text: '7. 版权投诉联系方式' }),
+    node('p', {}, [
+      node('span', { text: '版权投诉与举报专用邮箱：' }),
+      node('a', { href: 'mailto:help@example.com?subject=Copyright%20Notice%20%2F%20DMCA', text: 'help@example.com' })
+    ]),
+    node('p', { text: '为处理投诉，我们可能在必要范围内向相关上传者、服务提供商、专业顾问或主管机关披露通知中的信息。请勿在邮件中提供与权利主张无关的敏感个人信息。' }),
+    node('h2', { text: '8. 一般免责声明与正版支持' }),
+    node('ul', {}, [
+      node('li', { text: '本平台不对用户上传内容的准确性、完整性、合法性或持续可用性作出保证。' }),
+      node('li', { text: '因系统维护、网络故障、不可抗力或第三方服务导致的中断，本平台将在合理范围内尽快恢复服务。' }),
+      node('li', { text: '本页面仅说明平台的版权投诉处理流程，不构成法律意见，也不限制任何一方依法享有的权利或救济。' }),
+      node('li', { text: '本平台支持并鼓励正版阅读。如果您喜欢某部作品，请通过正版渠道购买或订阅，以支持作者与出版机构。' })
+    ]),
+    node('h2', { text: 'English Summary' }),
+    node('p', { text: 'OOH Story primarily hosts user-generated content and provides technical services for storage, display, search and sharing. We respect intellectual property rights and process valid copyright notices under applicable law, including the DMCA where applicable.' }),
+    node('p', { text: 'A valid notice should identify the copyrighted work and the exact allegedly infringing URL, provide the claimant’s contact and ownership information, include good-faith and accuracy statements made under penalty of perjury, and carry a physical or electronic signature. Complete notices are reviewed within 24–48 hours. Affected uploaders may submit a valid counter-notice. Repeat infringers may have their accounts or upload privileges terminated.' }),
+    node('p', {}, [
+      node('span', { text: 'Copyright contact: ' }),
+      node('a', { href: 'mailto:help@example.com?subject=Copyright%20Notice%20%2F%20DMCA', text: 'help@example.com' })
+    ])
   ], '/disclaimer')
 }
 
@@ -5523,7 +5573,9 @@ async function route() {
     else if (path === '/account/history') await loadAccountCollection('history')
     else if (path === '/account/favorites') await loadAccountCollection('favorites')
     else if (path === '/account/bookshelf') await loadAccountCollection('bookshelf')
-    else if (path === '/account/submissions') await loadSubmissionPage()
+    else if (path === '/account/deconstruction-tasks') await loadDeconstructionTasksPage()
+    else if (path === '/account/submit') await loadSubmitPage()
+    else if (path === '/account/submissions') await loadMySubmissionsPage()
     else if (path === '/account/notifications') await loadNotificationsPage()
     else if (path === '/account/profile') await loadProfilePage()
     else if (path === '/admin' || path.startsWith('/admin/')) await loadAdminPage(path)

@@ -20,7 +20,10 @@ from app.accounts import AccountStore
 from app.review_worker import _review_payload, reconcile_results, review_once
 from app.settings import Settings
 from app.submission_moderation import inspect_submission_content
-from app.submissions import inspect_deconstruction_structure
+from app.submissions import (
+    inspect_deconstruction_original,
+    inspect_deconstruction_structure,
+)
 from app.upload_security import UploadSecurityError, UploadSecurityScanner
 from app.user_api import create_user_router
 
@@ -64,6 +67,19 @@ class Books:
 
     def categories(self):
         return [{"name": "科幻", "count": 1}, {"name": "玄幻", "count": 2}]
+
+    def submission_cover(self, title: str):
+        if title == "已入库星海":
+            return {
+                "book_id": BOOK_ID,
+                "cover_url": f"/api/v1/books/{BOOK_ID}/cover?v=7",
+                "cover_is_default": False,
+            }
+        return {
+            "book_id": None,
+            "cover_url": "/api/v1/assets/default-cover",
+            "cover_is_default": True,
+        }
 
 
 def settings_for(tmp_path: Path) -> Settings:
@@ -121,14 +137,19 @@ def zip_bytes(files: dict[str, bytes]) -> bytes:
     return output.getvalue()
 
 
-def short_archive() -> bytes:
+def short_archive(*, original_characters: int | None = None) -> bytes:
+    original = (
+        "甲" * original_characters
+        if original_characters is not None
+        else "这是完整原文。" * 100
+    )
     return zip_bytes(
         {
             "我的作品/_meta.json": b'{"kind":"short"}',
             "我的作品/拆文报告.md": "报告".encode(),
             "我的作品/情节节点.md": "节点".encode(),
             "我的作品/写作手法.md": "手法".encode(),
-            "我的作品/原文/原文.txt": ("这是完整原文。" * 100).encode(),
+            "我的作品/原文/原文.txt": original.encode(),
         }
     )
 
@@ -186,6 +207,23 @@ def test_short_and_long_structure_profiles_explain_missing_files() -> None:
     assert "角色资料" in long["optional_missing"]
     broken = inspect_deconstruction_structure(["root/_meta.json"])
     assert broken["valid"] is False and broken["missing_files"]
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "gb18030"])
+def test_original_character_count_drives_fractional_price(
+    tmp_path: Path, encoding: str
+) -> None:
+    root = tmp_path / "extracted" / "作品" / "原文"
+    root.mkdir(parents=True)
+    visible = "甲" * 150_000
+    (root / "原文.txt").write_bytes((visible + " \n\t").encode(encoding))
+    result = inspect_deconstruction_original(
+        tmp_path / "extracted", {"normalized_root": "作品"}
+    )
+    assert result["original_text_char_count"] == 150_000
+    assert result["reward_point_units"] == 50
+    assert result["reward_points"] == 0.5
+    assert result["reward_rule"] == "approved-original-text-300k-chars-per-point-v1"
 
 
 def test_openclaw_review_bridge_treats_upload_as_evidence_and_parses_strict_json() -> (
@@ -544,12 +582,24 @@ def test_zip_deconstruction_and_novel_upload_are_queued_with_notifications_api(
     decon = browser.post(
         "/api/v1/me/uploads",
         headers=headers,
-        files={"file": ("structure.zip", short_archive(), "application/zip")},
+        data={"download_points": "999"},
+        files={
+            "file": (
+                "structure.zip",
+                short_archive(original_characters=150_000),
+                "application/zip",
+            )
+        },
     )
     assert decon.status_code == 201
     assert decon.json()["status"] == "quarantined"
-    assert decon.json()["message"] == "上传成功，正在等待审核"
+    assert decon.json()["message"] == "上传成功，正在统计原文字数并等待审核"
     assert "structure" not in decon.json() and "sha256" not in decon.json()
+    priced = browser.get("/api/v1/me/uploads").json()["items"][0]
+    assert priced["structure_report"]["original_text_char_count"] == 150_000
+    assert priced["structure_report"]["reward_point_units"] == 50
+    assert priced["reward_points"] == 0.5
+    assert priced["download_points"] == 0
     novel = browser.post(
         "/api/v1/me/novel-submissions",
         headers=headers,
@@ -594,6 +644,152 @@ def test_zip_deconstruction_and_novel_upload_are_queued_with_notifications_api(
     assert notifications["unread_count"] == 1
     assert notifications["items"][0]["title"] == "拆书文上传成功"
     assert notifications["items"][0]["resource_status"] == "ai_pending"
+
+
+def test_published_submissions_excludes_upload_history_and_uses_product_price(
+    tmp_path: Path,
+) -> None:
+    browser, settings, store, _books, login = authenticated_client(tmp_path)
+    user_id = login["user"]["id"]
+    novel_metadata = {
+        "title": "已入库星海",
+        "author": "作者甲",
+        "category": "科幻",
+        "serialization_status": "finished",
+        "summary": "已经通过审核并完成正式入库的小说。",
+        "source": "作者原创",
+        "authorization": "本人授权展示",
+    }
+    completed_novel = store.create_novel_submission(
+        user_id, novel_metadata, "completed.txt"
+    )
+    pending_novel = store.create_novel_submission(
+        user_id, {**novel_metadata, "title": "仍在审核"}, "pending.txt"
+    )
+    approved_novel = store.create_novel_submission(
+        user_id, {**novel_metadata, "title": "已过审待入库"}, "approved.txt"
+    )
+    completed_upload = store.create_upload(user_id, "completed.zip", "application/zip")
+    approved_upload = store.create_upload(user_id, "approved.zip", "application/zip")
+    rejected_upload = store.create_upload(user_id, "rejected.zip", "application/zip")
+    orphaned_completed_upload = store.create_upload(
+        user_id, "orphaned-completed.zip", "application/zip"
+    )
+    with sqlite3.connect(settings.account_database) as connection:
+        connection.execute(
+            "UPDATE novel_submissions SET status='completed',completed_at=? WHERE id=?",
+            ("2026-08-15T00:00:00Z", completed_novel),
+        )
+        connection.execute(
+            "UPDATE novel_submissions SET status='approved' WHERE id=?",
+            (approved_novel,),
+        )
+        connection.execute(
+            "UPDATE deconstruction_uploads SET status='completed',completed_at=?,output_slug=?,"
+            "download_points=1.25,download_point_units=125 WHERE id=?",
+            ("2026-08-15T00:00:00Z", "published-archive", completed_upload),
+        )
+        connection.execute(
+            "UPDATE deconstruction_uploads SET status='approved' WHERE id=?",
+            (approved_upload,),
+        )
+        connection.execute(
+            "UPDATE deconstruction_uploads SET status='rejected',rejection_reason='未通过' WHERE id=?",
+            (rejected_upload,),
+        )
+        connection.execute(
+            "UPDATE deconstruction_uploads SET status='completed',completed_at=?,output_slug=? WHERE id=?",
+            (
+                "2026-08-15T00:00:00Z",
+                "missing-public-product",
+                orphaned_completed_upload,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO deconstruction_products(slug,contributor_user_id,download_points,download_point_units,published_at) "
+            "VALUES(?,?,?,?,?)",
+            ("published-archive", user_id, 1.25, 125, "2026-08-15T00:00:00Z"),
+        )
+
+    published = browser.get("/api/v1/me/published-submissions")
+    assert published.status_code == 200
+    payload = published.json()
+    assert [item["id"] for item in payload["novels"]] == [completed_novel]
+    assert [item["id"] for item in payload["deconstructions"]] == [completed_upload]
+    assert payload["deconstructions"][0]["status"] == "completed"
+    assert payload["deconstructions"][0]["product_available"] is True
+    assert payload["deconstructions"][0]["download_points"] == 1.25
+    assert payload["novels"][0]["cover_source"] == "library"
+    assert payload["novels"][0]["cover_is_default"] is False
+    assert payload["deconstructions"][0]["cover_source"] == "default"
+    assert payload["deconstructions"][0]["cover_is_default"] is True
+
+    novel_history = browser.get("/api/v1/me/novel-submissions").json()["items"]
+    upload_history = browser.get("/api/v1/me/uploads").json()["items"]
+    assert {item["id"] for item in novel_history} == {
+        completed_novel,
+        pending_novel,
+        approved_novel,
+    }
+    assert {item["id"] for item in upload_history} == {
+        completed_upload,
+        approved_upload,
+        rejected_upload,
+        orphaned_completed_upload,
+    }
+
+
+def test_published_contributor_can_replace_cover_safely(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    browser, settings, store, _books, login = authenticated_client(tmp_path)
+    user_id = login["user"]["id"]
+    metadata = {
+        "title": "没有书库封面的作品",
+        "author": "投稿人",
+        "category": "科幻",
+        "serialization_status": "finished",
+        "summary": "已经正式入库并允许贡献者维护封面。",
+        "source": "作者原创",
+        "authorization": "本人授权展示",
+    }
+    completed = store.create_novel_submission(user_id, metadata, "completed.txt")
+    pending = store.create_novel_submission(
+        user_id, {**metadata, "title": "仍在审核的作品"}, "pending.txt"
+    )
+    with sqlite3.connect(settings.account_database) as connection:
+        connection.execute(
+            "UPDATE novel_submissions SET status='completed',completed_at=? WHERE id=?",
+            ("2026-08-15T00:00:00Z", completed),
+        )
+    monkeypatch.setattr(UploadSecurityScanner, "scan_binary", clean_binary_scan)
+    headers = {"X-CSRF-Token": login["csrf_token"]}
+
+    blocked = browser.post(
+        f"/api/v1/me/submissions/novel/{pending}/cover",
+        headers=headers,
+        files={"file": ("cover.jpg", cover_bytes(), "image/jpeg")},
+    )
+    assert blocked.status_code == 409
+
+    updated = browser.post(
+        f"/api/v1/me/submissions/novel/{completed}/cover",
+        headers=headers,
+        files={"file": ("cover.jpg", cover_bytes(), "image/jpeg")},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["cover_source"] == "custom"
+    assert updated.json()["cover_url"].endswith("?v=1")
+
+    cover = browser.get(f"/api/v1/me/submissions/novel/{completed}/cover")
+    assert cover.status_code == 200
+    assert cover.headers["content-type"] == "image/png"
+    assert cover.headers["cache-control"] == "private, no-store"
+    assert cover.content.startswith(b"\x89PNG\r\n\x1a\n")
+
+    published = browser.get("/api/v1/me/published-submissions").json()["novels"]
+    assert published[0]["cover_source"] == "custom"
+    assert published[0]["cover_url"].endswith("?v=1")
 
 
 def test_notification_history_paginates_ten_per_page(tmp_path: Path) -> None:
@@ -711,6 +907,9 @@ def test_review_worker_writes_relative_hashed_handoff_and_reconciles_result(
     }
     assert {item["resource_status"] for item in notifications["items"]} == {"completed"}
     assert {item["resource_title"] for item in notifications["items"]} == {"structure.zip"}
+    assert {item["action_url"] for item in notifications["items"]} == {
+        "#/account/submit"
+    }
 
 
 def test_additive_migration_preserves_old_upload_rows(tmp_path: Path) -> None:
@@ -774,12 +973,13 @@ def test_spa_nginx_and_worker_contracts_cover_submission_center() -> None:
     styles = (root / "static/styles.css").read_text(encoding="utf-8")
     nginx = (root / "deploy/nginx-oohstory.conf").read_text(encoding="utf-8")
     for value in (
+        "#/account/submit",
         "#/account/submissions",
         "#/account/notifications",
         "上传我的拆书文",
         "oh-story-claudecode",
-        "async function loadSubmissionPage(requestedRecordPage = 1)",
-        "const SUBMISSION_RECORDS_PER_PAGE = 10",
+        "async function loadSubmitPage()",
+        "async function loadMySubmissionsPage()",
         "async function loadNotificationsPage(requestedPage = 1)",
         "const NOTIFICATIONS_PER_PAGE = 10",
         "notification-pagination",
@@ -791,12 +991,27 @@ def test_spa_nginx_and_worker_contracts_cover_submission_center() -> None:
         "伪装成正常书籍",
         "小说与拆解中的虚构赌局、下注、押注情节允许",
         "showAccountSuccessToast(result.message || '上传成功，正在等待审核')",
-        "class: 'submission-history-panel'",
-        "class: 'submission-history-summary'",
-        "notificationData.action_required_count",
-        "未读需处理",
+        "小说上传记录",
+        "拆文上传记录",
+        "已过审书籍",
+        "已过审拆文",
+        "accountApi('/api/v1/me/published-submissions')",
+        "保留每次上传、审核、驳回和正式入库的完整进度。",
+        "积分下载",
+        "免费下载",
+        "每 30 万字奖励 1 积分",
+        "审核奖励按原文字数 ÷ 30 万一次性发放",
+        "保存下载方式",
+        "class: 'submission-history-panel submission-library-panel'",
+        "class: 'submission-history-summary my-submissions-summary'",
         "class: 'submission-progress'",
         "const stageLabels = ['已提交', '内容审核', '正式入库']",
+        "class: 'submission-workspace'",
+        "class: 'submission-mode-button is-active'",
+        "class: 'submission-history-tab is-active'",
+        "const setUploadMode = mode =>",
+        "const setHistoryView = type =>",
+        "showStep(0)",
         "class: 'notification-page-heading'",
     ):
         assert value in script
@@ -807,13 +1022,44 @@ def test_spa_nginx_and_worker_contracts_cover_submission_center() -> None:
     assert ".notification-stream" in styles and ".notification-page-button" in styles
     assert ".notification-resource-status" in styles
     assert ".submission-history-panel" in styles
-    assert ".submission-records { display:grid; grid-template-columns:repeat(2" in styles
+    assert ".submission-studio-page .submission-wizard-actions [hidden]" in styles
+    assert ".submission-workspace" in styles
+    assert ".submission-history-tab.is-active::after" in styles
+    assert ".submission-records {\n  grid-template-columns:minmax(0,1fr);" in styles
+    assert ".published-work-card {" in styles
+    assert "grid-template-columns:150px minmax(0,1fr)" in styles
+    assert "class: 'published-work-list'" in script
+    assert "更新封面" in script
     assert ".submission-stage.current::before" in styles
-    assert script.index("上传小说") < script.index("class: 'submission-history-panel'")
+    assert ".automatic-pricing-note" in styles
+    assert ".submission-price-editor" in styles
+    assert "oohstory-deconstruction-price-sync" in script
+    assert "location.hash = '#/account/submissions'" not in script
+    assert script.index("async function loadSubmitPage()") < script.index(
+        "async function loadMySubmissionsPage()"
+    )
+    submit_page_source = script.split("async function loadSubmitPage()", 1)[1].split(
+        "async function loadMySubmissionsPage()", 1
+    )[0]
+    my_submissions_source = script.split(
+        "async function loadMySubmissionsPage()", 1
+    )[1].split("const NOTIFICATIONS_PER_PAGE", 1)[0]
+    assert "accountApi('/api/v1/me/uploads')" in submit_page_source
+    assert "accountApi('/api/v1/me/novel-submissions')" in submit_page_source
+    assert "accountApi('/api/v1/me/published-submissions')" not in submit_page_source
+    assert "accountApi('/api/v1/me/published-submissions')" in my_submissions_source
+    assert "accountApi('/api/v1/me/uploads')" not in my_submissions_source
+    assert "accountApi('/api/v1/me/novel-submissions')" not in my_submissions_source
+    assert "'免费下载'" in my_submissions_source
+    assert "积分下载" in my_submissions_source
+    assert "等待结构识别" in script
     assert ".notification-row" in styles and "min-height:88px" in styles
     assert "正在隔离、检查文件结构并执行病毒扫描" not in script
     assert "正在安全解压、验毒并识别长/短篇结构" not in script
     assert '"~^POST:/api/v1/me/novel-submissions$" 1;' in nginx
+    assert '"~^POST:/api/v1/me/submissions/(?:novel|deconstruction)/[0-9a-f-]{36}/cover$" 1;' in nginx
+    assert "location ^~ /api/v1/me/submissions/" in nginx
+    assert '"~^PATCH:/api/v1/me/deconstructions/[^/]+/price$" 1;' in nginx
     assert '"~^POST:/api/v1/me/notifications' in nginx
     service = (root / "deploy/oohstory-submission-review.service").read_text(
         encoding="utf-8"

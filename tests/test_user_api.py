@@ -25,6 +25,10 @@ class Books:
         self.favorite_counts.append((book_id, count))
         return {"public_id": book_id, "favorite_count": count}
 
+    @staticmethod
+    def list_deconstructions():
+        return [{"slug": "样本书"}]
+
 
 def client(tmp_path: Path) -> TestClient:
     settings = Settings(
@@ -108,6 +112,147 @@ def test_anonymous_session_probe_is_200_but_private_state_stays_protected(tmp_pa
             "csrf_token": "",
         }
         assert browser.get("/api/v1/me/state").status_code == 401
+
+
+def test_deconstruction_like_route_toggles_for_authenticated_reader(
+    tmp_path: Path,
+) -> None:
+    with client(tmp_path) as browser:
+        registered = browser.post(
+            "/api/v1/auth/register",
+            json={
+                "email": "reader@example.com",
+                "password": "Correct-Horse-9-Battery",
+                "display_name": "星海读者",
+                "invite_code": browser.test_invite,
+                "client": "web",
+            },
+        )
+        csrf = registered.json()["csrf_token"]
+        route = "/api/v1/deconstructions/%E6%A0%B7%E6%9C%AC%E4%B9%A6/likes"
+
+        liked = browser.post(route, headers={"X-CSRF-Token": csrf})
+        assert liked.status_code == 200
+        assert liked.json() == {"slug": "样本书", "liked": True, "like_count": 1}
+
+        unliked = browser.post(route, headers={"X-CSRF-Token": csrf})
+        assert unliked.status_code == 200
+        assert unliked.json() == {"slug": "样本书", "liked": False, "like_count": 0}
+
+
+def test_deconstruction_task_market_api_claims_and_expires_without_worker(
+    tmp_path: Path,
+) -> None:
+    with client(tmp_path) as browser:
+        creator = browser.post("/api/v1/auth/register", json={
+            "email": "creator@example.com", "password": "Correct-Horse-9-Battery",
+            "display_name": "发起人", "invite_code": browser.test_invite, "client": "web",
+        }).json()
+        database = AccountStore(browser.test_account_database, session_ttl_seconds=3600)
+        with database._connect() as connection:
+            connection.execute(
+                "UPDATE users SET email_verified_at=? WHERE id=?",
+                ("2026-08-15T00:00:00+00:00", creator["user"]["id"]),
+            )
+        created = browser.post(
+            "/api/v1/deconstruction-tasks",
+            headers={"X-CSRF-Token": creator["csrf_token"]},
+            json={"book_title": "遥远的救世主", "author": "豆豆", "request_note": "人物关系"},
+        )
+        assert created.status_code == 201
+        task_id = created.json()["id"]
+
+        worker = browser.post("/api/v1/auth/register", json={
+            "email": "worker@example.com", "password": "Other-Correct-8-Password",
+            "display_name": "接单人", "invite_code": browser.test_invite, "client": "android",
+        }).json()
+        with database._connect() as connection:
+            connection.execute(
+                "UPDATE users SET email_verified_at=? WHERE id=?",
+                ("2026-08-15T00:00:00+00:00", worker["user"]["id"]),
+            )
+        bearer = {"Authorization": f"Bearer {worker['access_token']}"}
+        claimed = browser.post(
+            f"/api/v1/deconstruction-tasks/{task_id}/claim", headers=bearer
+        )
+        assert claimed.status_code == 200
+        assert claimed.json()["viewer_is_claimer"] is True
+        assert browser.delete(
+            f"/api/v1/deconstruction-tasks/{task_id}/claim", headers=bearer
+        ).status_code == 200
+        assert browser.get("/api/v1/deconstruction-tasks", headers=bearer).json()["items"][0]["status"] == "open"
+
+
+def test_deconstruction_price_api_syncs_access_and_checks_displayed_price(
+    tmp_path: Path,
+) -> None:
+    with client(tmp_path) as browser:
+        contributor = browser.post(
+            "/api/v1/auth/register",
+            json={
+                "email": "contributor@example.com",
+                "password": "Correct-Horse-9-Battery",
+                "display_name": "贡献者",
+                "invite_code": browser.test_invite,
+                "client": "android",
+            },
+        ).json()
+        buyer = browser.post(
+            "/api/v1/auth/register",
+            json={
+                "email": "buyer@example.com",
+                "password": "Other-Correct-8-Password",
+                "display_name": "购买者",
+                "invite_code": browser.test_invite,
+                "client": "android",
+            },
+        ).json()
+        store = AccountStore(browser.test_account_database, session_ttl_seconds=3600)
+        with store._connect() as connection:
+            connection.execute(
+                "INSERT INTO deconstruction_products(slug,contributor_user_id,download_points,download_point_units,published_at) "
+                "VALUES(?,?,?,?,?)",
+                ("样本书", contributor["user"]["id"], 0.5, 50, "2026-08-15T00:00:00+00:00"),
+            )
+            connection.execute(
+                "INSERT INTO user_point_wallets(user_id,balance,balance_units,updated_at) VALUES(?,?,?,?)",
+                (buyer["user"]["id"], 4, 400, "2026-08-15T00:00:00+00:00"),
+            )
+        contributor_headers = {
+            "Authorization": f"Bearer {contributor['access_token']}"
+        }
+        buyer_headers = {"Authorization": f"Bearer {buyer['access_token']}"}
+
+        updated = browser.patch(
+            "/api/v1/me/deconstructions/%E6%A0%B7%E6%9C%AC%E4%B9%A6/price",
+            headers=contributor_headers,
+            json={"download_points": 0.75},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["download_points"] == 0.75
+        access = browser.get(
+            "/api/v1/me/deconstructions/%E6%A0%B7%E6%9C%AC%E4%B9%A6/access",
+            headers=buyer_headers,
+        )
+        assert access.status_code == 200
+        assert access.json()["download_points"] == 0.75
+        assert "no-store" in access.headers["cache-control"]
+
+        stale = browser.post(
+            "/api/v1/me/deconstructions/%E6%A0%B7%E6%9C%AC%E4%B9%A6/purchase",
+            headers=buyer_headers,
+            json={"expected_points": 0.49},
+        )
+        assert stale.status_code == 409
+        assert "已更新为 0.75" in stale.json()["detail"]
+        purchased = browser.post(
+            "/api/v1/me/deconstructions/%E6%A0%B7%E6%9C%AC%E4%B9%A6/purchase",
+            headers=buyer_headers,
+            json={"expected_points": 0.75},
+        )
+        assert purchased.status_code == 200
+        assert purchased.json()["charged"] == 0.75
+        assert purchased.json()["balance"] == 3.25
 
 
 def test_mobile_login_returns_bearer_token_and_google_is_fail_closed_without_config(tmp_path: Path) -> None:

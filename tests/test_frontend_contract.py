@@ -32,13 +32,13 @@ def test_reader_assets_use_current_cache_busters() -> None:
     html = (PROJECT_ROOT / "static" / "index.html").read_text(encoding="utf-8")
     script = frontend_contract_source(PROJECT_ROOT)
 
-    assert 'href="/styles.css?v=20260810-authcoverorbit1"' in html
+    assert 'href="/styles.css?v=20260815-submission-atelier2"' in html
     assert 'src="/audiobook-lifecycle.js?v=20260811-audiobook-v15-5-preload-contract"' in html
     assert 'src="/audiobook-fallback.js?v=20260811-audiobook-v15-5-preload-contract"' in html
-    assert 'src="/app.js?v=20260815-audiobook-replay-resume1"' in html
+    assert 'src="/app.js?v=20260815-submission-atelier2"' in html
     assert 'href="/api/v1/home/hero-cover?variant=mobile"' not in html
     assert "data-hero-primer" not in html
-    assert 'src="/account-ui.js?v=20260811-googlefirst1"' in html
+    assert 'src="/account-ui.js?v=20260815-submission-atelier2"' in html
     assert (
         'src="/audiobook-cache.js?v=20260813-audiobook-v15-20-five-window"'
         in html
@@ -55,6 +55,28 @@ def test_reader_assets_use_current_cache_busters() -> None:
     assert "20260730-brand1" not in html
     assert "['dashboard', '#/admin', '概览']" in script
     assert "accountApi('/api/v1/admin/summary')" in script
+
+
+def test_transient_session_enrichment_failure_does_not_fake_logout() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+
+    assert "let data\n  try {\n    data = await accountApi('/api/v1/auth/session')" in script
+    assert "A temporary network/upstream failure is not proof" in script
+    assert "Profile enrichment may be independently throttled" in script
+
+
+def test_disclaimer_publishes_complete_copyright_and_dmca_policy() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+
+    assert "staticPage('版权声明与 DMCA 政策', 'Copyright & DMCA Policy'" in script
+    assert "平台性质与用户生成内容（UGC）" in script
+    assert "通知—删除" in script
+    assert "24 至 48 小时" in script
+    assert "反通知（Counter-Notice）" in script
+    assert "重复侵权与虚假投诉" in script
+    assert "mailto:help@example.com?subject=Copyright%20Notice%20%2F%20DMCA" in script
+    assert "English Summary" in script
+    assert "最近更新：2026 年 7 月 12 日" in script
 
 
 def test_book_seo_keywords_only_update_head_metadata() -> None:
@@ -993,8 +1015,8 @@ def test_google_web_login_uses_current_browser_popup_with_explicit_fallback() ->
     html = (PROJECT_ROOT / "static" / "index.html").read_text(encoding="utf-8")
     script = frontend_contract_source(PROJECT_ROOT)
 
-    assert 'href="/styles.css?v=20260810-authcoverorbit1"' in html
-    assert 'src="/account-ui.js?v=20260811-googlefirst1"' in html
+    assert 'href="/styles.css?v=20260815-submission-atelier2"' in html
+    assert 'src="/account-ui.js?v=20260815-submission-atelier2"' in html
     assert "ux_mode: 'popup'" in script
     assert "callback: handleCredential" in script
     assert "mode === 'link' ? '/api/v1/auth/google/link' : '/api/v1/auth/google'" in script
@@ -1009,7 +1031,7 @@ def test_web_deconstruction_upload_copy_uses_result_focused_message() -> None:
     script = frontend_contract_source(PROJECT_ROOT)
 
     assert (
-        "请上传 ZIP。我们会长/短篇结构审核与内容复核完后，并通过消息中心告知您上传结果。"
+        "提交标准 ZIP 档案，系统会完成结构识别、内容复核和正式入库。"
         in script
     )
     assert "请上传 ZIP。系统会在隔离沙箱完成 ClamAV 验毒" not in script
@@ -1108,8 +1130,8 @@ def test_auth_cover_centers_brand_mark_and_uses_reduced_motion_orbits() -> None:
     script = frontend_contract_source(PROJECT_ROOT)
     styles = (PROJECT_ROOT / "static" / "styles.css").read_text(encoding="utf-8")
 
-    assert 'href="/styles.css?v=20260810-authcoverorbit1"' in html
-    assert 'src="/account-ui.js?v=20260811-googlefirst1"' in html
+    assert 'href="/styles.css?v=20260815-submission-atelier2"' in html
+    assert 'src="/account-ui.js?v=20260815-submission-atelier2"' in html
     assert "class: 'auth-art-visual'" in script
     assert "class: 'auth-art-halo auth-art-halo-one'" in script
     assert "class: 'auth-art-halo auth-art-halo-two'" in script

@@ -43,6 +43,36 @@ def test_audiobook_routes_use_dedicated_quotas_not_generic_page_bucket() -> None
     assert blocked.status_code == 429
 
 
+def test_auth_routes_ignore_unrelated_generic_bucket_and_transient_ban() -> None:
+    limiter = RateLimiter(
+        global_rate=0.001,
+        global_burst=1,
+        chapter_rate=0.001,
+        chapter_burst=1,
+    )
+
+    assert limiter.check(_request("/api/v1/books/example/metrics/read", method="POST")) is None
+    blocked = limiter.check(
+        _request("/api/v1/books/example/metrics/read", method="POST")
+    )
+    assert blocked is not None
+    assert blocked.status_code == 429
+    limiter.ban_ip("203.0.113.10", duration=3600, reason="transient test ban")
+
+    assert limiter.check(_request("/api/v1/auth/session")) is None
+    assert limiter.check(_request("/api/v1/auth/config")) is None
+    assert limiter.check(_request("/api/v1/auth/login", method="POST")) is None
+
+    blocked_bot = limiter.check(
+        _request(
+            "/api/v1/auth/session",
+            user_agent=b"python-requests/2.32 scraper",
+        )
+    )
+    assert blocked_bot is not None
+    assert blocked_bot.status_code == 403
+
+
 def test_public_reader_gets_bypass_dynamic_rate_limits_and_transient_bans() -> None:
     limiter = RateLimiter(global_rate=0.001, global_burst=1, chapter_rate=0.001, chapter_burst=1)
     book_id = "AbCdEfGhIjKlMnOpQrStUv"

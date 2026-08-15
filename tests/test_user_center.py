@@ -659,6 +659,12 @@ def test_nginx_get_upload_history_does_not_consume_upload_quota() -> None:
         "POST:/api/v1/books/[A-Za-z0-9_-]{22}/chapters/[1-9][0-9]*/comments",
         "(?:POST|DELETE):/api/v1/paragraph-comments/[0-9a-f-]{36}/thanks",
         "POST:/api/v1/paragraph-comments/[0-9a-f-]{36}/likes",
+        "POST:/api/v1/deconstructions/[^/]+/likes",
+        "POST:/api/v1/deconstruction-tasks",
+        "(?:POST|DELETE):/api/v1/deconstruction-tasks/[0-9a-f-]{36}/claim",
+        "POST:/api/v1/me/wallet/convert-reading",
+        "POST:/api/v1/me/deconstructions/[^/]+/purchase",
+        "PATCH:/api/v1/me/deconstructions/[^/]+/price",
         "POST:/api/v1/books/[A-Za-z0-9_-]{22}/recommend",
     ):
         assert route in nginx
@@ -684,17 +690,41 @@ def test_nginx_get_upload_history_does_not_consume_upload_quota() -> None:
         1,
     )[1].split("\n    }", 1)[0]
     assert "^POST$" in likes_location
+    deconstruction_likes_location = nginx.split(
+        'location ~ "^/api/v1/deconstructions/[^/]+/likes$" {', 1
+    )[1].split("\n    }", 1)[0]
+    assert "^(GET|HEAD|POST)$" in deconstruction_likes_location
+    assert "limit_req zone=ohhstory_account burst=40 nodelay;" in (
+        deconstruction_likes_location
+    )
+    assert "proxy_pass http://oohstory_reader_backend;" in (
+        deconstruction_likes_location
+    )
+    task_location = nginx.split(
+        'location ~ "^/api/v1/deconstruction-tasks(?:/[0-9a-f-]{36}/claim)?$" {', 1
+    )[1].split("\n    }", 1)[0]
+    assert "^(GET|HEAD|POST|DELETE)$" in task_location
+    assert "client_max_body_size 8k;" in task_location
+    account_location = nginx.split(
+        "location ^~ /api/v1/me/ {", 1
+    )[1].split("\n    }", 1)[0]
+    assert "^(GET|HEAD|POST|PUT|PATCH|DELETE)$" in account_location
 
 
 def test_spa_has_real_account_routes_profile_controls_and_active_time_tracker() -> None:
     script = frontend_contract_source(PROJECT_ROOT)
     styles = (PROJECT_ROOT / "static" / "styles.css").read_text(encoding="utf-8")
     for route in (
-        "#/account/history", "#/account/favorites", "#/account/bookshelf", "#/account/profile",
+        "#/account/history", "#/account/favorites", "#/account/bookshelf",
+        "#/account/deconstruction-tasks", "#/account/submit",
+        "#/account/submissions", "#/account/profile",
     ):
         assert route in script
     assert "async function loadAccountCollection(kind)" in script
     assert "async function loadProfilePage()" in script
+    assert "async function loadDeconstructionTasksPage()" in script
+    assert "async function loadSubmitPage()" in script
+    assert "async function loadMySubmissionsPage()" in script
     assert "current_password" in script and "new_password" in script
     assert "image/jpeg,image/png,image/webp" in script
     assert "startReadingActivity(String(requestedBookId))" in script

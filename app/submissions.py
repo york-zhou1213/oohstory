@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import re
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .point_pricing import (
+    DECONSTRUCTION_CHARS_PER_POINT,
+    deconstruction_reward_units,
+    point_value,
+)
 
 
 SHORT_REQUIRED = (
@@ -79,6 +86,45 @@ def inspect_deconstruction_structure(names: list[str]) -> dict[str, Any]:
         "files": sorted(existing)[:500],
         "contract": "oh-story-claudecode-v1",
         "normalized_root": normalized_root,
+    }
+
+
+def _count_visible_characters(path: Path) -> int:
+    """Count non-whitespace characters while supporting common Chinese encodings."""
+    for encoding in ("utf-8-sig", "gb18030"):
+        count = 0
+        decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+        try:
+            with path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    text = decoder.decode(chunk)
+                    count += sum(not character.isspace() for character in text)
+                tail = decoder.decode(b"", final=True)
+                count += sum(not character.isspace() for character in tail)
+            return count
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("原文/原文.txt 不是有效的 UTF-8 或 GB18030 文本")
+
+
+def inspect_deconstruction_original(
+    extracted_root: Path, structure: dict[str, Any]
+) -> dict[str, Any]:
+    """Measure the canonical original and derive its one-time review reward."""
+    extracted = Path(extracted_root).resolve()
+    normalized_root = str(structure.get("normalized_root") or "")
+    content_root = (extracted / normalized_root).resolve()
+    original = (content_root / "原文" / "原文.txt").resolve()
+    if extracted not in original.parents or not original.is_file() or original.is_symlink():
+        raise ValueError("拆书档案缺少可读取的 原文/原文.txt")
+    character_count = _count_visible_characters(original)
+    units = deconstruction_reward_units(character_count)
+    return {
+        "original_text_char_count": character_count,
+        "reward_chars_per_point": DECONSTRUCTION_CHARS_PER_POINT,
+        "reward_point_units": units,
+        "reward_points": point_value(units),
+        "reward_rule": "approved-original-text-300k-chars-per-point-v1",
     }
 
 
