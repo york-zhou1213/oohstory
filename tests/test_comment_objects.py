@@ -35,24 +35,33 @@ def test_comment_root_defaults_to_mounted_object_root(tmp_path: Path) -> None:
 
 
 def test_mysql_comment_schema_keeps_body_out_of_database() -> None:
-    root = Path(__file__).resolve().parents[2] / "webnovel-writer" / "deploy" / "mysql"
-    migration = (root / "026_reader_comment_objects.sql").read_text(encoding="utf-8")
-    grant = (root / "grant-oohstory-comments.sql").read_text(encoding="utf-8")
+    project = Path(__file__).resolve().parents[1]
+    migration = (
+        project / "admin" / "deploy" / "mysql" / "023_reader_comment_objects.sql"
+    ).read_text(encoding="utf-8")
+    initializer = (
+        project / "admin" / "deploy" / "mysql" / "init.sql"
+    ).read_text(encoding="utf-8")
     assert "object_key" in migration
     assert "object_sha256" in migration
     assert "content TEXT" not in migration
     assert "comment_provider=comment_store" in (
         Path(__file__).resolve().parents[1] / "app" / "main.py"
     ).read_text(encoding="utf-8")
-    assert "oohstory_comment_role" in grant
+    assert "oohstory_public_reader_role" in initializer
+    assert "ON `oohstory_library`.reader_comments" in initializer
 
 
 def test_web_and_app_expose_book_detail_comments() -> None:
     project = Path(__file__).resolve().parents[1]
     web = (project / "static" / "app.js").read_text(encoding="utf-8")
-    app_root = project.parent / "oohstory-app"
-    mobile = (app_root / "lib" / "screens" / "book_detail_screen.dart").read_text(encoding="utf-8")
-    service = (app_root / "lib" / "services" / "account_service.dart").read_text(encoding="utf-8")
+    app_root = project / "mobile"
+    mobile = (
+        app_root / "lib" / "screens" / "book_detail_screen.dart"
+    ).read_text(encoding="utf-8")
+    service = (
+        app_root / "lib" / "services" / "account_service.dart"
+    ).read_text(encoding="utf-8")
     assert "/api/v1/books/${bookId}/comments" in web
     assert "/api/v1/comments/${comment.id}/likes" in web
     assert "读者评论" in web
@@ -64,7 +73,7 @@ def test_all_book_comments_follow_chapter_or_volume_directory_on_web_and_app() -
     project = Path(__file__).resolve().parents[1]
     web = (project / "static" / "app.js").read_text(encoding="utf-8")
     mobile = (
-        project.parent / "oohstory-app" / "lib" / "screens" / "book_detail_screen.dart"
+        project / "mobile" / "lib" / "screens" / "book_detail_screen.dart"
     ).read_text(encoding="utf-8")
     web_render = web.index("app.replaceChildren", web.index("async function loadBook"))
     web_volume_directory = web.index("hasVolumes ? chapterPanel : null", web_render)

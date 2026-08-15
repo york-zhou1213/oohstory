@@ -56,7 +56,7 @@ def test_bootstrap_contains_no_default_credentials() -> None:
     assert "IDENTIFIED BY '" not in initializer
     assert "CREATE USER" not in initializer
     assert "IDENTIFIED BY '" not in runtime_users
-    assert runtime_users.count("IDENTIFIED BY RANDOM PASSWORD") == 2
+    assert runtime_users.count("IDENTIFIED BY RANDOM PASSWORD") == 3
     assert "@'%' IDENTIFIED" not in runtime_users
 
 

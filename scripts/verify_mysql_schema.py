@@ -12,7 +12,7 @@ import pymysql
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_ROOT = PROJECT_ROOT / "admin" / "deploy" / "mysql"
-EXPECTED_TABLES = 27
+EXPECTED_TABLES = 29
 EXPECTED_TRIGGERS = 7
 
 

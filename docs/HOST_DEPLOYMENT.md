@@ -65,7 +65,7 @@ cd /opt/oohstory-reader
   --password-file /etc/oohstory-admin/mysql-password
 ```
 
-预期为 22 个 revision、27 张基础表和 7 个触发器。
+预期为 23 个 revision、29 张基础表和 7 个触发器。
 
 ## 4. 配置 Reader 与 Admin
 
@@ -116,7 +116,7 @@ sudo systemctl reload nginx
 ## 7. 上线前验收
 
 - Reader 与 Admin 健康接口返回 200；
-- MySQL 为 22 revisions / 27 tables / 7 triggers；
+- MySQL 为 23 revisions / 29 tables / 7 triggers；
 - Reader 账号不能执行 DDL，Admin 只读账号不能写书目；
 - 公网 `/admin`、`/admin/*`、`/api/admin/*` 和 `/api/v1/admin/*` 返回 404；
 - `.env`、数据库、日志、证书、密钥、签名包和作品数据均未进入 Git；

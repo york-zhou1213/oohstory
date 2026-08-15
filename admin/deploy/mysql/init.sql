@@ -119,16 +119,35 @@ SOURCE deploy/mysql/022_book_publication_controls.sql;
 INSERT INTO schema_migrations (version, checksum, description)
 VALUES ('022', 'bbf8c42cf07b3cfef18628c69d7ecb278bdf5fb18535aaa1eb50a51f5c4cdb3a', '022_book_publication_controls');
 
+SOURCE deploy/mysql/023_reader_comment_objects.sql;
+INSERT INTO schema_migrations (version, checksum, description)
+VALUES ('023', 'a7e2711b4f6a1f18dbac68c44a663ad1f02de9b874cf1f85ba9874303a5d3b6e', '023_reader_comment_objects');
+
 -- Roles have no login credentials. Runtime users are created by
 -- deploy/mysql/runtime-users.sql with server-generated passwords.
 CREATE ROLE IF NOT EXISTS
     'oohstory_library_reader_role'@'%',
-    'oohstory_library_writer_role'@'%';
+    'oohstory_library_writer_role'@'%',
+    'oohstory_public_reader_role'@'%';
 GRANT SELECT ON `oohstory_library`.*
     TO 'oohstory_library_reader_role'@'%';
 GRANT SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES
     ON `oohstory_library`.*
     TO 'oohstory_library_writer_role'@'%';
+GRANT SELECT ON `oohstory_library`.*
+    TO 'oohstory_public_reader_role'@'%';
+GRANT INSERT, UPDATE
+    ON `oohstory_library`.book_public_metrics
+    TO 'oohstory_public_reader_role'@'%';
+GRANT SELECT, INSERT, UPDATE
+    ON `oohstory_library`.book_public_metric_visitors
+    TO 'oohstory_public_reader_role'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE
+    ON `oohstory_library`.reader_comments
+    TO 'oohstory_public_reader_role'@'%';
+GRANT SELECT, INSERT, UPDATE, DELETE
+    ON `oohstory_library`.reader_comment_reactions
+    TO 'oohstory_public_reader_role'@'%';
 
 SELECT COUNT(*) AS applied_migrations FROM schema_migrations;
 SELECT COUNT(*) AS created_tables

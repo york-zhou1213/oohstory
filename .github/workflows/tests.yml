@@ -131,7 +131,7 @@ jobs:
             --user root \
             --password-file "$RUNNER_TEMP/mysql-password"
           test "$(mysql -N -B -h127.0.0.1 -uroot -e \
-            "SELECT COUNT(*) FROM mysql.user WHERE User IN ('oohstory_library_writer_role','oohstory_library_reader_role')")" = "2"
+            "SELECT COUNT(*) FROM mysql.user WHERE User IN ('oohstory_library_writer_role','oohstory_library_reader_role','oohstory_public_reader_role')")" = "3"
       - name: Refuse a second fresh initializer
         working-directory: admin
         env:
@@ -157,7 +157,7 @@ jobs:
           PYTHONPATH=admin/src python \
             admin/scripts/electronic-library/apply_mysql_migrations.py \
             | tee "$RUNNER_TEMP/migration-skip.log"
-          test "$(grep -c '^skip ' "$RUNNER_TEMP/migration-skip.log")" = "22"
+          test "$(grep -c '^skip ' "$RUNNER_TEMP/migration-skip.log")" = "23"
           test "$(grep -Ec '^(apply|adopt) ' "$RUNNER_TEMP/migration-skip.log" || true)" = "0"
 
   mobile:

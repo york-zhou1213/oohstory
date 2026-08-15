@@ -51,12 +51,12 @@ sudo mysql --batch --raw < deploy/mysql/runtime-users.sql \
   > /var/lib/oohstory-admin/generated-mysql-passwords.txt
 ```
 
-`init.sql` creates the database, all 21 current schema revisions, migration
+`init.sql` creates the database, all 23 current schema revisions, migration
 checksums, triggers, and least-privilege roles. It rejects a non-empty schema
 and contains neither accounts nor passwords. `runtime-users.sql` creates only
-two `127.0.0.1` accounts with MySQL-generated random passwords. Immediately
-install those two values in the writer and reader password files described
-below, then securely remove the root-only capture file. There are no default
+three `127.0.0.1` accounts with MySQL-generated random passwords. Immediately
+install those values in the writer, admin reader, and public Reader password
+files described below, then securely remove the root-only capture file. There are no default
 credentials or seed production records in Git.
 
 Run `python3 scripts/electronic-library/render_mysql_init_sql.py --check` before
@@ -72,6 +72,11 @@ service group). The parent `/etc/oohstory-admin` directory must be
 `0710 root:oohstory-admin` so the service can traverse to that one file while
 remaining unable to list the directory. Never copy the webnovel-writer
 environment file.
+
+The public Reader account is `oohstory_public_reader`. Store its generated
+password in `/etc/oohstory-reader/mysql-password` with `root:oohstory` mode
+`0640`. Its role can read the catalog and can mutate only anonymous public
+metrics plus Reader comment metadata; comment bodies remain outside MySQL.
 
 After every source update, reinstall the project package (or use an explicitly
 managed editable install) and verify both `oohstory_admin.__file__` and

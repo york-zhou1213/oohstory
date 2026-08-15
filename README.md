@@ -62,7 +62,7 @@ OOH Story 是一套数据自持有、可从空环境部署的中文电子书平�
 ## 仓库结构
 
 - `app/`、`static/`：Reader、账户、阅读记录、评论、投稿与 Web UI。
-- `admin/`：OOHStory Admin、书库引擎、任务脚本、001–022 MySQL 迁移和 systemd 模板。
+- `admin/`：OOHStory Admin、书库引擎、任务脚本、001–023 MySQL 迁移和 systemd 模板。
 - `mobile/`：Flutter Android/iOS 客户端源码。
 - `scripts/`：本地空书库、数据库验收、可选 Compose 沙盒和敏感信息门禁。
 - `deploy/`、`admin/deploy/`：原生 Linux 的 systemd、Nginx、MySQL 与 Redis 部署模板。
@@ -108,7 +108,7 @@ set +a
 
 - Reader 与 Admin 的 systemd 单元；
 - Nginx/TLS、安全请求白名单与限流模板；
-- MySQL 001–022 空库初始化、随机运行账号和迁移工具；
+- MySQL 001–023 空库初始化、随机运行账号和迁移工具；
 - Redis、Worker 与周期任务模板；
 - 空书库初始化和最小权限配置示例。
 
@@ -129,9 +129,9 @@ set +a
 1. 在被 Git 忽略、权限为 0600 的 `.env.compose` 生成四个独立数据库密码；
 2. 同一文件只保存管理员密码哈希，随机管理员明文密码只显示一次；
 3. 创建不含任何书籍的 `data/library/` SQLite/目录骨架与默认封面；
-4. 启动 MySQL 8.4 并真实执行 001–022 全部迁移；
+4. 启动 MySQL 8.4 并真实执行 001–023 全部迁移；
 5. 创建 writer、admin-reader、public-reader 三个最小权限账号；
-6. 启动 Reader 与 Admin，核验 22 个 revision、27 张表、7 个触发器和两个健康接口。
+6. 启动 Reader 与 Admin，核验 23 个 revision、29 张表、7 个触发器和两个健康接口。
 
 入口：
 

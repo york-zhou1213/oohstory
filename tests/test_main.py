@@ -14,14 +14,25 @@ from PIL import Image
 import pytest
 
 from app import main
+from app import rate_limiter as rate_limiter_module
 from app.library import InputError
 
 PUBLIC_BOOK_ID = "AAAAAAAAAAAAAAAAAAAAAA"
 
 
 @pytest.fixture(autouse=True)
-def isolate_request_limiter(monkeypatch) -> None:
+def isolate_request_limiter(monkeypatch, tmp_path: Path) -> None:
     """Keep per-test request accounting independent and deterministic."""
+    monkeypatch.setattr(
+        rate_limiter_module,
+        "_DOWNLOAD_LOG_PATH",
+        tmp_path / "download_daily.json",
+    )
+    monkeypatch.setattr(
+        rate_limiter_module,
+        "_DOWNLOAD_LOG_LOCK_PATH",
+        tmp_path / "download_daily.lock",
+    )
     monkeypatch.setattr(
         main,
         "_rate_limiter",
