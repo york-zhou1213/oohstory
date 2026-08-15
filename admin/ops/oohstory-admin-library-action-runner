@@ -61,6 +61,22 @@ SITE_FULL_SYNC_GROUPS = {
     "linovelib": "fanqie",
 }
 SERIALIZED_UPDATE_SOURCES = {"xbiquge", "ixdzs", "shubaow", "linovelib"}
+CAPABILITY_ACTIONS = (
+    "search", "move", "cover", "upload_cover", "import",
+    "delete_catalog_books",
+    "deconstruct", "resume", "deconstruction_batch",
+    "task_runners", "task_detail", "sync_status", "sync_control",
+    "site_full_sync", "serialized_update_source", "cover_redraw_control",
+    "root_migration_status", "root_migration_preflight", "root_migration_start",
+    "index_refresh", "plot_query", "plot_plan", "plot_preview",
+    "plot_apply", "plot_adaptations",
+    "operations_overview", "invite_create", "invite_revoke",
+    "registered_user_status", "registered_user_sessions_revoke",
+    "category_create", "category_update", "category_delete",
+    "admin_novel_upload", "book_publication_overview",
+    "book_publication_status",
+)
+ALLOWED_ACTIONS = frozenset((*CAPABILITY_ACTIONS, "job_status"))
 SAFE_ENV_RE = re.compile(
     r"^(?:OOHSTORY_LIBRARY_|WEBNOVEL_LIBRARY_|WEBNOVEL_GLOBAL_DECONSTRUCTION_ROOT$|"
     r"LIBRARY_TASK_USE_SYSTEMD$)[A-Z0-9_]*$"
@@ -812,21 +828,7 @@ async def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
     action = str(payload.get("action") or "")
     if action == "capabilities":
         return {
-            "actions": [
-                "search", "move", "cover", "upload_cover", "import",
-                "delete_catalog_books",
-                "deconstruct", "resume", "deconstruction_batch",
-                "task_runners", "task_detail", "sync_status", "sync_control",
-                "site_full_sync", "serialized_update_source", "cover_redraw_control",
-                "root_migration_status", "root_migration_preflight", "root_migration_start",
-                "index_refresh", "plot_query", "plot_plan", "plot_preview",
-                "plot_apply", "plot_adaptations",
-                "operations_overview", "invite_create", "invite_revoke",
-                "registered_user_status", "registered_user_sessions_revoke",
-                "category_create", "category_update", "category_delete",
-                "admin_novel_upload", "book_publication_overview",
-                "book_publication_status",
-            ],
+            "actions": list(CAPABILITY_ACTIONS),
             "move_limit": 500,
             "cover_limit": 200,
             "delete_limit": 100,
@@ -836,20 +838,7 @@ async def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
         from oohstory_library.services.library_task_runners import task_runner_catalog
 
         return task_runner_catalog(refresh=True)
-    allowed_actions = {
-        "job_status", "search", "move", "cover", "import",
-        "delete_catalog_books",
-        "deconstruct", "resume", "deconstruction_batch", "task_detail", "upload_cover",
-        "sync_status", "sync_control", "site_full_sync", "serialized_update_source", "cover_redraw_control", "index_refresh", "plot_query", "plot_plan",
-        "root_migration_status", "root_migration_preflight", "root_migration_start",
-        "plot_preview", "plot_apply", "plot_adaptations",
-        "operations_overview", "invite_create", "invite_revoke",
-        "registered_user_status", "registered_user_sessions_revoke",
-        "category_create", "category_update", "category_delete",
-        "admin_novel_upload", "book_publication_overview",
-        "book_publication_status",
-    }
-    if action not in allowed_actions:
+    if action not in ALLOWED_ACTIONS:
         raise ValueError("操作不在允许列表中")
     if action.startswith("root_migration_"):
         return library_root_migration(payload)
@@ -1111,21 +1100,31 @@ async def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> None:
-    if os.geteuid() != 0:
-        emit(False, "书库操作助手必须由 root 执行", code=77)
-    configure_root_runtime_environment()
     if len(sys.argv) == 3 and sys.argv[1] == "--run-job":
+        if os.geteuid() != 0:
+            emit(False, "书库操作助手必须由 root 执行", code=77)
+        configure_root_runtime_environment()
         try:
             asyncio.run(execute_job(sys.argv[2]))
         except Exception:
             raise SystemExit(1)
         raise SystemExit(0)
     if len(sys.argv) == 2 and sys.argv[1] == "--dispatch-stdin":
-        pass
+        if os.geteuid() != 0:
+            emit(False, "书库操作助手必须由 root 执行", code=77)
+        configure_root_runtime_environment()
     elif len(sys.argv) != 1:
         emit(False, "不接受命令行参数", code=64)
     try:
-        data = asyncio.run(dispatch(read_request()))
+        payload = read_request()
+        action = str(payload.get("action") or "")
+        if action != "capabilities" and action not in ALLOWED_ACTIONS:
+            raise ValueError("操作不在允许列表中")
+        if os.geteuid() != 0 and action != "capabilities":
+            emit(False, "书库操作助手必须由 root 执行", code=77)
+        if os.geteuid() == 0:
+            configure_root_runtime_environment()
+        data = asyncio.run(dispatch(payload))
         emit(True, str(data.get("message") or "操作完成") if isinstance(data, dict) else "操作完成", data if isinstance(data, dict) else {})
     except (ValueError, KeyError) as exc:
         emit(False, str(exc).strip("'"), code=64)
