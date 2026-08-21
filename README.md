@@ -10,7 +10,7 @@
 
 <p align="center">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-0f766e">
-  <a href="https://github.com/york-zhou1213/oohstory/releases/tag/web-v20260821-v21-29-oss1"><img alt="Release: web-v20260821-v21-29-oss1" src="https://img.shields.io/badge/release-web--v20260821--v21--29--oss1-7c3aed"></a>
+  <a href="https://github.com/york-zhou1213/oohstory/releases/tag/web-v20260821-v21-30-oss1"><img alt="Release: web-v20260821-v21-30-oss1" src="https://img.shields.io/badge/release-web--v20260821--v21--30--oss1-7c3aed"></a>
   <img alt="Python 3.12+" src="https://img.shields.io/badge/Python-3.12%2B-3776AB">
   <img alt="Flutter" src="https://img.shields.io/badge/Flutter-stable-02569B">
   <img alt="MySQL 8.4" src="https://img.shields.io/badge/MySQL-8.4-4479A1">
@@ -26,7 +26,7 @@
 
 OOH Story 是一套数据自持有、可从空环境部署的中文电子书平台。仓库包含 Web Reader、独立运维后台、书库 Backend/Worker、MySQL 数据库迁移，以及 Flutter Android/iOS 客户端源码。
 
-当前公开版本：[`web-v20260821-v21-29-oss1`](https://github.com/york-zhou1213/oohstory/releases/tag/web-v20260821-v21-29-oss1)。
+当前公开版本：[`web-v20260821-v21-30-oss1`](https://github.com/york-zhou1213/oohstory/releases/tag/web-v20260821-v21-30-oss1)。
 
 > 仓库只提供程序代码与品牌静态资源，不包含小说正文、用户数据、数据库备份、签名安装包、私钥或生产凭据。部署者必须确保内容具备合法的使用和发布权。
 
