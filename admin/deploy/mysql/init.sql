@@ -123,6 +123,10 @@ SOURCE deploy/mysql/023_reader_comment_objects.sql;
 INSERT INTO schema_migrations (version, checksum, description)
 VALUES ('023', 'a7e2711b4f6a1f18dbac68c44a663ad1f02de9b874cf1f85ba9874303a5d3b6e', '023_reader_comment_objects');
 
+SOURCE deploy/mysql/028_reader_ready_category_words.sql;
+INSERT INTO schema_migrations (version, checksum, description)
+VALUES ('028', 'bc21130fddfbaf5f0dbb24153e910dc6fdda6e79dc93ebda0d77977a42256f23', '028_reader_ready_category_words');
+
 -- Roles have no login credentials. Runtime users are created by
 -- deploy/mysql/runtime-users.sql with server-generated passwords.
 CREATE ROLE IF NOT EXISTS

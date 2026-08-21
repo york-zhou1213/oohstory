@@ -249,6 +249,8 @@ const state = {
   cloudState: { history: [], favorites: [], bookshelf: [] },
   notificationsUnread: 0,
   cloudSyncTimer: null,
+  cloudSyncGeneration: 0,
+  routeGeneration: 0,
   readingActivity: null,
   ttsController: null,
   ttsSession: null
@@ -522,6 +524,26 @@ function navigateInApp(target, { replace = false } = {}) {
   return true
 }
 
+function routeIsCurrent(generation, expectedPath = '') {
+  if (generation !== state.routeGeneration) return false
+  return !expectedPath || pathFromLocation() === expectedPath
+}
+
+function isSpaNavigationTarget(url) {
+  if (url.hash && !url.hash.startsWith('#/')) return false
+  if (url.hash.startsWith('#/')) return true
+  const pathname = url.pathname.replace(/\/+$/, '') || '/'
+  return pathname === '/'
+    || ['/library', '/rankings', '/deconstructions', '/account'].includes(pathname)
+    || /^\/(?:about|disclaimer|guide|contact|client)$/.test(pathname)
+    || /^\/account\/(?:history|favorites|bookshelf|deconstruction-tasks|submit|submissions|notifications|profile)$/.test(pathname)
+    || /^\/admin(?:\/.*)?$/.test(pathname)
+    || /^\/books\/[A-Za-z0-9_-]{22}$/.test(pathname)
+    || /^\/books\/[A-Za-z0-9_-]{22}\/chapters\/\d+$/.test(pathname)
+    || /^\/books\/[A-Za-z0-9_-]{22}\/volumes\/\d+$/.test(pathname)
+    || /^\/deconstructions\/[^/]+$/.test(pathname)
+}
+
 function emptyReadingProgressStore() {
   return {
     schema: READING_PROGRESS_SCHEMA,
@@ -741,10 +763,104 @@ const coverLoader = (() => {
   }
 })()
 
+const EDGE_RECOVERY_MARKER = '__cf_recover'
+const EDGE_RECOVERY_SESSION_KEY = 'oohstory-edge-recovery-at'
+const EDGE_RECOVERY_GUARD_MS = 15000
+let edgeRecoveryInFlight = false
+let edgeHiddenAt = 0
+
+function isCloudflareEdgeChallenge(response) {
+  if (!response || response.status !== 403) return false
+  const mitigated = String(response.headers.get('cf-mitigated') || '').toLowerCase()
+  const contentType = String(response.headers.get('content-type') || '').toLowerCase()
+  return mitigated === 'challenge'
+    || (response.headers.has('cf-ray') && contentType.includes('text/html'))
+}
+
+function edgeRetryUrl(input) {
+  const raw = typeof input === 'string' ? input : input?.url
+  if (!raw) return input
+  const url = new URL(raw, location.href)
+  if (url.origin !== location.origin) return input
+  url.searchParams.set('__edge_retry', String(Date.now()))
+  return `${url.pathname}${url.search}${url.hash}`
+}
+
+function clearEdgeRecoveryMarker() {
+  try { sessionStorage.removeItem(EDGE_RECOVERY_SESSION_KEY) } catch (_error) {}
+  const url = new URL(location.href)
+  if (!url.searchParams.has(EDGE_RECOVERY_MARKER)) return
+  url.searchParams.delete(EDGE_RECOVERY_MARKER)
+  history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
+}
+
+function beginEdgeRecovery() {
+  const now = Date.now()
+  let lastAttempt = 0
+  try { lastAttempt = Number(sessionStorage.getItem(EDGE_RECOVERY_SESSION_KEY) || 0) } catch (_error) {}
+  if (now - lastAttempt < EDGE_RECOVERY_GUARD_MS) {
+    const error = new Error('Cloudflare 安全验证尚未恢复，请点击“重新加载”后继续')
+    error.edgeChallenge = true
+    throw error
+  }
+  try { sessionStorage.setItem(EDGE_RECOVERY_SESSION_KEY, String(now)) } catch (_error) {}
+  edgeRecoveryInFlight = true
+  const url = new URL(location.href)
+  url.searchParams.set(EDGE_RECOVERY_MARKER, String(now))
+  window.setTimeout(() => location.replace(`${url.pathname}${url.search}${url.hash}`), 0)
+  const error = new Error('正在重新连接 Cloudflare 安全验证…')
+  error.edgeRecovery = true
+  throw error
+}
+
+async function edgeFetch(input, options = {}, { recoverNavigation = true } = {}) {
+  const method = String(options.method || input?.method || 'GET').toUpperCase()
+  let response = await fetch(input, options)
+  if (!isCloudflareEdgeChallenge(response)) {
+    if (response.ok) clearEdgeRecoveryMarker()
+    return response
+  }
+  if (['GET', 'HEAD'].includes(method)) {
+    await new Promise(resolve => window.setTimeout(resolve, 180))
+    response = await fetch(edgeRetryUrl(input), { ...options, cache: 'no-store' })
+    if (!isCloudflareEdgeChallenge(response)) {
+      if (response.ok) clearEdgeRecoveryMarker()
+      return response
+    }
+  }
+  if (recoverNavigation) beginEdgeRecovery()
+  return response
+}
+
+window.OOHStoryEdgeFetch = edgeFetch
+
+const probeEdgeSessionAfterResume = () => {
+  if (document.hidden || edgeRecoveryInFlight) return
+  edgeFetch(`/healthz?edge_probe=${Date.now()}`, {
+    method: 'HEAD', credentials: 'same-origin', cache: 'no-store'
+  }).catch(error => {
+    if (!error?.edgeRecovery && !error?.edgeChallenge) {
+      console.warn('[Edge] Cloudflare session probe unavailable', error)
+    }
+  })
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    edgeHiddenAt = Date.now()
+    return
+  }
+  if (edgeHiddenAt && Date.now() - edgeHiddenAt >= 300000) probeEdgeSessionAfterResume()
+  edgeHiddenAt = 0
+})
+window.addEventListener('pageshow', event => {
+  if (event.persisted) probeEdgeSessionAfterResume()
+})
+
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {})
   headers.set('Accept', 'application/json')
-  const response = await fetch(path, { ...options, headers })
+  const response = await edgeFetch(path, { ...options, headers })
   const data = await response.json().catch(() => ({}))
   if (!response.ok) throw new Error(data.detail || `请求失败（${response.status}）`)
   return data
@@ -1018,11 +1134,37 @@ function safeLibraryReturnPath(value) {
   }
 }
 
+function libraryReturnStorageKey(bookId) {
+  return `oohstory.library.return.v1:${String(bookId || '').trim()}`
+}
+
+function rememberLibraryReturnPath(bookId, value) {
+  const libraryPath = safeLibraryReturnPath(value)
+  if (!bookId || libraryPath === '/library') return libraryPath
+  try {
+    sessionStorage.setItem(libraryReturnStorageKey(bookId), libraryPath)
+  } catch {
+    // Storage may be disabled; clean crawlable URLs still take precedence.
+  }
+  return libraryPath
+}
+
+function libraryReturnPathFor(bookId) {
+  const explicit = paramsFromHash().get('from')
+  if (explicit) return rememberLibraryReturnPath(bookId, explicit)
+  try {
+    return safeLibraryReturnPath(sessionStorage.getItem(libraryReturnStorageKey(bookId)))
+  } catch {
+    return '/library'
+  }
+}
+
 function withLibraryReturn(path, returnTo) {
   const libraryPath = safeLibraryReturnPath(returnTo)
-  if (libraryPath === '/library') return path
   const url = new URL(path, location.origin)
-  url.searchParams.set('from', libraryPath)
+  const bookMatch = url.pathname.match(/^\/books\/([A-Za-z0-9_-]{22})(?:\/|$)/)
+  if (bookMatch) rememberLibraryReturnPath(bookMatch[1], libraryPath)
+  url.searchParams.delete('from')
   return `${url.pathname}${url.search}`
 }
 
@@ -1854,7 +1996,7 @@ async function loadLibrary() {
 }
 
 async function loadBook(bookId) {
-  const libraryReturnPath = safeLibraryReturnPath(paramsFromHash().get('from'))
+  const libraryReturnPath = libraryReturnPathFor(bookId)
   const contextualHref = path => withLibraryReturn(path, libraryReturnPath)
   const [book, catalog, metrics, recommendationState, initialBookComments] = await Promise.all([
     api(`/api/v1/books/${bookId}`),
@@ -2394,10 +2536,20 @@ function bindMobileReaderGestures({
   stage.addEventListener('touchmove', event => {
     const touch = event.touches?.[0]
     if (!touch) return
-    if (Math.abs(touch.clientX - touchStartX) > 10 || Math.abs(touch.clientY - touchStartY) > 10) {
+    const deltaX = touch.clientX - touchStartX
+    const deltaY = touch.clientY - touchStartY
+    if (Math.abs(deltaX) > 10 || Math.abs(deltaY) > 10) {
       touchMoved = true
     }
-  }, { passive: true })
+    // Paginated reading owns horizontal swipes. Cancelling the native pan
+    // prevents iOS Safari's edge-history gesture from racing our chapter
+    // navigation and restoring an older reader route.
+    if (state.reader.mode !== 'vertical'
+      && Math.abs(deltaX) > 12
+      && Math.abs(deltaX) > Math.abs(deltaY)) {
+      event.preventDefault()
+    }
+  }, { passive: false })
   const handleReaderScroll = () => {
     if (touchActive && Math.abs(readerScrollMetrics(stage).scrollTop - touchStartScrollTop) > 4) {
       touchMoved = true
@@ -2488,10 +2640,11 @@ function bindMobileReaderGestures({
   }
 }
 
-async function loadReader(bookId, chapterId) {
+async function loadReader(bookId, chapterId, navigationGeneration = state.routeGeneration) {
   const requestedBookId = String(bookId)
   const requestedChapterId = Number(chapterId)
-  const libraryReturnPath = safeLibraryReturnPath(paramsFromHash().get('from'))
+  const expectedReaderPath = `/read/${requestedBookId}/${requestedChapterId}`
+  const libraryReturnPath = libraryReturnPathFor(bookId)
   const contextualHref = path => withLibraryReturn(path, libraryReturnPath)
   const [chapter, catalog, initialChapterComments] = await Promise.all([
     getReaderChapter(requestedBookId, requestedChapterId),
@@ -2499,6 +2652,7 @@ async function loadReader(bookId, chapterId) {
     api(`/api/v1/books/${requestedBookId}/chapters/${requestedChapterId}/comments`)
       .catch(() => ({ paragraphs: {}, comment_count: 0 }))
   ])
+  if (!routeIsCurrent(navigationGeneration, expectedReaderPath)) return
   const chapterPosition = catalog.chapters.findIndex(item => Number(item.id) === requestedChapterId)
   if (chapterPosition < 0) throw new Error('当前章节不在本书目录中')
   trackBookMetric(requestedBookId, 'read').catch(() => {})
@@ -2545,6 +2699,7 @@ async function loadReader(bookId, chapterId) {
   let resizeTimer = null
   let pageAnimationTimer = null
   let progressSaveTimer = null
+  let chapterNavigationPending = false
   let autoFrame = null
   let autoLastTime = 0
   let progressFrame = null
@@ -2671,12 +2826,14 @@ async function loadReader(bookId, chapterId) {
   }
 
   const goToChapter = (id, automatic = false) => {
-    if (!id) return false
+    if (!id || chapterNavigationPending) return false
+    chapterNavigationPending = true
     if (!automatic) stopAutoReading()
     flushReadingProgress()
     state.readerAutoContinue = Boolean(automatic)
-    navigateInApp(contextualHref(`/books/${requestedBookId}/chapters/${id}`))
-    return true
+    const navigated = navigateInApp(contextualHref(`/books/${requestedBookId}/chapters/${id}`))
+    if (!navigated) chapterNavigationPending = false
+    return navigated
   }
 
   const updateProgress = () => {
@@ -2847,6 +3004,9 @@ async function loadReader(bookId, chapterId) {
   let audiobookManifestHash = ''
   let ttsChapterStreamUrl = ''
   let ttsNextChapterStreamUrl = '', ttsContinuousStreamMode = false
+  let ttsNextChapterPrefetchPromise = null, ttsNextChapterPrefetchSourceId = ''
+  let ttsChapterTransitionPromise = null, ttsStreamCompletionPromise = null
+  let ttsChapterEndWatchdogTimer = null, ttsChapterEndWatchdogAttempts = 0
   let ttsStreamStartPlanIndex = 0
   let ttsStreamResumeBaseSeconds = 0
   let ttsTimelineLoadedThrough = -1
@@ -2859,6 +3019,9 @@ async function loadReader(bookId, chapterId) {
   let ttsFallbackPlayback = null
   let ttsBatchPreloadKey = '', ttsBatchPreloadPromise = null
   let ttsLastStreamCurrentTimeSeconds = 0, ttsTrustedPlanIndex = 0, ttsTrustedItemOffsetSeconds = 0, ttsReplayRecoveryPromise = null
+  let ttsHlsMode = false, ttsHlsQueueId = '', ttsHlsStatusUrl = ''
+  let ttsHlsItems = [], ttsHlsQueueIndex = 0, ttsHlsRefreshTimer = null, ttsHlsRefreshPromise = null
+  let ttsHlsNavigatingChapterId = '', ttsHlsStartOffsetSeconds = 0
 
   const ttsIllustLine = /^\[illustration:.+\]$/
   const ttsParagraphs = () => {
@@ -2945,6 +3108,170 @@ async function loadReader(bookId, chapterId) {
 
   const ttsBackendResponseError = window.OOHStoryAudiobookLifecycle.responseError
   const ttsBackendFailureNotice = window.OOHStoryAudiobookLifecycle.failureNotice
+
+  const ttsSupportsNativeIosHls = () => {
+    const ua = String(navigator.userAgent || '')
+    const ios = /iP(?:hone|ad|od)/i.test(ua)
+      || (/Macintosh/i.test(ua) && Number(navigator.maxTouchPoints || 0) > 1)
+    if (!ios) return false
+    const audio = ttsEnsureAudio()
+    return Boolean(audio.canPlayType?.('application/vnd.apple.mpegurl') || audio.canPlayType?.('application/x-mpegURL'))
+  }
+
+  const ttsHlsNormalizeItems = payload => (Array.isArray(payload?.items) ? payload.items : []).map(item => ({
+    ...item,
+    chapterId: String(item.chapter_id),
+    chapterTitle: item.chapter_title || '未命名章节',
+    manifestHash: String(item.manifest_hash || ''),
+    paraIdx: Math.max(0, Number(item.paragraph_index) || 0),
+    index: Math.max(0, Number(item.index) || 0),
+    durationSeconds: Math.max(0.1, Number(item.duration_seconds) || 0.8),
+    durationExact: Boolean(item.duration_exact),
+    queueOffsetSeconds: Math.max(0, Number(item.queue_offset_seconds) || 0),
+    nextChapterId: Number(item.next_chapter_id) > 0 ? String(item.next_chapter_id) : null,
+    text: item.text || ''
+  }))
+
+  const ttsHlsApplyPayload = payload => {
+    const incoming = ttsHlsNormalizeItems(payload)
+    if (incoming.length) ttsHlsItems = incoming
+    if (payload?.queue_id) ttsHlsQueueId = String(payload.queue_id)
+    if (payload?.status_endpoint) ttsHlsStatusUrl = String(payload.status_endpoint)
+    return ttsHlsItems.length > 0
+  }
+
+  const ttsHlsRefreshQueue = () => {
+    if (!ttsHlsMode || !ttsHlsStatusUrl || ttsHlsRefreshPromise) return ttsHlsRefreshPromise
+    ttsHlsRefreshPromise = fetch(ttsHlsStatusUrl, {
+      method: 'GET', credentials: 'same-origin', cache: 'no-store',
+      headers: { 'X-Audiobook-Client': audiobookClientId },
+      signal: audiobookAbortController?.signal
+    }).then(async response => {
+      if (!response.ok) throw new Error(`HLS queue status ${response.status}`)
+      ttsHlsApplyPayload(await response.json())
+      return true
+    }).catch(error => {
+      if (error?.name !== 'AbortError') console.warn('[TTS] iOS HLS queue refresh unavailable', error)
+      return false
+    }).finally(() => { ttsHlsRefreshPromise = null })
+    return ttsHlsRefreshPromise
+  }
+
+  const ttsHlsSeekToQueueIndex = index => {
+    if (!ttsHlsMode || !ttsAudioEl || !ttsHlsItems.length) return
+    const target = Math.max(0, Math.min(Number(index) || 0, ttsHlsItems.length - 1))
+    ttsAudioEl.currentTime = Math.max(0, Number(ttsHlsItems[target].queueOffsetSeconds) || 0)
+    ttsHlsQueueIndex = target
+  }
+
+  const ttsHlsSyncPosition = () => {
+    if (!ttsHlsMode || !ttsAudioEl || !ttsHlsItems.length || !state.reader.ttsActive) return
+    const currentTime = Math.max(0, Number(ttsAudioEl.currentTime) || 0)
+    let queueIndex = 0
+    for (let index = 0; index < ttsHlsItems.length; index++) {
+      if (Number(ttsHlsItems[index].queueOffsetSeconds) <= currentTime + 0.05) queueIndex = index
+      else break
+    }
+    const active = ttsHlsItems[queueIndex]
+    if (!active) return
+    const chapterChanged = String(state.ttsSession?.chapterId || '') !== active.chapterId
+    let activePlanIndex = ttsPlanIndex
+    if (chapterChanged) {
+      const chapterItems = ttsHlsItems.filter(item => item.chapterId === active.chapterId)
+      ttsChapterPlan = chapterItems
+      activePlanIndex = Math.max(0, chapterItems.findIndex(item => item.index === active.index))
+      ttsPlanIndex = activePlanIndex
+      ttsParagraphIndex = -1
+      ttsStreamStartPlanIndex = 0
+      audiobookManifestHash = active.manifestHash
+      ttsFollowingChapterId = active.nextChapterId
+      if (state.ttsSession?.active) {
+        state.ttsSession.chapterId = active.chapterId
+        state.ttsSession.chapterTitle = active.chapterTitle
+        state.ttsSession.paragraphCount = ttsPlanParagraphCount(chapterItems)
+        state.ttsSession.absoluteItemCount = chapterItems.length
+        state.ttsSession.itemCount = chapterItems.length
+        const metrics = ttsChapterMetrics(active.chapterId)
+        state.ttsSession.chapterNumber = metrics.number
+        state.ttsSession.chapterCount = metrics.count
+        state.ttsSession.contextItems = chapterItems.map(item => item.text || '')
+        state.ttsSession.returnPath = contextualHref(`/books/${requestedBookId}/chapters/${active.chapterId}`)
+      }
+      ttsActivateChapter(active.chapterId).catch(error => console.warn('[TTS] HLS chapter activation delayed', error))
+      if (!state.ttsSession?.detached && String(requestedChapterId) !== active.chapterId
+          && ttsHlsNavigatingChapterId !== active.chapterId) {
+        ttsHlsNavigatingChapterId = active.chapterId
+        requestAnimationFrame(() => navigateInApp(contextualHref(`/books/${requestedBookId}/chapters/${active.chapterId}`)))
+      }
+    } else {
+      activePlanIndex = Math.max(0, ttsChapterPlan.findIndex(item => Number(item.index) === active.index))
+    }
+    ttsHlsQueueIndex = queueIndex
+    ttsSetActiveItem(activePlanIndex)
+    ttsTrustedPlanIndex = ttsPlanIndex
+    ttsTrustedItemOffsetSeconds = Math.max(0, currentTime - active.queueOffsetSeconds)
+    if (Date.now() - ttsLastProgressAt >= 5000) {
+      ttsLastProgressAt = Date.now()
+      ttsQueueServerProgress()
+    }
+  }
+
+  const ttsStartNativeIosHls = async (currentManifest, startIndex, offsetSeconds) => {
+    if (!ttsSupportsNativeIosHls() || !audiobookServerSessionId) return false
+    const response = await fetch(`/api/v1/audiobook/sessions/${audiobookServerSessionId}/hls/queues`, {
+      method: 'POST', credentials: 'same-origin', headers: audiobookHeaders(),
+      signal: audiobookAbortController?.signal,
+      body: JSON.stringify({
+        manifest_hash: String(currentManifest.manifest_hash || ''),
+        start_index: Math.max(0, Number(startIndex) || 0),
+        offset_ms: Math.max(0, Math.round((Number(offsetSeconds) || 0) * 1000))
+      })
+    })
+    if (!response.ok) throw await ttsBackendResponseError(response)
+    const payload = await response.json()
+    if (!state.reader.ttsActive || !ttsHlsApplyPayload(payload)) return false
+    const audio = ttsEnsureAudio()
+    ttsHlsMode = true
+    ttsSegmentFallbackMode = false
+    ttsContinuousStreamMode = false
+    ttsHlsQueueIndex = 0
+    ttsHlsStartOffsetSeconds = Math.max(0, Number(payload.offset_ms || 0) / 1000)
+    ttsActiveStreamId = ttsHlsQueueId
+    if (state.ttsSession?.active) state.ttsSession.playbackStatusText = '正在连接 iOS 后台播放队列'
+    ttsLifecycle.connect()
+    ttsUpdateControls()
+    audio.src = String(payload.playlist_endpoint || '')
+    audio.onloadedmetadata = () => {
+      // Safari may preserve the old HLS media time when the page-lifetime
+      // Audio element receives a new queue URL.  Always seek to the exact
+      // queue-relative start, including zero, so ordinary listen and
+      // long-press "from here" cannot inherit the previous playback cursor.
+      const currentTime = Math.max(0, Number(audio.currentTime) || 0)
+      if (Math.abs(currentTime - ttsHlsStartOffsetSeconds) >= 0.05) {
+        try { audio.currentTime = ttsHlsStartOffsetSeconds } catch (_error) {}
+      }
+    }
+    audio.ontimeupdate = ttsHlsSyncPosition
+    audio.onplaying = () => {
+      if (!ttsHlsMode || !state.reader.ttsActive) return
+      ttsAudioUnlocked = true
+      if (state.ttsSession?.active) state.ttsSession.playbackStatusText = ''
+      if (ttsLifecycle.isConnecting()) ttsLifecycle.playing()
+      ttsUpdateControls()
+    }
+    audio.onended = () => {
+      if (ttsHlsMode && state.reader.ttsActive) stopTTS()
+    }
+    audio.onerror = () => {
+      if (!ttsHlsMode || !state.reader.ttsActive) return
+      ttsMarkPlaybackBlocked(new Error('native HLS playback failed'), 'iOS 后台播放队列中断，点击重试')
+    }
+    if (ttsHlsRefreshTimer) clearInterval(ttsHlsRefreshTimer)
+    ttsHlsRefreshTimer = setInterval(() => ttsHlsRefreshQueue(), 15000)
+    const playPromise = audio.play()
+    Promise.resolve(playPromise).catch(error => ttsMarkPlaybackBlocked(error))
+    return true
+  }
 
   const ttsBackendManifest = async (startParagraph, allowServerResume = true) => {
     audiobookAbortController?.abort()
@@ -3041,8 +3368,19 @@ async function loadReader(bookId, chapterId) {
     state.ttsSession.contextItems = plan.map(item => item.text)
     state.ttsSession.itemCount = plan.length
     if (!ttsChapterStreamUrl || !plan.length) throw new Error('audiobook stream unavailable')
-    if (!ttsLifecycle.isPausedByUser()) ttsPlayItem(0)
-    else ttsUpdateControls()
+    if (!ttsLifecycle.isPausedByUser()) {
+      let nativeHlsStarted = false
+      try {
+        nativeHlsStarted = await ttsStartNativeIosHls(
+          payload.current,
+          Number(plan[0]?.index || 0),
+          ttsResumeOffsetSeconds
+        )
+      } catch (error) {
+        if (error?.name !== 'AbortError') console.warn('[TTS] native iOS HLS unavailable; using chapter stream', error)
+      }
+      if (!nativeHlsStarted) ttsPlayItem(0)
+    } else ttsUpdateControls()
     if (effectiveChapterId !== String(requestedChapterId)) {
       requestAnimationFrame(() => navigateInApp(
         contextualHref(`/books/${requestedBookId}/chapters/${effectiveChapterId}`),
@@ -3163,13 +3501,13 @@ async function loadReader(bookId, chapterId) {
     if (!response.ok) throw new Error(`activate chapter ${response.status}`)
   }
 
-  const ttsChapterEnd = async () => {
+  const ttsChapterEndOnce = async transitionGeneration => {
     if (state.reader.ttsActive && ttsFollowingChapterId) {
       const keepReaderInSync = Boolean(state.ttsSession?.active && !state.ttsSession.detached)
       if (!ttsNextChapterPlan.length || String(ttsNextChapterId) !== String(ttsFollowingChapterId)) {
         await ttsPrefetchNextChapter()
       }
-      if (!state.reader.ttsActive || !ttsNextChapterPlan.length) {
+      if (!state.reader.ttsActive || transitionGeneration !== ttsPlanGeneration || !ttsNextChapterPlan.length) {
         ttsStreamEnding = false; ttsMarkPlaybackBlocked(new Error('next chapter unavailable'), '下一章加载失败，点击重试')
         return
       }
@@ -3182,6 +3520,7 @@ async function loadReader(bookId, chapterId) {
         }
         return
       }
+      if (!state.reader.ttsActive || transitionGeneration !== ttsPlanGeneration) return
       ttsChapterPlan = ttsNextChapterPlan
       ttsChapterStreamUrl = ttsNextChapterStreamUrl; ttsContinuousStreamMode = true
       audiobookManifestHash = ttsNextChapterSignature
@@ -3209,6 +3548,8 @@ async function loadReader(bookId, chapterId) {
       ttsNextChapterTitle = ''
       ttsNextChapterStreamUrl = ''
       ttsNextChapterCached = false
+      ttsNextChapterPrefetchPromise = null
+      ttsNextChapterPrefetchSourceId = ''
       state.ttsPendingPlan = null
       state.ttsContinueOnLoad = false
       saveTtsCheckpoint(state.ttsSession)
@@ -3220,6 +3561,17 @@ async function loadReader(bookId, chapterId) {
     } else {
       stopTTS()
     }
+  }
+
+  const ttsChapterEnd = () => {
+    if (ttsChapterTransitionPromise) return ttsChapterTransitionPromise
+    const transitionGeneration = ttsPlanGeneration
+    const transition = Promise.resolve().then(() => ttsChapterEndOnce(transitionGeneration))
+      .finally(() => {
+        if (ttsChapterTransitionPromise === transition) ttsChapterTransitionPromise = null
+      })
+    ttsChapterTransitionPromise = transition
+    return transition
   }
 
   const ttsUpdateMediaSession = (paraIdx) => {
@@ -3235,9 +3587,11 @@ async function loadReader(bookId, chapterId) {
     })
     navigator.mediaSession.setActionHandler('stop', () => stopTTS())
     navigator.mediaSession.setActionHandler('previoustrack', () => {
+      if (ttsHlsMode) { ttsHlsSeekToQueueIndex(ttsHlsQueueIndex - 1); return }
       if (ttsPlanIndex > 0) ttsPlayItem(ttsPlanIndex - 1)
     })
     navigator.mediaSession.setActionHandler('nexttrack', () => {
+      if (ttsHlsMode) { ttsHlsSeekToQueueIndex(ttsHlsQueueIndex + 1); return }
       if (ttsPlanIndex < ttsChapterPlan.length - 1) ttsPlayItem(ttsPlanIndex + 1)
     })
   }
@@ -3286,11 +3640,15 @@ async function loadReader(bookId, chapterId) {
   const ttsRefreshTimeline = async (force = false) => {
     if (!audiobookServerSessionId || !audiobookManifestHash || !ttsChapterPlan.length) return
     const now = Date.now()
-    if (!force && now - ttsLastTimelineRefresh < 1000) return ttsTimelinePromise
+    if (!force && now - ttsLastTimelineRefresh < 1500) return ttsTimelinePromise
     if (ttsTimelinePromise) return ttsTimelinePromise
-    ttsLastTimelineRefresh = now
     const firstAbsolute = Number(ttsChapterPlan[ttsStreamStartPlanIndex]?.index || 0)
     const lastAbsolute = Number(ttsChapterPlan.at(-1)?.index ?? firstAbsolute)
+    const currentPlanIndex = Math.max(ttsStreamStartPlanIndex, Math.min(ttsResolvedStreamPlanIndex(), ttsChapterPlan.length - 1))
+    const currentAbsolute = Number(ttsChapterPlan[currentPlanIndex]?.index ?? firstAbsolute)
+    const desiredThrough = Math.min(lastAbsolute, currentAbsolute + TTS_STREAM_BATCH_SEGMENTS - 1)
+    if (!force && ttsTimelineLoadedThrough >= desiredThrough) return ttsTimelineLoadedThrough >= lastAbsolute
+    ttsLastTimelineRefresh = now
     const timelineStart = Math.max(firstAbsolute, ttsTimelineLoadedThrough + 1)
     if (timelineStart > lastAbsolute) return true
     ttsTimelinePromise = fetch(
@@ -3345,6 +3703,74 @@ async function loadReader(bookId, chapterId) {
     }
     return false
   }
+  const ttsClearChapterEndWatchdog = () => {
+    if (ttsChapterEndWatchdogTimer) window.clearTimeout(ttsChapterEndWatchdogTimer)
+    ttsChapterEndWatchdogTimer = null
+  }
+  const ttsExpectedStreamDuration = () => {
+    if (!ttsChapterPlan.length) return 0
+    let total = 0
+    for (let idx = ttsStreamStartPlanIndex; idx < ttsChapterPlan.length; idx++) {
+      if (!ttsChapterPlan[idx]?.durationExact) return 0
+      total += ttsStreamSegmentPlayedSeconds(idx)
+    }
+    return total
+  }
+  const ttsFinishChapterStream = (streamId, generation, { hardEnd = false } = {}) => {
+    if (ttsStreamCompletionPromise) return ttsStreamCompletionPromise
+    ttsClearChapterEndWatchdog()
+    ttsStreamEnding = true
+    const completion = (async () => {
+      let streamCompleted = false
+      try {
+        streamCompleted = await ttsConfirmStreamComplete(streamId, generation)
+      } catch (error) {
+        if (error?.name === 'AbortError') return false
+        console.warn('[TTS] chapter stream completion check failed', error)
+      }
+      if (!state.reader.ttsActive || generation !== ttsPlanGeneration || ttsActiveStreamId !== streamId) return false
+      if (!streamCompleted) {
+        ttsStreamEnding = false
+        if (hardEnd || ttsChapterEndWatchdogAttempts >= 5) {
+          ttsMarkPlaybackBlocked(new Error('chapter stream ended before its final receipt'), '本章音频结束确认失败，已停在章末，点击重试')
+        } else {
+          ttsChapterEndWatchdogTimer = window.setTimeout(() => {
+            ttsChapterEndWatchdogTimer = null
+            ttsMaybeCompleteChapterAtMediaEof(streamId, generation)
+          }, 750)
+        }
+        return false
+      }
+      const finalPlanIndex = Math.max(0, ttsChapterPlan.length - 1)
+      ttsSetActiveItem(finalPlanIndex)
+      await Promise.resolve(ttsQueueServerProgress(true))
+      ttsStreamEnding = false
+      await ttsChapterEnd()
+      return true
+    })().finally(() => {
+      if (ttsStreamCompletionPromise === completion) ttsStreamCompletionPromise = null
+    })
+    ttsStreamCompletionPromise = completion
+    return completion
+  }
+  const ttsMaybeCompleteChapterAtMediaEof = (streamId = ttsActiveStreamId, generation = ttsPlanGeneration) => {
+    if (!state.reader.ttsActive || ttsStreamEnding || ttsLifecycle.isPausedByUser()) return
+    if (!streamId || streamId !== ttsActiveStreamId || generation !== ttsPlanGeneration) return
+    const finalAbsolute = Number(ttsChapterPlan.at(-1)?.index ?? -1)
+    if (finalAbsolute < 0 || ttsTimelineLoadedThrough < finalAbsolute) return
+    const expectedDuration = ttsExpectedStreamDuration()
+    const currentTime = Math.max(0, Number(ttsAudioEl?.currentTime) || 0)
+    if (!expectedDuration || currentTime < Math.max(0, expectedDuration - 0.35)) return
+    if (ttsChapterEndWatchdogTimer || ttsStreamCompletionPromise) return
+    ttsChapterEndWatchdogAttempts++
+    ttsChapterEndWatchdogTimer = window.setTimeout(() => {
+      ttsChapterEndWatchdogTimer = null
+      if (!state.reader.ttsActive || generation !== ttsPlanGeneration || streamId !== ttsActiveStreamId) return
+      const latestTime = Math.max(0, Number(ttsAudioEl?.currentTime) || 0)
+      if (latestTime < Math.max(0, expectedDuration - 0.35)) return
+      ttsFinishChapterStream(streamId, generation, { hardEnd: false })
+    }, 500)
+  }
   const ttsSetActiveItem = idx => {
     const item = ttsChapterPlan[idx]
     if (!item) return
@@ -3352,7 +3778,7 @@ async function loadReader(bookId, chapterId) {
     ttsParagraphIndex = item.paraIdx
     ttsHighlight(item.paraIdx)
     ttsPlanIndex = idx
-    if (!ttsNextChapterCached && !ttsNextChapterPlan.length
+    if (!ttsHlsMode && !ttsNextChapterCached && !ttsNextChapterPlan.length
         && idx >= Math.max(0, ttsChapterPlan.length - 2) && ttsFollowingChapterId) {
         ttsNextChapterCached = true
       ttsPrefetchNextChapter()
@@ -3375,8 +3801,13 @@ async function loadReader(bookId, chapterId) {
     }
     ttsUpdateMediaSession(item.paraIdx)
   }
-  const ttsSyncStreamPosition = () => { const audio = ttsAudioEl; if (!audio || !ttsChapterPlan.length || ttsRejectStreamReplay()) return; const candidate = ttsResolvedStreamPlanIndex(); if (candidate !== ttsPlanIndex) ttsSetActiveItem(candidate); ttsRememberTrustedPosition(candidate); ttsRefreshTimeline().catch(() => {}); if (Date.now() - ttsLastProgressAt >= 5000) { ttsLastProgressAt = Date.now(); ttsQueueServerProgress() } }
+  const ttsSyncStreamPosition = () => { const audio = ttsAudioEl; if (!audio || !ttsChapterPlan.length || ttsRejectStreamReplay()) return; const candidate = ttsResolvedStreamPlanIndex(); if (candidate !== ttsPlanIndex) ttsSetActiveItem(candidate); ttsRememberTrustedPosition(candidate); ttsRefreshTimeline().then(() => ttsMaybeCompleteChapterAtMediaEof()).catch(() => {}); if (Date.now() - ttsLastProgressAt >= 5000) { ttsLastProgressAt = Date.now(); ttsQueueServerProgress() } }
   const ttsCurrentItemOffsetSeconds = (planIndex = ttsPlanIndex) => {
+    if (ttsHlsMode && ttsHlsItems.length) {
+      const active = ttsHlsItems[Math.max(0, Math.min(ttsHlsQueueIndex, ttsHlsItems.length - 1))]
+      const relative = Math.max(0, Number(ttsAudioEl?.currentTime || 0) - Number(active?.queueOffsetSeconds || 0))
+      return Math.min(relative, Math.max(0.05, Number(active?.durationSeconds || 0.1) - 0.05))
+    }
     const boundedPlanIndex = Math.max(0, Math.min(Number(planIndex) || 0, ttsChapterPlan.length - 1))
     let elapsedBeforeItem = 0
     for (let planIdx = ttsStreamStartPlanIndex; planIdx < boundedPlanIndex; planIdx++) elapsedBeforeItem += ttsStreamSegmentPlayedSeconds(planIdx)
@@ -3415,6 +3846,9 @@ async function loadReader(bookId, chapterId) {
       return
     }
     const audio = ttsEnsureAudio()
+    ttsClearChapterEndWatchdog()
+    ttsChapterEndWatchdogAttempts = 0
+    ttsStreamCompletionPromise = null
     ttsFallbackPlayback.clearWatchdog()
     ttsSegmentFallbackMode = false; ttsStreamEnding = false
     ttsFallbackPlayback.release()
@@ -3467,25 +3901,7 @@ async function loadReader(bookId, chapterId) {
       if (!state.reader.ttsActive || generation !== ttsPlanGeneration || ttsActiveStreamId !== streamId) return
       if (failed) return
       failed = true
-      ttsStreamEnding = true
-      let streamCompleted = false
-      try {
-        streamCompleted = await ttsConfirmStreamComplete(streamId, generation)
-      } catch (error) {
-        if (error?.name === 'AbortError') return
-        console.warn('[TTS] chapter stream completion check failed', error)
-      }
-      if (!state.reader.ttsActive || generation !== ttsPlanGeneration || ttsActiveStreamId !== streamId) return
-      if (!streamCompleted) {
-        ttsStreamEnding = false
-        ttsMarkPlaybackBlocked(new Error('audio batch ended before its final segment'), '本组音频流中断，已停在当前段，点击重试')
-        return
-      }
-      const finalPlanIndex = Math.max(idx, ttsChapterPlan.length - 1)
-      ttsSetActiveItem(finalPlanIndex)
-      ttsQueueServerProgress(true)
-      ttsStreamEnding = false
-      ttsChapterEnd()
+      await ttsFinishChapterStream(streamId, generation, { hardEnd: true })
     }
     audio.onerror = () => advanceAfterFailure(new Error('audio element error'))
     ttsFallbackPlayback.guard(
@@ -3505,11 +3921,14 @@ async function loadReader(bookId, chapterId) {
     console.log('[TTS] playing', idx, '/', ttsChapterPlan.length, 'para=' + item.paraIdx)
   }
 
-  const ttsPrefetchNextChapter = async () => {
+  const ttsPrefetchNextChapter = () => {
     if (audiobookServerSessionId) {
       const generation = ttsPlanGeneration
-      try {
-        const fromChapterId = state.ttsSession?.chapterId || requestedChapterId
+      const fromChapterId = String(state.ttsSession?.chapterId || requestedChapterId)
+      if (ttsNextChapterPlan.length && String(ttsNextChapterId) === String(ttsFollowingChapterId)) return Promise.resolve(true)
+      if (ttsNextChapterPrefetchPromise && ttsNextChapterPrefetchSourceId === fromChapterId) return ttsNextChapterPrefetchPromise
+      const prefetch = (async () => {
+       try {
         const response = await fetch(`/api/v1/audiobook/sessions/${audiobookServerSessionId}/next?from_chapter_id=${encodeURIComponent(fromChapterId)}`, {
           method: 'POST', credentials: 'same-origin',
           headers: { 'X-Audiobook-Client': audiobookClientId },
@@ -3517,7 +3936,7 @@ async function loadReader(bookId, chapterId) {
         })
         if (!response.ok) throw new Error(`next manifest ${response.status}`)
         const manifest = (await response.json()).next
-        if (!manifest || !state.reader.ttsActive || generation !== ttsPlanGeneration) return
+        if (!manifest || !state.reader.ttsActive || generation !== ttsPlanGeneration) return false
         const nextPlan = manifest.segments.map(item => ({ ...item, paraIdx: Number(item.paragraph_index), url: '', text: item.text || '' }))
         ttsNextChapterPlan = nextPlan
         ttsNextChapterId = manifest.chapter_id
@@ -3527,7 +3946,7 @@ async function loadReader(bookId, chapterId) {
         ttsNextChapterSignature = manifest.manifest_hash || ''
         ttsNextChapterCached = true
         try {
-          if (!ttsNextChapterStreamUrl || !await window.OOHStoryAudiobookCache.shouldPrefetch()) return
+          if (!ttsNextChapterStreamUrl || !await window.OOHStoryAudiobookCache.shouldPrefetch()) return true
           const firstIndex = Number(nextPlan[0]?.index || 0)
           const preload = await fetch(`${ttsNextChapterStreamUrl}?start=${encodeURIComponent(firstIndex)}&preload=1`, {
             method: 'GET', credentials: 'same-origin', cache: 'no-store',
@@ -3539,11 +3958,22 @@ async function loadReader(bookId, chapterId) {
         } catch (error) {
           if (error?.name !== 'AbortError') console.warn('[TTS] next chapter stream preload unavailable', error)
         }
+        return true
       } catch (error) {
         if (error?.name !== 'AbortError') console.warn('[TTS] next persistent chapter unavailable', error)
+        return false
       }
-      return
+      })().finally(() => {
+        if (ttsNextChapterPrefetchPromise === prefetch) {
+          ttsNextChapterPrefetchPromise = null
+          ttsNextChapterPrefetchSourceId = ''
+        }
+      })
+      ttsNextChapterPrefetchSourceId = fromChapterId
+      ttsNextChapterPrefetchPromise = prefetch
+      return prefetch
     }
+    return Promise.resolve(false)
   }
 
   const ttsQueueServerProgress = (immediate = false) => {
@@ -3554,7 +3984,9 @@ async function loadReader(bookId, chapterId) {
     const sessionId = audiobookServerSessionId
     const current = state.ttsSession
     if (!sessionId || !current?.active || !current.chapterId) return null
-    const progressPlanIndex = !ttsSegmentFallbackMode && ttsChapterPlan.length ? ttsResolvedStreamPlanIndex() : Math.max(0, ttsPlanIndex)
+    const progressPlanIndex = ttsHlsMode
+      ? Math.max(0, ttsPlanIndex)
+      : (!ttsSegmentFallbackMode && ttsChapterPlan.length ? ttsResolvedStreamPlanIndex() : Math.max(0, ttsPlanIndex))
     const activeItem = ttsChapterPlan[progressPlanIndex]
     const itemOffsetSeconds = ttsCurrentItemOffsetSeconds(progressPlanIndex)
     if (activeItem) {
@@ -3590,6 +4022,12 @@ async function loadReader(bookId, chapterId) {
   }
 
   const stopTTS = ({ preservePending = false } = {}) => {
+    ttsClearChapterEndWatchdog()
+    ttsChapterEndWatchdogAttempts = 0
+    ttsStreamCompletionPromise = null
+    ttsChapterTransitionPromise = null
+    ttsNextChapterPrefetchPromise = null
+    ttsNextChapterPrefetchSourceId = ''
     if (!preservePending) {
       const finalProgress = ttsQueueServerProgress(true)
       const closingSessionId = audiobookServerSessionId
@@ -3616,6 +4054,15 @@ async function loadReader(bookId, chapterId) {
       ttsChapterStreamUrl = ''
     }
     if (ttsHeartbeat) { clearInterval(ttsHeartbeat); ttsHeartbeat = null }
+    if (ttsHlsRefreshTimer) { clearInterval(ttsHlsRefreshTimer); ttsHlsRefreshTimer = null }
+    ttsHlsRefreshPromise = null
+    ttsHlsMode = false
+    ttsHlsQueueId = ''
+    ttsHlsStatusUrl = ''
+    ttsHlsItems = []
+    ttsHlsQueueIndex = 0
+    ttsHlsNavigatingChapterId = ''
+    ttsHlsStartOffsetSeconds = 0
     ttsFallbackPlayback?.clearWatchdog()
     if (ttsRebuildTimer) { clearTimeout(ttsRebuildTimer); ttsRebuildTimer = null }
     ttsRebuildRequested = false
@@ -3735,7 +4182,15 @@ async function loadReader(bookId, chapterId) {
     ttsRebuildRequested = false
     ttsLifecycle.restart()
     ttsPlanGeneration++
+    ttsClearChapterEndWatchdog()
+    ttsChapterEndWatchdogAttempts = 0
+    ttsStreamCompletionPromise = null
+    ttsChapterTransitionPromise = null
+    ttsNextChapterPrefetchPromise = null
+    ttsNextChapterPrefetchSourceId = ''
     audiobookAbortController?.abort()
+    if (ttsHlsRefreshTimer) { clearInterval(ttsHlsRefreshTimer); ttsHlsRefreshTimer = null }
+    ttsHlsRefreshPromise = null; ttsHlsMode = false; ttsHlsQueueId = ''; ttsHlsStatusUrl = ''; ttsHlsItems = []; ttsHlsQueueIndex = 0
     window.OOHStoryAudiobookCache?.cancel?.()
     window.OOHStoryAudiobookCache?.releaseUrls?.()
     if (audiobookServerSessionId) {
@@ -3835,12 +4290,14 @@ async function loadReader(bookId, chapterId) {
         ttsUpdateControls()
       },
       previous: () => {
+        if (ttsHlsMode) { ttsHlsSeekToQueueIndex(ttsHlsQueueIndex - 1); return }
         if (ttsPlanIndex > 0) {
           if (ttsSegmentFallbackMode) ttsFallbackPlayback.play(ttsPlanIndex - 1)
           else ttsPlayItem(ttsPlanIndex - 1)
         }
       },
       next: () => {
+        if (ttsHlsMode) { ttsHlsSeekToQueueIndex(ttsHlsQueueIndex + 1); return }
         if (ttsPlanIndex < ttsChapterPlan.length - 1) {
           if (ttsSegmentFallbackMode) ttsFallbackPlayback.play(ttsPlanIndex + 1)
           else ttsPlayItem(ttsPlanIndex + 1)
@@ -3867,6 +4324,17 @@ async function loadReader(bookId, chapterId) {
       },
       rebuild: () => ttsScheduleRebuild(),
       previousChapter: () => {
+        if (ttsHlsMode) {
+          const currentChapterId = String(state.ttsSession?.chapterId || '')
+          let target = ttsHlsQueueIndex - 1
+          while (target >= 0 && ttsHlsItems[target].chapterId === currentChapterId) target--
+          if (target >= 0) {
+            const targetChapterId = ttsHlsItems[target].chapterId
+            while (target > 0 && ttsHlsItems[target - 1].chapterId === targetChapterId) target--
+            ttsHlsSeekToQueueIndex(target)
+          }
+          return
+        }
         const currentPosition = catalog.chapters.findIndex(item => String(item.id) === String(state.ttsSession?.chapterId))
         const targetId = currentPosition > 0 ? catalog.chapters[currentPosition - 1]?.id : null
         if (!targetId) return
@@ -3874,6 +4342,12 @@ async function loadReader(bookId, chapterId) {
         goToChapter(targetId, true)
       },
       nextChapter: () => {
+        if (ttsHlsMode) {
+          const currentChapterId = String(state.ttsSession?.chapterId || '')
+          const target = ttsHlsItems.findIndex((item, index) => index > ttsHlsQueueIndex && item.chapterId !== currentChapterId)
+          if (target >= 0) ttsHlsSeekToQueueIndex(target)
+          return
+        }
         if (ttsFollowingChapterId) ttsChapterEnd()
       },
       hasPreviousChapter: () => catalog.chapters.findIndex(item => String(item.id) === String(state.ttsSession?.chapterId)) > 0,
@@ -3936,7 +4410,7 @@ async function loadReader(bookId, chapterId) {
     else ttsLifecycle.connect()
     ttsUpdateControls()
     const audio = ttsEnsureAudio()
-    if (!retryCurrentItem && audio.src && audio.paused && !audio.ended) {
+    if ((ttsHlsMode || !retryCurrentItem) && audio.src && audio.paused && !audio.ended) {
       Promise.resolve(audio.play()).then(() => {
         ttsLifecycle.playing()
         ttsUpdateControls()
@@ -4835,10 +5309,12 @@ async function loadReader(bookId, chapterId) {
   }
   startReadingActivity(String(requestedBookId))
   requestAnimationFrame(() => {
+    if (!routeIsCurrent(navigationGeneration, expectedReaderPath)) return
     if (catalogRendered) chapterList.querySelector('.active')?.scrollIntoView({ block: 'center' })
     stage.focus({ preventScroll: true })
     recomputePagination(true)
     const afterLayout = () => {
+      if (!routeIsCurrent(navigationGeneration, expectedReaderPath)) return
       if (restoreWithin !== null) {
         if (layoutMode === 'vertical') {
           const metrics = readerScrollMetrics(stage, layoutMode)
@@ -4849,6 +5325,9 @@ async function loadReader(bookId, chapterId) {
         }
       }
       updateProgress()
+      // Establish the newly opened chapter as the authoritative local/cloud
+      // reading record before an older chapter's delayed lifecycle sync fires.
+      flushReadingProgress()
       if (state.readerAutoContinue) {
         state.readerAutoContinue = false
         if (state.ttsContinueOnLoad) {
@@ -5347,7 +5826,7 @@ function loadClient() {
           node('div', { class: 'client-list-info' }, [
             node('h3', { text: 'Android 客户端' }),
             node('p', { text: '原生 Android 应用，支持离线缓存、TTS 语音朗读、自定义阅读设置等全部功能。' }),
-            node('a', { class: 'client-btn client-btn-primary', href: '/downloads/android/latest.apk', download: '', text: '下载 APK v1.18.20 安装包' })
+            node('a', { class: 'client-btn client-btn-primary', href: '/downloads/android/latest.apk', download: '', text: '下载 APK v1.18.21 安装包' })
           ])
         ]),
         node('div', { class: 'client-list-item' }, [
@@ -5409,7 +5888,7 @@ async function loadRankings() {
 }
 
 async function loadVolume(bookId, volId) {
-  const libraryReturnPath = safeLibraryReturnPath(paramsFromHash().get('from'))
+  const libraryReturnPath = libraryReturnPathFor(bookId)
   const contextualHref = path => withLibraryReturn(path, libraryReturnPath)
   const [catalog, bookDetails] = await Promise.all([
     api(`/api/v1/books/${bookId}/chapters`),
@@ -5554,6 +6033,7 @@ function openIllustViewer(bookId, paths, startIndex) {
 }
 
 async function route() {
+  const navigationGeneration = ++state.routeGeneration
   state.readerNavigation?.cancelTap?.()
   state.readerNavigation = null
   loading()
@@ -5586,7 +6066,7 @@ async function route() {
     else if (/^\/book\/[A-Za-z0-9_-]{22}$/.test(path)) await loadBook(path.split('/')[2])
     else if (/^\/read\/[A-Za-z0-9_-]{22}\/\d+$/.test(path)) {
       const [, , bookId, chapterId] = path.split('/')
-      await loadReader(bookId, chapterId)
+      await loadReader(bookId, chapterId, navigationGeneration)
     } else if (path.startsWith('/deconstruction/')) {
       await loadDeconstruction(decodeURIComponent(path.slice('/deconstruction/'.length)))
     } else if (path === '/rankings') {
@@ -5605,6 +6085,8 @@ async function route() {
       throw new Error('页面不存在')
     }
   } catch (error) {
+    if (!routeIsCurrent(navigationGeneration, path)) return
+    if (error?.edgeRecovery) return
     setSeo({
       title: '页面暂时无法打开｜OOH Story',
       description: '当前页面不存在或暂时无法读取，请返回 OOH Story 首页继续浏览。',
@@ -5613,6 +6095,7 @@ async function route() {
     })
     errorView(error)
   }
+  if (!routeIsCurrent(navigationGeneration, path)) return
   if (!path.startsWith('/read/')) window.scrollTo(0, 0)
   updateGlobalTtsReturn()
   app.focus({ preventScroll: true })
@@ -5685,11 +6168,12 @@ document.addEventListener('click', event => {
   const link = event.target instanceof Element ? event.target.closest('a[href]') : null
   if (!link) return
   if (chapterLink) requestReaderFullscreen()
-  if (!state.ttsSession?.active || link.hasAttribute('download') || link.target
+  if (link.hasAttribute('download') || link.target
     || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
   let url
   try { url = new URL(link.href, location.href) } catch { return }
   if (url.origin !== location.origin || !/^https?:$/.test(url.protocol)) return
+  if (!isSpaNavigationTarget(url)) return
   event.preventDefault()
   navigateInApp(`${url.pathname}${url.search}${url.hash}`)
 }, { capture: true })

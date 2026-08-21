@@ -643,8 +643,11 @@ def test_nginx_get_upload_history_does_not_consume_upload_quota() -> None:
     assert "POST $binary_remote_addr;" in nginx
     assert "limit_req_zone $oohstory_upload_rate_key zone=ohhstory_upload" in nginx
     uploads = nginx.split("location = /api/v1/me/uploads {", 1)[1].split("\n    }", 1)[0]
-    assert "limit_req_zone $binary_remote_addr zone=ohhstory_account:10m rate=20r/s;" in nginx
-    assert "limit_req zone=ohhstory_account burst=40 nodelay;" in uploads
+    assert (
+        "limit_req_zone $oohstory_account_rate_key "
+        "zone=ohhstory_account_v2:10m rate=20r/s;"
+    ) in nginx
+    assert "limit_req zone=ohhstory_account_v2 burst=40 nodelay;" in uploads
     assert "limit_req zone=ohhstory_upload" in uploads
     assert "real_ip_header CF-Connecting-IP;" in nginx
     assert "set_real_ip_from 173.245.48.0/20;" in nginx
@@ -671,7 +674,7 @@ def test_nginx_get_upload_history_does_not_consume_upload_quota() -> None:
     recommendation_location = nginx.split(
         'location ~ "^/api/v1/books/[A-Za-z0-9_-]{22}/recommend$" {', 1
     )[1].split("\n    }", 1)[0]
-    assert "limit_req zone=ohhstory_account" in recommendation_location
+    assert "limit_req zone=ohhstory_account_v2" in recommendation_location
     assert "proxy_pass http://oohstory_reader_backend;" in recommendation_location
     comment_location = nginx.split(
         'location ~ "^/api/v1/books/[A-Za-z0-9_-]{22}/chapters/[1-9][0-9]*/comments$" {',
@@ -679,7 +682,7 @@ def test_nginx_get_upload_history_does_not_consume_upload_quota() -> None:
     )[1].split("\n    }", 1)[0]
     assert "^(GET|HEAD|POST)$" in comment_location
     assert "client_max_body_size 2k;" in comment_location
-    assert "limit_req zone=ohhstory_account burst=40 nodelay;" in comment_location
+    assert "limit_req zone=ohhstory_account_v2 burst=40 nodelay;" in comment_location
     thanks_location = nginx.split(
         'location ~ "^/api/v1/paragraph-comments/[0-9a-f-]{36}/thanks$" {',
         1,
@@ -694,7 +697,7 @@ def test_nginx_get_upload_history_does_not_consume_upload_quota() -> None:
         'location ~ "^/api/v1/deconstructions/[^/]+/likes$" {', 1
     )[1].split("\n    }", 1)[0]
     assert "^(GET|HEAD|POST)$" in deconstruction_likes_location
-    assert "limit_req zone=ohhstory_account burst=40 nodelay;" in (
+    assert "limit_req zone=ohhstory_account_v2 burst=40 nodelay;" in (
         deconstruction_likes_location
     )
     assert "proxy_pass http://oohstory_reader_backend;" in (

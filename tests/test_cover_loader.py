@@ -22,7 +22,7 @@ def test_cover_loader_waits_for_dom_and_hides_pending_images() -> None:
     assert "fetch(url, { cache: 'default' })" in script
     assert "cache: 'no-cache'" not in script
     assert "COVER_CACHE_EPOCH" not in script
-    assert 'src="/app.js?v=20260815-submission-atelier2"' in html
+    assert 'src="/app.js?v=20260821-account-nav-touch1"' in html
 
 
 def test_light_novel_volume_gallery_eagerly_loads_the_first_visible_row() -> None:

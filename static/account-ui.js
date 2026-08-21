@@ -12,10 +12,11 @@ async function accountApi(path, { method = 'GET', body = null, form = null } = {
     headers.set('Content-Type', 'application/json')
     requestBody = JSON.stringify(body)
   }
-  let response = await fetch(path, { method, headers, body: requestBody, credentials: 'same-origin' })
+  const edgeFetch = window.OOHStoryEdgeFetch || window.fetch.bind(window)
+  let response = await edgeFetch(path, { method, headers, body: requestBody, credentials: 'same-origin' })
   if (response.status === 429 && ['GET', 'HEAD'].includes(method)) {
     await new Promise(resolve => window.setTimeout(resolve, 450))
-    response = await fetch(path, { method, headers, body: requestBody, credentials: 'same-origin' })
+    response = await edgeFetch(path, { method, headers, body: requestBody, credentials: 'same-origin' })
   }
   const data = response.status === 204 ? {} : await response.json().catch(() => ({}))
   if (!response.ok) throw new Error(data.detail || `请求失败（${response.status}）`)
@@ -360,10 +361,11 @@ function refreshHomeContinueReading() {
 
 function scheduleReadingHistorySync(bookId, entry) {
   if (!state.account) return
+  const syncGeneration = ++state.cloudSyncGeneration
   clearTimeout(state.cloudSyncTimer)
   state.cloudSyncTimer = setTimeout(async () => {
     try {
-      state.cloudState = await accountApi('/api/v1/me/state', {
+      const cloudState = await accountApi('/api/v1/me/state', {
         method: 'PUT',
         body: {
           history: [{
@@ -377,6 +379,7 @@ function scheduleReadingHistorySync(bookId, entry) {
           bookshelf: []
         }
       })
+      if (syncGeneration === state.cloudSyncGeneration) state.cloudState = cloudState
     } catch {
       // Local progress remains authoritative until the next successful sync.
     }
@@ -766,11 +769,19 @@ function accountNavigation(active = 'overview') {
     ['notifications', '#/account/notifications', `消息${state.notificationsUnread ? ` · ${state.notificationsUnread}` : ''}`],
     ['profile', '#/account/profile', '资料与安全']
   ]
-  return node('nav', { class: 'account-nav', 'aria-label': '用户中心导航' },
+  const nav = node('nav', { class: 'account-nav', 'aria-label': '用户中心导航' },
     items.map(([key, href, label]) => node('a', {
       class: key === active ? 'active' : '', href, text: label
     }))
   )
+  window.requestAnimationFrame(() => {
+    if (!nav.isConnected || nav.scrollWidth <= nav.clientWidth) return
+    const activeLink = nav.querySelector('a.active')
+    if (!activeLink) return
+    const centered = activeLink.offsetLeft - (nav.clientWidth - activeLink.offsetWidth) / 2
+    nav.scrollLeft = Math.max(0, Math.min(centered, nav.scrollWidth - nav.clientWidth))
+  })
+  return nav
 }
 
 function deconstructionTaskStatus(status) {

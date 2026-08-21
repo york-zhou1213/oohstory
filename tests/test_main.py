@@ -600,7 +600,7 @@ def test_untrusted_host_is_rejected() -> None:
     assert response.status_code == 400
 
 
-def test_clean_canonical_routes_return_the_same_spa_index() -> None:
+def test_clean_canonical_routes_return_route_specific_seo_shells() -> None:
     client = TestClient(main.app)
     expected = (Path(main.STATIC_ROOT) / "index.html").read_bytes()
 
@@ -608,7 +608,6 @@ def test_clean_canonical_routes_return_the_same_spa_index() -> None:
         "/library",
         "/rankings",
         "/deconstructions",
-        "/deconstructions/%E6%A0%B7%E6%9C%AC%E4%B9%A6",
         "/about",
         "/disclaimer",
         "/guide",
@@ -617,12 +616,25 @@ def test_clean_canonical_routes_return_the_same_spa_index() -> None:
     ):
         response = client.get(path, headers={"Host": "testserver"})
         assert response.status_code == 200
-        assert response.content == expected
+        assert response.content != expected
+        assert f'<link rel="canonical" href="{main.SITE_ORIGIN}{path}">' in response.text
+        assert '<article class="seo-fallback">' in response.text
+        assert '<section class="page-state seo-app-loading"' in response.text
+        assert response.text.index('class="page-state seo-app-loading"') < (
+            response.text.index('class="seo-fallback"')
+        )
         assert response.headers["content-type"].startswith("text/html")
         assert {
             directive.strip().casefold()
             for directive in response.headers["cache-control"].split(",")
-        } == {"no-cache", "no-transform"}
+        } == {"public", "max-age=300", "no-transform"}
+
+    report = client.get(
+        "/deconstructions/%E6%A0%B7%E6%9C%AC%E4%B9%A6",
+        headers={"Host": "testserver"},
+    )
+    assert report.status_code == 200
+    assert report.content == expected
 
 
 class SeoRepository:
@@ -657,6 +669,16 @@ class SeoRepository:
             ],
         }
 
+    def reader_chapter(self, book_id: str, chapter_id: int) -> dict[str, object]:
+        assert book_id == PUBLIC_BOOK_ID
+        assert chapter_id == 45
+        return {
+            "id": 45,
+            "content": "王都的晨光落在石板路上，菜月昴推开窗，听见远处钟声。",
+            "previous_id": 1,
+            "next_id": None,
+        }
+
 
 def _structured_data(response_text: str) -> tuple[str, dict[str, object]]:
     match = re.search(
@@ -668,7 +690,7 @@ def _structured_data(response_text: str) -> tuple[str, dict[str, object]]:
     return match.group(1), json.loads(match.group(1))
 
 
-def test_book_page_returns_server_rendered_book_seo_without_changing_body(
+def test_book_page_returns_server_rendered_book_seo_with_useful_body(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(main, "repository", lambda: SeoRepository())
@@ -695,7 +717,13 @@ def test_book_page_returns_server_rendered_book_seo_without_changing_body(
     assert f'<meta property="og:title" content="{expected_title}">' in response.text
     assert f'<meta name="twitter:title" content="{expected_title}">' in response.text
     assert "菜月昴来到异世界" in response.text.split("</head>", 1)[0]
-    assert "菜月昴来到异世界" not in response.text.split("</head>", 1)[1]
+    assert "菜月昴来到异世界" in response.text.split("</head>", 1)[1]
+    assert '<article class="seo-fallback">' in response.text
+    assert (
+        f'href="{main.SITE_ORIGIN}/books/{PUBLIC_BOOK_ID}/chapters/1"'
+        in response.text
+    )
+    assert "开始阅读第一章" in response.text
     assert "X-OOHStory-SEO-CSP-Hash" not in response.headers
     json_ld_text, json_ld = _structured_data(response.text)
     entities = json_ld["@graph"]
@@ -751,6 +779,7 @@ def test_chapter_and_volume_pages_return_page_specific_raw_html(
 
     assert chapter.status_code == 200
     assert "第四十五章 · 王都的清晨" in chapter.text
+    assert "王都的晨光落在石板路上" in chapter.text.split("</head>", 1)[1]
     assert f"{main.SITE_ORIGIN}/books/{PUBLIC_BOOK_ID}/chapters/45" in chapter.text
     assert any(
         entity.get("@type") == "Chapter"
@@ -801,8 +830,14 @@ def test_numeric_public_book_routes_are_not_exposed() -> None:
 
 
 class SitemapRepository:
-    def sitemap_book_ids(self) -> list[str]:
-        return [PUBLIC_BOOK_ID]
+    def sitemap_book_count(self) -> int:
+        return 1
+
+    def sitemap_book_ids(
+        self, limit: int = 49_990, offset: int = 0
+    ) -> list[str]:
+        values = [PUBLIC_BOOK_ID]
+        return values[offset : offset + limit]
 
     def get_book(self, book_id: str) -> dict[str, str]:
         assert book_id == PUBLIC_BOOK_ID
@@ -822,17 +857,12 @@ def test_robots_and_sitemap_use_real_clean_200_urls(monkeypatch) -> None:
     monkeypatch.setattr(main, "repository", lambda: SitemapRepository())
     client = TestClient(main.app)
     robots = client.get("/robots.txt", headers={"Host": "testserver"})
-    crawler_headers = {
-        "Host": "testserver",
-        "CF-Connecting-IP": "66.249.64.1",
-    }
-    sitemap = client.get("/sitemap.xml", headers=crawler_headers)
+    sitemap = client.get("/sitemap.xml", headers={"Host": "testserver"})
 
     assert robots.status_code == 200
-    assert "User-agent: *\n" in robots.text
-    assert "Allow: /\n" in robots.text
-    assert "Disallow: /api/\n" in robots.text
-    assert f"Sitemap: {main.SITE_ORIGIN}/sitemap.xml\n" in robots.text
+    assert robots.text == (
+        f"User-agent: *\nAllow: /\nSitemap: {main.SITE_ORIGIN}/sitemap.xml\n"
+    )
     assert sitemap.status_code == 200
     assert sitemap.headers["content-type"].startswith("application/xml")
     root = ElementTree.fromstring(sitemap.content)
@@ -840,26 +870,36 @@ def test_robots_and_sitemap_use_real_clean_200_urls(monkeypatch) -> None:
     sitemap_urls = [item.text for item in root.findall("s:sitemap/s:loc", namespace)]
     assert sitemap_urls == [
         f"{main.SITE_ORIGIN}/sitemaps/static.xml",
-        f"{main.SITE_ORIGIN}/sitemaps/books/{PUBLIC_BOOK_ID}.xml",
+        f"{main.SITE_ORIGIN}/sitemaps/library-1.xml",
     ]
     assert "#" not in sitemap.text
     for url in sitemap_urls:
         path = url.removeprefix(main.SITE_ORIGIN) or "/"
-        response = client.get(path, headers=crawler_headers)
+        response = client.get(path, headers={"Host": "testserver"})
         assert response.status_code == 200
 
-    static = client.get("/sitemaps/static.xml", headers=crawler_headers)
+    static = client.get("/sitemaps/static.xml", headers={"Host": "testserver"})
     static_root = ElementTree.fromstring(static.content)
     static_urls = [item.text for item in static_root.findall("s:url/s:loc", namespace)]
     assert static_urls == [
         f"{main.SITE_ORIGIN}/",
         f"{main.SITE_ORIGIN}/library",
+        f"{main.SITE_ORIGIN}/rankings",
         f"{main.SITE_ORIGIN}/deconstructions",
+        f"{main.SITE_ORIGIN}/guide",
+        f"{main.SITE_ORIGIN}/about",
+        f"{main.SITE_ORIGIN}/contact",
+        f"{main.SITE_ORIGIN}/client",
     ]
+
+    guide = client.get("/guide", headers={"Host": "testserver"})
+    assert guide.status_code == 200
+    assert f'<link rel="canonical" href="{main.SITE_ORIGIN}/guide">' in guide.text
+    assert "使用指南" in guide.text.split("</head>", 1)[1]
 
     book = client.get(
         f"/sitemaps/books/{PUBLIC_BOOK_ID}.xml",
-        headers=crawler_headers,
+        headers={"Host": "testserver"},
     )
     book_root = ElementTree.fromstring(book.content)
     book_urls = [item.text for item in book_root.findall("s:url/s:loc", namespace)]

@@ -11,8 +11,8 @@ def test_android_update_endpoint_returns_public_release_notes() -> None:
     payload = response.json()
     assert payload["platform"] == "android"
     assert payload["available"] is True
-    assert payload["latest"]["version_name"] == "1.18.20"
-    assert payload["latest"]["version_code"] == 64
+    assert payload["latest"]["version_name"] == "1.18.21"
+    assert payload["latest"]["version_code"] == 65
     assert payload["latest"]["download_url"] == (
         f"{main.SITE_ORIGIN}/downloads/android/latest.apk"
     )
@@ -23,7 +23,7 @@ def test_android_update_endpoint_returns_public_release_notes() -> None:
 
 def test_android_update_endpoint_suppresses_current_version_prompt() -> None:
     response = TestClient(main.app).get(
-        "/api/v1/app/android/latest?version_code=64&version_name=1.18.20"
+        "/api/v1/app/android/latest?version_code=65&version_name=1.18.21"
     )
     assert response.status_code == 200
     assert response.json()["available"] is False

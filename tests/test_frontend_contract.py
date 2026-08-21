@@ -32,13 +32,13 @@ def test_reader_assets_use_current_cache_busters() -> None:
     html = (PROJECT_ROOT / "static" / "index.html").read_text(encoding="utf-8")
     script = frontend_contract_source(PROJECT_ROOT)
 
-    assert 'href="/styles.css?v=20260815-submission-atelier2"' in html
+    assert 'href="/styles.css?v=20260821-account-nav-touch1"' in html
     assert 'src="/audiobook-lifecycle.js?v=20260811-audiobook-v15-5-preload-contract"' in html
     assert 'src="/audiobook-fallback.js?v=20260811-audiobook-v15-5-preload-contract"' in html
-    assert 'src="/app.js?v=20260815-submission-atelier2"' in html
+    assert 'src="/app.js?v=20260821-account-nav-touch1"' in html
     assert 'href="/api/v1/home/hero-cover?variant=mobile"' not in html
     assert "data-hero-primer" not in html
-    assert 'src="/account-ui.js?v=20260815-submission-atelier2"' in html
+    assert 'src="/account-ui.js?v=20260821-account-nav-touch1"' in html
     assert (
         'src="/audiobook-cache.js?v=20260813-audiobook-v15-20-five-window"'
         in html
@@ -47,7 +47,7 @@ def test_reader_assets_use_current_cache_busters() -> None:
     assert "login_uri: location.origin" in script
     assert "'oohstory-web-link-v1' : 'oohstory-web-redirect-v1'" in script
     assert "href: '/downloads/android/latest.apk'" in script
-    assert "下载 APK v1.18.20 安装包" in script
+    assert "下载 APK v1.18.21 安装包" in script
     assert "20260801-metrics1" not in html
     assert "20260801-seo1" not in html
     assert "20260801-progress1" not in html
@@ -153,7 +153,12 @@ def test_tts_progress_uses_reader_paragraphs_and_exact_stream_time_mapping() -> 
     assert "Math.min(paragraphCount, paragraphIndex + 1)" in script
     assert "state.ttsSession.paragraphCount = ttsPlanParagraphCount(plan)" in script
     assert "const ttsResolvedStreamPlanIndex" in script
-    assert "const progressPlanIndex = !ttsSegmentFallbackMode && ttsChapterPlan.length" in script
+    assert "const progressPlanIndex = ttsHlsMode" in script
+    assert (
+        ": (!ttsSegmentFallbackMode && ttsChapterPlan.length "
+        "? ttsResolvedStreamPlanIndex() : Math.max(0, ttsPlanIndex))"
+        in script
+    )
     assert "ttsCurrentItemOffsetSeconds(progressPlanIndex)" in script
     assert "activeItem?.index ?? current.absoluteItemIndex ?? current.itemIndex" in script
     assert "if (!item.durationExact) break" not in script
@@ -1015,8 +1020,8 @@ def test_google_web_login_uses_current_browser_popup_with_explicit_fallback() ->
     html = (PROJECT_ROOT / "static" / "index.html").read_text(encoding="utf-8")
     script = frontend_contract_source(PROJECT_ROOT)
 
-    assert 'href="/styles.css?v=20260815-submission-atelier2"' in html
-    assert 'src="/account-ui.js?v=20260815-submission-atelier2"' in html
+    assert 'href="/styles.css?v=20260821-account-nav-touch1"' in html
+    assert 'src="/account-ui.js?v=20260821-account-nav-touch1"' in html
     assert "ux_mode: 'popup'" in script
     assert "callback: handleCredential" in script
     assert "mode === 'link' ? '/api/v1/auth/google/link' : '/api/v1/auth/google'" in script
@@ -1130,8 +1135,8 @@ def test_auth_cover_centers_brand_mark_and_uses_reduced_motion_orbits() -> None:
     script = frontend_contract_source(PROJECT_ROOT)
     styles = (PROJECT_ROOT / "static" / "styles.css").read_text(encoding="utf-8")
 
-    assert 'href="/styles.css?v=20260815-submission-atelier2"' in html
-    assert 'src="/account-ui.js?v=20260815-submission-atelier2"' in html
+    assert 'href="/styles.css?v=20260821-account-nav-touch1"' in html
+    assert 'src="/account-ui.js?v=20260821-account-nav-touch1"' in html
     assert "class: 'auth-art-visual'" in script
     assert "class: 'auth-art-halo auth-art-halo-one'" in script
     assert "class: 'auth-art-halo auth-art-halo-two'" in script

@@ -51,7 +51,7 @@ sudo mysql --batch --raw < deploy/mysql/runtime-users.sql \
   > /var/lib/oohstory-admin/generated-mysql-passwords.txt
 ```
 
-`init.sql` creates the database, all 23 current schema revisions, migration
+`init.sql` creates the database, all 24 current schema revisions, migration
 checksums, triggers, and least-privilege roles. It rejects a non-empty schema
 and contains neither accounts nor passwords. `runtime-users.sql` creates only
 three `127.0.0.1` accounts with MySQL-generated random passwords. Immediately

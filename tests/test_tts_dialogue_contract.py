@@ -95,20 +95,58 @@ def test_web_audiobook_uses_one_full_chapter_media_source() -> None:
     assert "audio.ontimeupdate = ttsSyncStreamPosition" in play
     assert "const nextBatchIdx" not in play
     assert "ttsChapterEnd()" in play
-    assert "ttsConfirmStreamComplete(streamId, generation)" in play
+    assert "ttsFinishChapterStream(streamId, generation, { hardEnd: true })" in play
+    assert "ttsConfirmStreamComplete(streamId, generation)" in script
     assert "ttsActiveStreamId !== streamId" in play
     assert "ttsStreamEnding = false" in script
-    assert "ttsStreamEnding = true" in play
+    assert "ttsStreamEnding = true" in script
     assert "if (ttsContinuousStreamMode) {" not in play
-    assert "ttsSetActiveItem(finalPlanIndex)" in play
-    assert "audio batch ended before its final segment" in play
-    assert "本组音频流中断，已停在当前段，点击重试" in play
+    assert "ttsSetActiveItem(finalPlanIndex)" in script
+    assert "chapter stream ended before its final receipt" in script
+    assert "本章音频结束确认失败，已停在章末，点击重试" in script
     assert "chapter stream failed; switching to finite segment playback" in play
     assert "ttsFallbackPlayback.play(fallbackIdx, fallbackOffset)" in play
     assert "ttsPrefetchNextChapter().catch(() => {})" in play
     assert "limit=${TTS_STREAM_BATCH_SEGMENTS}" in script
     assert "limit=24" not in script
     assert "retryCount < 6" not in play
+
+
+def test_ios_web_audiobook_uses_native_hls_queue_without_js_chapter_swaps() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    start = script[
+        script.index("  const ttsSupportsNativeIosHls =") :
+        script.index("\n\n  const ttsBackendManifest", script.index("  const ttsSupportsNativeIosHls ="))
+    ]
+
+    assert "application/vnd.apple.mpegurl" in start
+    assert "navigator.maxTouchPoints" in start
+    assert "`/api/v1/audiobook/sessions/${audiobookServerSessionId}/hls/queues`" in start
+    assert "audio.src = String(payload.playlist_endpoint || '')" in start
+    assert "Math.abs(currentTime - ttsHlsStartOffsetSeconds) >= 0.05" in start
+    assert "audio.currentTime = ttsHlsStartOffsetSeconds" in start
+    assert "audio.ontimeupdate = ttsHlsSyncPosition" in start
+    assert "setInterval(() => ttsHlsRefreshQueue(), 15000)" in start
+    assert "ttsHlsSeekToQueueIndex" in start
+    assert "ttsStartNativeIosHls(" in script
+    assert "if (!nativeHlsStarted) ttsPlayItem(0)" in script
+    assert "manifest_hash: !ttsSegmentFallbackMode && ttsActiveStreamId" in script
+
+
+def test_web_recovers_expired_cloudflare_challenge_without_killing_the_pwa() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    account = (PROJECT_ROOT / "static" / "account-ui.js").read_text(encoding="utf-8")
+    html = (PROJECT_ROOT / "static" / "index.html").read_text(encoding="utf-8")
+
+    assert "cf-mitigated" in script
+    assert "response.headers.has('cf-ray')" in script
+    assert "window.OOHStoryEdgeFetch = edgeFetch" in script
+    assert "location.replace" in script
+    assert "if (error?.edgeRecovery) return" in script
+    assert "probeEdgeSessionAfterResume" in script
+    assert "window.OOHStoryEdgeFetch || window.fetch.bind(window)" in account
+    assert "app.js?v=20260821-account-nav-touch1" in html
+    assert "account-ui.js?v=20260821-account-nav-touch1" in html
 
 
 def test_web_audiobook_does_not_resume_ended_chapter_stream_during_transition() -> None:
@@ -122,8 +160,11 @@ def test_web_audiobook_does_not_resume_ended_chapter_stream_during_transition() 
         script.index("  window.addEventListener('pagehide'", script.index("  visibilityListener ="))
     ]
     chapter_end = script[
-        script.index("  const ttsChapterEnd = async () =>"):
-        script.index("\n\n  const ttsUpdateMediaSession", script.index("  const ttsChapterEnd = async () =>"))
+        script.index("  const ttsChapterEndOnce = async transitionGeneration =>"):
+        script.index(
+            "\n\n  const ttsUpdateMediaSession",
+            script.index("  const ttsChapterEndOnce = async transitionGeneration =>"),
+        )
     ]
 
     assert "if (!state.reader.ttsActive || ttsStreamEnding) return" in resume
@@ -366,7 +407,7 @@ def test_web_tts_prefetches_only_one_five_segment_next_chapter_batch() -> None:
 
 def test_web_tts_next_chapter_manifest_is_not_blocked_by_prefetch_capacity() -> None:
     script = frontend_contract_source(PROJECT_ROOT)
-    start = script.index("  const ttsPrefetchNextChapter = async () =>")
+    start = script.index("  const ttsPrefetchNextChapter = () =>")
     source = script[start:script.index("\n\n  const ttsQueueServerProgress", start)]
 
     manifest_fetch = source.index("next?from_chapter_id")
@@ -503,7 +544,9 @@ def test_web_tts_preserves_unlocked_audio_across_automatic_chapter_route() -> No
 
 def test_web_tts_adopts_prefetched_chapter_without_stopping_the_player() -> None:
     script = frontend_contract_source(PROJECT_ROOT)
-    chapter_end_start = script.index("  const ttsChapterEnd = async () =>")
+    chapter_end_start = script.index(
+        "  const ttsChapterEndOnce = async transitionGeneration =>"
+    )
     chapter_end_end = script.index("\n\n  const ttsUpdateMediaSession", chapter_end_start)
     chapter_end = script[chapter_end_start:chapter_end_end]
 
@@ -516,3 +559,30 @@ def test_web_tts_adopts_prefetched_chapter_without_stopping_the_player() -> None
     assert "saveTtsCheckpoint(state.ttsSession)" in script
     assert "class: 'interline-action tts'" in script
     assert "text: '从此处听书'" in script
+
+
+def test_web_tts_deduplicates_prefetch_and_recovers_missing_media_ended() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    prefetch_start = script.index("  const ttsPrefetchNextChapter = () =>")
+    prefetch_end = script.index("\n\n  const ttsQueueServerProgress", prefetch_start)
+    prefetch = script[prefetch_start:prefetch_end]
+
+    assert "ttsNextChapterPrefetchPromise" in prefetch
+    assert "ttsNextChapterPrefetchSourceId === fromChapterId" in prefetch
+    assert "ttsNextChapterPlan.length && String(ttsNextChapterId)" in prefetch
+    assert "const ttsMaybeCompleteChapterAtMediaEof" in script
+    assert "ttsExpectedStreamDuration()" in script
+    assert "ttsTimelineLoadedThrough < finalAbsolute" in script
+    assert "ttsFinishChapterStream(streamId, generation, { hardEnd: false })" in script
+    assert "await Promise.resolve(ttsQueueServerProgress(true))" in script
+    assert "if (ttsChapterTransitionPromise) return ttsChapterTransitionPromise" in script
+
+
+def test_web_tts_timeline_only_polls_when_playback_needs_more_durations() -> None:
+    script = frontend_contract_source(PROJECT_ROOT)
+    start = script.index("  const ttsRefreshTimeline = async (force = false) =>")
+    timeline = script[start:script.index("\n  const ttsNewStreamId", start)]
+
+    assert "const desiredThrough = Math.min(lastAbsolute, currentAbsolute + TTS_STREAM_BATCH_SEGMENTS - 1)" in timeline
+    assert "ttsTimelineLoadedThrough >= desiredThrough" in timeline
+    assert "now - ttsLastTimelineRefresh < 1500" in timeline

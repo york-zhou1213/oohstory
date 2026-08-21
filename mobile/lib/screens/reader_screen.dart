@@ -70,6 +70,7 @@ class _ReaderScreenState extends State<ReaderScreen>
   DateTime _lastInteraction = DateTime.now();
   bool _readerForeground = true;
   int _chapterLoadGeneration = 0;
+  bool _chapterNavigationPending = false;
 
   final List<Color> _bgColors = [
     const Color(0xFFF5F1E8),
@@ -89,8 +90,7 @@ class _ReaderScreenState extends State<ReaderScreen>
       (c) => c.id == _currentChapterId,
     );
     if (_currentChapterIdx < 0) _currentChapterIdx = 0;
-    _loadChapter();
-    _loadSettings();
+    unawaited(_initializeReader());
     _positionsListener.itemPositions.addListener(_updateReadProgress);
     _readingHeartbeatTimer = Timer.periodic(
       const Duration(seconds: 30),
@@ -108,6 +108,7 @@ class _ReaderScreenState extends State<ReaderScreen>
   }
 
   void _updateReadProgress() {
+    if (_loading || _chapterNavigationPending) return;
     final positions = _positionsListener.itemPositions.value;
     if (positions.isEmpty || _items.isEmpty) return;
     final maxIndex = positions
@@ -149,6 +150,11 @@ class _ReaderScreenState extends State<ReaderScreen>
   Future<void> _loadSettings() async {
     await _progress.init();
     await _storage.init();
+  }
+
+  Future<void> _initializeReader() async {
+    await _loadSettings();
+    if (mounted) await _loadChapter();
   }
 
   Future<void> _loadChapter() async {
@@ -205,6 +211,7 @@ class _ReaderScreenState extends State<ReaderScreen>
           _ttsParagraphs = ttsParas;
           _paragraphThreads = _threadsByIndex(comments);
           _loading = false;
+          _chapterNavigationPending = false;
           _ttsHighlight = -1;
           _readProgress = 0.0;
         });
@@ -235,6 +242,7 @@ class _ReaderScreenState extends State<ReaderScreen>
         _ttsContinueOnLoad = false;
         setState(() {
           _loading = false;
+          _chapterNavigationPending = false;
           _ttsPlaying = false;
           _ttsHighlight = -1;
         });
@@ -250,8 +258,10 @@ class _ReaderScreenState extends State<ReaderScreen>
   }
 
   void _changeChapter(int offset, {required bool continueTts}) {
+    if (_loading || _chapterNavigationPending) return;
     final nextIndex = _currentChapterIdx + offset;
     if (nextIndex < 0 || nextIndex >= widget.chapters.length) return;
+    _chapterNavigationPending = true;
     _ttsContinueOnLoad = continueTts;
     _tts.stop();
     if (mounted) {
@@ -262,7 +272,7 @@ class _ReaderScreenState extends State<ReaderScreen>
     }
     _currentChapterIdx = nextIndex;
     _currentChapterId = widget.chapters[_currentChapterIdx].id;
-    _loadChapter();
+    unawaited(_loadChapter());
   }
 
   void _nextChapter() {
@@ -962,7 +972,12 @@ class _ReaderScreenState extends State<ReaderScreen>
               children: [
                 IconButton(
                   icon: const Icon(Icons.skip_previous, color: Colors.white),
-                  onPressed: _currentChapterIdx > 0 ? _prevChapter : null,
+                  onPressed:
+                      !_loading &&
+                          !_chapterNavigationPending &&
+                          _currentChapterIdx > 0
+                      ? _prevChapter
+                      : null,
                 ),
                 IconButton(
                   icon: const Icon(Icons.list, color: Colors.white),
@@ -981,7 +996,10 @@ class _ReaderScreenState extends State<ReaderScreen>
                 ),
                 IconButton(
                   icon: const Icon(Icons.skip_next, color: Colors.white),
-                  onPressed: _currentChapterIdx < widget.chapters.length - 1
+                  onPressed:
+                      !_loading &&
+                          !_chapterNavigationPending &&
+                          _currentChapterIdx < widget.chapters.length - 1
                       ? _nextChapter
                       : null,
                 ),
@@ -1001,7 +1019,9 @@ class _ReaderScreenState extends State<ReaderScreen>
           if (_currentChapterIdx > 0)
             Expanded(
               child: OutlinedButton(
-                onPressed: _prevChapter,
+                onPressed: !_loading && !_chapterNavigationPending
+                    ? _prevChapter
+                    : null,
                 child: const Text('上一章'),
               ),
             ),
@@ -1011,7 +1031,9 @@ class _ReaderScreenState extends State<ReaderScreen>
           if (_currentChapterIdx < widget.chapters.length - 1)
             Expanded(
               child: FilledButton(
-                onPressed: _nextChapter,
+                onPressed: !_loading && !_chapterNavigationPending
+                    ? _nextChapter
+                    : null,
                 child: const Text('下一章'),
               ),
             ),

@@ -17,9 +17,9 @@ void main() {
       'android/app/src/main/kotlin/com/oohstory/oohstory/MainActivity.kt',
     ).readAsStringSync();
 
-    expect(pubspec, contains('version: 1.18.20+64'));
-    expect(AppUpdateService.currentVersionName, '1.18.20');
-    expect(AppUpdateService.currentVersionCode, 64);
+    expect(pubspec, contains('version: 1.18.21+65'));
+    expect(AppUpdateService.currentVersionName, '1.18.21');
+    expect(AppUpdateService.currentVersionCode, 65);
     expect(api, contains('/api/v1/app/android/latest'));
     expect(api, contains('version_code'));
     expect(api, contains('version_name'));
@@ -37,8 +37,8 @@ void main() {
     tester,
   ) async {
     const info = AppUpdateInfo(
-      versionName: '1.18.21',
-      versionCode: 65,
+      versionName: '1.18.22',
+      versionCode: 66,
       releaseDate: '2026-08-13',
       downloadUrl: 'https://reader.example.com/downloads/android/latest.apk',
       sha256: 'abc',
@@ -62,7 +62,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('发现新版本'), findsOneWidget);
-    expect(find.text('当前版本 v1.18.20，可更新至 v1.18.21。'), findsOneWidget);
+    expect(find.text('当前版本 v1.18.21，可更新至 v1.18.22。'), findsOneWidget);
     expect(find.text('更新内容'), findsOneWidget);
     expect(find.text('修复后台播放稳定性'), findsOneWidget);
     expect(find.text('新增自动检查更新'), findsOneWidget);

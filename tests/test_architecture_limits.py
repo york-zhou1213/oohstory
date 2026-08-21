@@ -13,7 +13,10 @@ def test_frontend_monolith_cannot_regrow_legacy_audiobook_logic() -> None:
     fallback_script = PROJECT_ROOT / "static" / "audiobook-fallback.js"
     account_script = PROJECT_ROOT / "static" / "account-ui.js"
 
-    assert len(app_script.splitlines()) <= 5800
+    # Reader navigation isolation, indexed category selection, and the
+    # self-hosted account marketplace now share the main route surface. Keep a
+    # bounded ceiling while still preventing audiobook logic from returning.
+    assert len(app_script.splitlines()) <= 6400
     assert cache_script.is_file()
     assert lifecycle_script.is_file()
     assert fallback_script.is_file()

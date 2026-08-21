@@ -44,8 +44,8 @@ class AppUpdateInfo {
 }
 
 class AppUpdateService {
-  static const currentVersionName = '1.18.20';
-  static const currentVersionCode = 64;
+  static const currentVersionName = '1.18.21';
+  static const currentVersionCode = 65;
   static const _channel = MethodChannel('com.oohstory.oohstory/app');
   static const _lastPromptedVersionCodeKey =
       'oohstory_android_update_prompted_version_code';

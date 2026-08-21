@@ -681,7 +681,7 @@ def test_mysql_public_catalog_enforces_manual_publication_state_everywhere() -> 
     source = (
         Path(__file__).resolve().parents[1] / "app" / "mysql_catalog.py"
     ).read_text(encoding="utf-8")
-    assert source.count("is_active=1") == 19
+    assert source.count("is_active=1") == 20
     assert source.count("is_published=1") == source.count("is_active=1")
     assert "FROM public_catalog_facets" in source
     assert (

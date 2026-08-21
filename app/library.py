@@ -33,7 +33,8 @@ READER_NUMERIC_HEADING_LINE = re.compile(
     r"(?:[、.．:：\-—]|\s)+"
     r"(?P<title>\S[^\n]{0,119})\s*$"
 )
-READER_INDEX_SCHEMA_VERSION = 5
+READER_INDEX_SCHEMA_VERSION = 7
+READER_INDEX_COMPATIBLE_SCHEMA_VERSIONS = frozenset({6, 7})
 READER_LN_ILLUSTRATION_REF = re.compile(r"^\[本地插图：(.+?)\]\s*$", re.MULTILINE)
 READER_LN_CHAPTER_FILE = re.compile(r"^(\d+)-(\d+)-(.+)-([0-9a-f]{10})\.txt$")
 READER_FALLBACK_CHUNK_BYTES = 256 * 1024
@@ -429,11 +430,40 @@ class LibraryRepository:
 
     def category_books(self, per_category: int = 5) -> dict[str, list[dict[str, Any]]]:
         if self._mysql is not None:
-            raw = self._mysql.category_books(per_category)
+            raw = self._mysql.category_books(
+                per_category,
+                max_source_bytes=self.settings.max_source_bytes,
+                max_index_source_bytes=self.settings.max_index_source_bytes,
+                reader_index_schema_min=min(READER_INDEX_COMPATIBLE_SCHEMA_VERSIONS),
+                reader_index_schema_max=max(READER_INDEX_COMPATIBLE_SCHEMA_VERSIONS),
+                max_chapter_count=self.settings.max_chapter_count,
+            )
             result: dict[str, list[dict[str, Any]]] = {}
             for cat, books in raw.items():
                 enriched = []
                 for b in books:
+                    if len(enriched) >= per_category:
+                        break
+                    try:
+                        source = self._book_path(str(b.get("body_object_key") or ""))
+                        catalog_id = int(b.get("catalog_id") or 0)
+                        if source.stat().st_size > self.settings.max_index_source_bytes:
+                            cached_indexes = (
+                                self._read_json(root / f"{catalog_id}.json")
+                                for root in (
+                                    self.settings.shared_reader_index_root,
+                                    self.settings.reader_index_root,
+                                )
+                            )
+                            if not any(
+                                self._valid_reader_index(cached, source, catalog_id)
+                                and len(cached.get("chapters") or ())
+                                <= self.settings.max_chapter_count
+                                for cached in cached_indexes
+                            ):
+                                continue
+                    except (LibraryError, OSError, TypeError, ValueError):
+                        continue
                     pid = _encode_public_id(bytes(b["public_id"]))
                     enriched.append(
                         {
@@ -730,12 +760,31 @@ class LibraryRepository:
         self._enrich_books(picked)
         return picked
 
-    def sitemap_book_ids(self, limit: int = 49_990) -> list[str]:
+    def sitemap_book_count(self) -> int:
+        if self._mysql is not None:
+            return self._mysql.sitemap_book_count()
+        with self._ro_connection(self.settings.catalog_path) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM books
+                WHERE status='done'
+                  AND NULLIF(TRIM(COALESCE(output_path,'')), '') IS NOT NULL
+                """
+            ).fetchone()
+        return int(row["total"] if row is not None else 0)
+
+    def sitemap_book_ids(
+        self, limit: int = 49_990, offset: int = 0
+    ) -> list[str]:
         safe_limit = min(max(int(limit), 1), 49_990)
+        safe_offset = max(int(offset), 0)
         if self._mysql is not None:
             return [
                 _encode_public_id(value)
-                for value in self._mysql.sitemap_book_ids(safe_limit)
+                for value in self._mysql.sitemap_book_ids(
+                    safe_limit, safe_offset
+                )
             ]
         with self._ro_connection(self.settings.catalog_path) as conn:
             rows = conn.execute(
@@ -745,9 +794,9 @@ class LibraryRepository:
                 WHERE status='done'
                   AND NULLIF(TRIM(COALESCE(output_path,'')), '') IS NOT NULL
                 ORDER BY id DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (safe_limit,),
+                (safe_limit, safe_offset),
             ).fetchall()
         return [_local_public_id(int(row["id"])) for row in rows]
 
@@ -1428,6 +1477,53 @@ class LibraryRepository:
                 return candidate
         return None
 
+    def _ln_manifest_volume_dirs(self, ln_dir: Path) -> list[Path]:
+        """Return the ordered volume directories declared by the crawler manifest.
+
+        Wenku8 keeps its stable chapter identity in ``.wenku8-chapters.json``.
+        Treat that manifest as authoritative when it is present so temporary,
+        quarantined, or conflicting directories cannot become public volumes.
+        Older light-novel imports without a manifest continue to use the
+        directory scan fallback.
+        """
+        manifest = self._read_json(ln_dir / ".wenku8-chapters.json")
+        rows = manifest.get("chapters")
+        if not isinstance(rows, list):
+            return []
+
+        volume_dirs: list[Path] = []
+        seen: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            raw_path = str(row.get("path") or "").strip()
+            relative = Path(raw_path)
+            if (
+                not raw_path
+                or relative.is_absolute()
+                or ".." in relative.parts
+                or len(relative.parts) < 2
+            ):
+                continue
+            dirname = relative.parts[0]
+            if dirname in seen or not re.fullmatch(r"\d{3}-.+", dirname):
+                continue
+            candidate_names = (dirname, dirname.rstrip(" ."))
+            candidate = next(
+                (
+                    ln_dir / name
+                    for name in candidate_names
+                    if name
+                    and (ln_dir / name).is_dir()
+                    and not (ln_dir / name).is_symlink()
+                ),
+                None,
+            )
+            if candidate is not None:
+                seen.add(dirname)
+                volume_dirs.append(candidate)
+        return volume_dirs
+
     def _build_ln_reader_index(
         self, book_id: int, source: Path, ln_dir: Path, book_title: str
     ) -> dict[str, Any]:
@@ -1446,9 +1542,15 @@ class LibraryRepository:
                     if book_title and text.startswith(book_title[:6]):
                         vol_title_map[len(vol_title_map)] = text
 
-        vol_dirs = sorted(
-            d for d in ln_dir.iterdir() if d.is_dir() and re.match(r"\d{3}-", d.name)
-        )
+        vol_dirs = self._ln_manifest_volume_dirs(ln_dir)
+        if not vol_dirs:
+            vol_dirs = sorted(
+                d
+                for d in ln_dir.iterdir()
+                if d.is_dir()
+                and not d.is_symlink()
+                and re.match(r"\d{3}-", d.name)
+            )
 
         for vol_idx, vol_dir in enumerate(vol_dirs):
             chapter_dir = self._ln_content_dir(vol_dir, ("章节", "章节目录"))
@@ -1456,7 +1558,8 @@ class LibraryRepository:
             if chapter_dir is None:
                 continue
 
-            vol_title = vol_title_map.get(vol_idx, "")
+            volume_number = int(vol_dir.name[:3])
+            vol_title = vol_title_map.get(max(volume_number - 1, 0), "")
             if not vol_title:
                 raw = re.sub(r"^\d{3}-", "", vol_dir.name)
                 vol_title = raw.replace("-", " ").strip()
@@ -1652,15 +1755,25 @@ class LibraryRepository:
             return {}
         return value if isinstance(value, dict) else {}
 
-    def _valid_reader_index(self, payload: dict[str, Any], source: Path) -> bool:
+    def _valid_reader_index(
+        self,
+        payload: dict[str, Any],
+        source: Path,
+        book_id: int,
+    ) -> bool:
+        """Validate cached offsets against the selected public book source.
+
+        Reader indexes are keyed by catalog ID and already contain a source
+        size/mtime fingerprint. Their historical ``source_path`` may be an
+        absolute path from an earlier NAS mount. Re-resolving that path through
+        the MySQL object-key guard rejects every legitimate shared index, so it
+        must not participate in cache validity or file access.
+        """
         stat = source.stat()
-        try:
-            cached_source = self._book_path(str(payload.get("source_path") or ""))
-        except LibraryError:
-            return False
         return bool(
-            payload.get("schema_version") == READER_INDEX_SCHEMA_VERSION
-            and cached_source == source
+            payload.get("schema_version")
+            in READER_INDEX_COMPATIBLE_SCHEMA_VERSIONS
+            and int(payload.get("catalog_id") or -1) == int(book_id)
             and int(payload.get("source_bytes") or -1) == stat.st_size
             and int(payload.get("source_mtime_ns") or -1) == stat.st_mtime_ns
             and payload.get("chapters")
@@ -1677,13 +1790,13 @@ class LibraryRepository:
             self.settings.reader_index_root,
         ):
             cached = self._read_json(root / f"{int(book_id)}.json")
-            if self._valid_reader_index(cached, source):
+            if self._valid_reader_index(cached, source, book_id):
                 return cached
         with self._index_locks_guard:
             lock = self._index_locks.setdefault(int(book_id), threading.Lock())
         with lock:
             cached = self._read_json(self._reader_index_path(book_id))
-            if self._valid_reader_index(cached, source):
+            if self._valid_reader_index(cached, source, book_id):
                 return cached
             if source.stat().st_size > self.settings.max_index_source_bytes:
                 raise InputError("超大正文的章节目录尚未预生成")

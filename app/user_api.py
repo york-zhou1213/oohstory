@@ -60,6 +60,8 @@ GOOGLE_LINK_STATE = "oohstory-web-link-v1"
 GOOGLE_INVITE_COOKIE = "oohstory_google_invite"
 GOOGLE_LINK_COOKIE = "oohstory_google_link"
 RECOMMENDATION_VISITOR_NAMESPACE = uuid.UUID("a533cc90-f860-4e42-9a34-70a22085eb1c")
+DECONSTRUCTION_ARCHIVE_MAX_FILES = 12_000
+DECONSTRUCTION_ARCHIVE_MAX_BYTES = 512 * 1024 * 1024
 
 
 def recommendation_visitor_id(user_id: str, event_id: str) -> str:
@@ -1890,23 +1892,45 @@ def create_user_router(
             ) as archive:
                 total = 0
                 count = 0
-                for candidate in sorted(path for path in root.rglob("*") if path.is_file()):
-                    resolved = candidate.resolve()
-                    relative = resolved.relative_to(root) if resolved.is_relative_to(root) else None
+                library_root = settings.library_root.resolve()
+                for candidate in sorted(root.rglob("*")):
+                    relative = candidate.relative_to(root)
                     if (
-                        candidate.is_symlink()
-                        or relative is None
-                        or candidate.name == "_submission.json"
+                        candidate.name == "_submission.json"
                         or any(part.startswith(".") for part in relative.parts)
                     ):
                         continue
+                    try:
+                        resolved = candidate.resolve(strict=True)
+                    except (OSError, RuntimeError):
+                        continue
+                    if candidate.is_symlink():
+                        # System-generated archives intentionally keep the
+                        # canonical original as a symlink into the shared
+                        # electronic library. Include that file's bytes while
+                        # preserving its archive-relative name, but never
+                        # follow links outside the managed library root.
+                        if not resolved.is_relative_to(library_root):
+                            continue
+                    elif not resolved.is_relative_to(root):
+                        continue
+                    if not resolved.is_file():
+                        continue
+                    try:
+                        resolved_size = resolved.stat().st_size
+                    except OSError:
+                        continue
                     count += 1
-                    total += resolved.stat().st_size
-                    if count > 2000 or total > 256 * 1024 * 1024:
+                    total += resolved_size
+                    if (
+                        count > DECONSTRUCTION_ARCHIVE_MAX_FILES
+                        or total > DECONSTRUCTION_ARCHIVE_MAX_BYTES
+                    ):
                         raise HTTPException(
                             status_code=413, detail="拆书档案超过下载安全上限"
                         )
-                    archive.write(resolved, relative)
+                    archive.write(resolved, relative.as_posix())
+            download_count = store().increment_deconstruction_download(slug)
             background_tasks.add_task(Path(archive_name).unlink, missing_ok=True)
             return FileResponse(
                 archive_name,
@@ -1915,6 +1939,7 @@ def create_user_router(
                 headers={
                     "Cache-Control": "private, no-store",
                     "X-Download-Options": "noopen",
+                    "X-Deconstruction-Download-Count": str(download_count),
                 },
             )
         except BaseException:

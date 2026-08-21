@@ -18,15 +18,11 @@ from fastapi.responses import JSONResponse
 
 from .reader_abuse import ReaderAbuseGuard, ReaderProbeSigner
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_STATE_ROOT = Path(
-    os.getenv("OOHSTORY_STATE_ROOT", str(_PROJECT_ROOT / "var"))
-).expanduser().resolve()
-_DOWNLOAD_LOG_PATH = _STATE_ROOT / "download_daily.json"
-_DOWNLOAD_LOG_LOCK_PATH = _STATE_ROOT / "download_daily.lock"
+_DOWNLOAD_LOG_PATH = Path("/var/lib/oohstory-reader/download_daily.json")
+_DOWNLOAD_LOG_LOCK_PATH = Path("/var/lib/oohstory-reader/download_daily.lock")
 _DOWNLOAD_LOG_LOCK = threading.Lock()
-_READER_ABUSE_DB_PATH = _STATE_ROOT / "reader_abuse.sqlite3"
-_READER_PROBE_SECRET_PATH = _STATE_ROOT / "reader_probe.key"
+_READER_ABUSE_DB_PATH = Path("/var/lib/oohstory-reader/reader_abuse.sqlite3")
+_READER_PROBE_SECRET_PATH = Path("/var/lib/oohstory-reader/reader_probe.key")
 
 
 KNOWN_GOOD_BOTS = frozenset({
@@ -69,8 +65,8 @@ BLOCKED_BOT_KEYWORDS = frozenset({
 })
 
 PERMANENTLY_BLOCKED_IPS = frozenset({
-    "198.51.100.24",
-    "198.51.100.23",
+    "216.73.217.55",
+    "216.73.217.130",
 })
 
 _SEARCH_ENGINE_CIDRS = [
@@ -240,6 +236,15 @@ class RateLimiter:
         return (
             request.method in {"GET", "HEAD"}
             and _PUBLIC_READER_PATH_RE.fullmatch(request.url.path) is not None
+        )
+
+    @staticmethod
+    def _is_account_read_request(request: Request) -> bool:
+        path = request.url.path
+        return (
+            request.method in {"GET", "HEAD"}
+            and path.startswith("/api/v1/me/")
+            and _COUNTED_DOWNLOAD_PATH_RE.fullmatch(path) is None
         )
 
     def _try_consume(self, key: str, rate: float, burst: int) -> bool:
@@ -514,12 +519,24 @@ class RateLimiter:
         if not is_api:
             return None
 
-        # Authentication endpoints already use durable, operation-specific
-        # limits in AccountStore. Unrelated reading or comment traffic must
-        # not consume the generic IP bucket and turn a valid session probe or
-        # login into a misleading 429 response. Permanent IP and bot blocks
-        # above still apply.
+        # Authentication endpoints have their own durable, operation-specific
+        # limits in AccountStore (for example login is keyed by IP + email).
+        # Letting unrelated reading/comment traffic exhaust the generic IP
+        # bucket made session checks and legitimate login attempts return 429,
+        # which the clients understandably presented as a login failure.
+        # Permanent IP and bot blocks above still apply.
         if path.startswith("/api/v1/auth/"):
+            return None
+
+        # An authenticated account screen intentionally loads profile,
+        # notifications, submissions and reading state together. These
+        # read-only requests have no side effects and are already protected
+        # by authentication plus the edge account limit. Do not let unrelated
+        # page traffic exhaust the generic per-IP bucket and turn an ordinary
+        # account render into a 429. Counted downloads and every mutation stay
+        # on their dedicated/generic limits. Permanent IP and bot blocks above
+        # still apply.
+        if self._is_account_read_request(request):
             return None
 
         with self._lock:

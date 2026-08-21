@@ -1,7 +1,7 @@
 name: oohstory
 description: "OOH Story - 免费中文小说阅读与深度拆书"
 publish_to: 'none'
-version: 1.18.20+64
+version: 1.18.21+65
 
 environment:
   sdk: ^3.8.1

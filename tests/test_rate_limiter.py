@@ -118,12 +118,79 @@ def test_public_reader_bypass_does_not_cover_comments_writes_or_blocked_bots() -
     assert blocked_bot.status_code == 403
 
 
+def test_account_reads_ignore_unrelated_generic_bucket_and_transient_ban() -> None:
+    limiter = RateLimiter(
+        global_rate=0.001,
+        global_burst=1,
+        chapter_rate=0.001,
+        chapter_burst=1,
+    )
+
+    assert limiter.check(_request("/api/v1/books/example/metrics/read", method="POST")) is None
+    blocked = limiter.check(
+        _request("/api/v1/books/example/metrics/read", method="POST")
+    )
+    assert blocked is not None
+    assert blocked.status_code == 429
+    limiter.ban_ip("203.0.113.10", duration=3600, reason="transient test ban")
+
+    account_reads = (
+        "/api/v1/me/state",
+        "/api/v1/me/profile",
+        "/api/v1/me/notifications",
+        "/api/v1/me/uploads",
+        "/api/v1/me/novel-submissions",
+        "/api/v1/me/published-submissions",
+    )
+    for path in account_reads:
+        assert limiter.check(_request(path)) is None
+        assert limiter.check(_request(path, method="HEAD")) is None
+
+    blocked_write = limiter.check(
+        _request("/api/v1/me/novel-submissions", method="POST")
+    )
+    assert blocked_write is not None
+    assert blocked_write.status_code == 429
+
+    blocked_bot = limiter.check(
+        _request(
+            "/api/v1/me/novel-submissions",
+            user_agent=b"python-requests/2.32 scraper",
+        )
+    )
+    assert blocked_bot is not None
+    assert blocked_bot.status_code == 403
+
+
+def test_account_read_bypass_does_not_skip_deconstruction_download_quota(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = tmp_path / "download_daily.json"
+    monkeypatch.setattr(rate_limiter_module, "_DOWNLOAD_LOG_PATH", log_path)
+    monkeypatch.setattr(
+        rate_limiter_module,
+        "_DOWNLOAD_LOG_LOCK_PATH",
+        tmp_path / "download_daily.lock",
+    )
+    limiter = RateLimiter()
+    path = "/api/v1/me/deconstructions/example/download"
+
+    for _ in range(limiter.DOWNLOAD_DAILY_LIMIT):
+        assert limiter.check(_request(path)) is None
+
+    blocked = limiter.check(_request(path))
+    assert blocked is not None
+    assert blocked.status_code == 429
+    assert json.loads(blocked.body)["daily_limit"] == limiter.DOWNLOAD_DAILY_LIMIT
+
+
 def test_known_chapter_scraper_is_blocked_before_public_reader_bypass() -> None:
     limiter = RateLimiter()
     book_id = "AbCdEfGhIjKlMnOpQrStUv"
     request = _request(
         f"/api/v1/books/{book_id}/chapters/12",
-        headers=((b"cf-connecting-ip", b"198.51.100.23"),),
+        headers=((b"cf-connecting-ip", b"216.73.217.130"),),
     )
 
     blocked = limiter.check(request)
@@ -134,7 +201,7 @@ def test_known_chapter_scraper_is_blocked_before_public_reader_bypass() -> None:
     blocked_html = limiter.check(
         _request(
             f"/books/{book_id}/chapters/12",
-            headers=((b"cf-connecting-ip", b"198.51.100.23"),),
+            headers=((b"cf-connecting-ip", b"216.73.217.130"),),
         )
     )
     assert blocked_html is not None
@@ -214,3 +281,27 @@ def test_nginx_public_reader_location_has_no_request_or_connection_limit() -> No
     assert "limit_req " not in reader_location
     assert "limit_conn " not in reader_location
     assert "zone=ohhstory_chapter" not in nginx
+
+
+def test_nginx_account_reads_do_not_consume_write_or_connection_buckets() -> None:
+    nginx = (
+        Path(__file__).resolve().parents[1] / "deploy" / "nginx-oohstory.conf"
+    ).read_text(encoding="utf-8")
+    account_map = nginx.split(
+        'map "$request_method:$uri" $oohstory_account_rate_key {', 1
+    )[1].split("\n}", 1)[0]
+
+    assert '"~^(?:GET|HEAD):/api/v1/me/" "";' in account_map
+    assert (
+        '"~^(?:GET|HEAD):/api/v1/me/deconstructions/[^/]+/download$" '
+        "$binary_remote_addr;"
+    ) in account_map
+    assert (
+        "limit_req_zone $oohstory_account_rate_key "
+        "zone=ohhstory_account_v2:10m rate=20r/s;"
+    ) in nginx
+    assert (
+        "limit_conn_zone $oohstory_account_rate_key "
+        "zone=ohhstory_account_conn:10m;"
+    ) in nginx
+    assert nginx.count("limit_conn ohhstory_account_conn ") == 5

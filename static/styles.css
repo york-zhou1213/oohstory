@@ -725,7 +725,11 @@ img { display: block; }
 .account-nav { display:flex; justify-content:center; gap:7px; margin:0 0 18px; padding:6px; overflow-x:auto; border:1px solid var(--line); border-radius:16px; background:var(--surface); box-shadow:var(--shadow-sm); scrollbar-width:none; }
 .account-nav::-webkit-scrollbar { display:none; }
 .account-nav a { flex:none; padding:10px 14px; border-radius:11px; color:var(--muted); text-decoration:none; font-size:13px; font-weight:700; white-space:nowrap; }
-.account-nav a:hover,.account-nav a.active { color:#fff; background:linear-gradient(135deg,#3197e2,#1a70b2); }
+.account-nav a.active { color:#fff; background:linear-gradient(135deg,#3197e2,#1a70b2); }
+.account-nav a:focus-visible { outline:2px solid #3197e2; outline-offset:2px; }
+@media (hover:hover) and (pointer:fine) {
+  .account-nav a:hover { color:#fff; background:linear-gradient(135deg,#3197e2,#1a70b2); }
+}
 .account-hero-avatar img,.profile-avatar-preview img { width:100%; height:100%; object-fit:cover; border-radius:inherit; }
 .account-level-badge { display:inline-flex; margin-top:9px; padding:5px 10px; border:1px solid rgba(49,151,226,.2); border-radius:999px; color:var(--primary-dark); background:rgba(255,255,255,.52); font-size:11px; font-weight:800; }
 .account-profile-shortcut { display:flex; align-items:center; justify-content:space-between; gap:18px; }
@@ -3720,6 +3724,9 @@ body.tts-player-open { overflow: hidden; background: #10283b; }
   color: var(--muted);
   text-align: center;
 }
+.seo-app-loading { display: none; }
+:root.js .seo-app-loading { display: grid; }
+:root.js .seo-fallback { display: none; }
 .loader {
   width: 32px;
   height: 32px;
@@ -4242,6 +4249,7 @@ body.tts-player-open { overflow: hidden; background: #10283b; }
     height: 100%;
     min-height: 0;
     overflow-x: hidden;
+    overscroll-behavior-x: none;
     border: 0;
     border-radius: 0;
     background: var(--reader-bg);
@@ -5439,12 +5447,15 @@ body.tts-player-open { overflow: hidden; background: #10283b; }
 .volume-gallery-panel .chapter-panel-head h2 { margin-top: 4px; }
 .vol-cover-grid {
   display: grid;
-  grid-template-columns: repeat(6, 1fr);
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 16px;
+  width: 100%;
+  min-width: 0;
 }
 .vol-cover-card {
   text-decoration: none; color: inherit;
   display: flex; flex-direction: column; gap: 6px;
+  min-width: 0; max-width: 100%; overflow: hidden;
   padding: 8px;
   border: 1px solid transparent;
   border-radius: 12px;
@@ -5456,15 +5467,19 @@ body.tts-player-open { overflow: hidden; background: #10283b; }
   box-shadow: 0 12px 28px rgba(12, 25, 54, .09);
 }
 .vol-cover-wrap {
+  width: 100%; min-width: 0;
   aspect-ratio: 3/4;
   border-radius: 8px; overflow: hidden;
   background: linear-gradient(145deg, var(--cover-a, #3f6f95), var(--cover-b, #20384f));
 }
-.vol-cover-wrap img { width: 100%; height: 100%; object-fit: cover; }
+.vol-cover-wrap img {
+  display: block; width: 100%; max-width: 100%; height: 100%; object-fit: cover;
+}
 .vol-cover-placeholder {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 8px; padding: 14px; text-align: center;
   width: 100%; height: 100%;
+  min-width: 0; overflow: hidden;
   font-size: 14px; font-weight: 600; color: rgba(255,255,255,.88);
 }
 .vol-cover-placeholder::before {
@@ -5487,10 +5502,14 @@ body.tts-player-open { overflow: hidden; background: #10283b; }
 }
 .vol-cover-title {
   margin: 0; font-size: 12px; font-weight: 600; line-height: 1.3;
+  max-width: 100%; overflow-wrap: anywhere; word-break: break-word;
   overflow: hidden; text-overflow: ellipsis;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
 }
-.vol-cover-meta { font-size: 11px; color: var(--muted); }
+.vol-cover-meta {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11px; color: var(--muted);
+}
 
 .vol-detail-layout {
   display: flex; gap: 32px; align-items: flex-start;
@@ -5575,7 +5594,7 @@ body.tts-player-open { overflow: hidden; background: #10283b; }
 
 /* Mobile volume/illust responsive */
 @media (max-width: 720px) {
-  .vol-cover-grid { grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .vol-cover-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
   .volume-gallery-panel { margin: 16px 0 14px; padding: 13px 10px; }
   .vol-detail-layout { flex-direction: column; width: 100%; min-width: 0; gap: 16px; }
   .vol-detail-cover {

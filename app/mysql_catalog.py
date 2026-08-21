@@ -193,45 +193,106 @@ class MySQLPublicCatalog:
                     for row in cursor.fetchall()
                 ]
 
-    def category_books(self, per_category: int = 5) -> dict[str, list[dict[str, Any]]]:
+    def category_books(
+        self,
+        per_category: int = 5,
+        *,
+        max_source_bytes: int,
+        max_index_source_bytes: int,
+        reader_index_schema_min: int,
+        reader_index_schema_max: int,
+        max_chapter_count: int,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return the longest books that the Reader can actually open.
+
+        Small sources may build their chapter index during the request. Larger
+        sources are eligible only after the offline indexer has recorded a
+        current, non-empty reader index. This keeps the category showcase from
+        advertising books whose detail/catalog request is guaranteed to fail.
+        """
+        candidate_limit = max(int(per_category) * 4, int(per_category))
         with self.pool.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT t.category, t.title, t.author, t.public_id,
-                           t.cover_object_key, t.row_version, t.cat_total
-                    FROM (
-                        SELECT b.category, b.title, b.author, p.public_id,
-                               b.cover_object_key, b.row_version,
-                               COUNT(*) OVER (PARTITION BY b.category) AS cat_total,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY b.category
-                                   ORDER BY COALESCE(b.effective_word_count, 0) DESC
-                               ) AS rn
-                        FROM books b
-                        INNER JOIN book_public_ids p ON p.catalog_id=b.id
-                        WHERE b.is_active=1 AND b.body_available=1
-                          AND b.is_published=1
-                    ) t
-                    WHERE t.rn <= %s
-                    ORDER BY t.cat_total DESC, t.category, t.rn
+                    SELECT category, SUM(book_count) AS cat_total
+                    FROM public_catalog_facets
+                    WHERE book_count>0
+                    GROUP BY category
+                    ORDER BY cat_total DESC, category
                     """,
-                    (per_category,),
                 )
+                categories = list(cursor.fetchall())
                 result: dict[str, list[dict[str, Any]]] = {}
-                for row in cursor.fetchall():
-                    cat = str(row["category"])
-                    if cat not in result:
-                        result[cat] = []
-                    result[cat].append(
+                for category_row in categories:
+                    cat = str(category_row["category"])
+                    cursor.execute(
+                        """
+                        SELECT b.id AS catalog_id, b.title, b.author, p.public_id,
+                               b.body_object_key, b.bytes AS source_bytes,
+                               b.cover_object_key, b.row_version
+                        FROM books b FORCE INDEX (
+                            idx_books_reader_ready_category_words
+                        )
+                        INNER JOIN book_public_ids p ON p.catalog_id=b.id
+                        WHERE b.body_available=1
+                          AND b.is_active=1
+                          AND b.is_published=1
+                          AND b.category=%s
+                          AND b.bytes BETWEEN 1 AND %s
+                          AND (
+                              b.bytes <= %s
+                              OR EXISTS (
+                                  SELECT 1
+                                  FROM book_metadata reader_meta
+                                  WHERE reader_meta.catalog_id=b.id
+                                    AND reader_meta.reader_source_bytes=b.bytes
+                                    AND reader_meta.reader_schema_version
+                                        BETWEEN %s AND %s
+                                    AND reader_meta.section_count
+                                        BETWEEN 1 AND %s
+                                    AND reader_meta.reader_index_status
+                                        IN ('exact','fallback')
+                              )
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM book_metadata invalid_meta
+                              WHERE invalid_meta.catalog_id=b.id
+                                AND invalid_meta.reader_source_bytes=b.bytes
+                                AND invalid_meta.reader_schema_version
+                                    BETWEEN %s AND %s
+                                AND invalid_meta.section_count>%s
+                          )
+                        ORDER BY b.effective_word_count DESC, b.id DESC
+                        LIMIT %s
+                        """,
+                        (
+                            cat,
+                            int(max_source_bytes),
+                            int(max_index_source_bytes),
+                            int(reader_index_schema_min),
+                            int(reader_index_schema_max),
+                            int(max_chapter_count),
+                            int(reader_index_schema_min),
+                            int(reader_index_schema_max),
+                            int(max_chapter_count),
+                            candidate_limit,
+                        ),
+                    )
+                    result[cat] = [
                         {
                             "title": str(row["title"]),
                             "author": str(row["author"]),
                             "public_id": row["public_id"],
+                            "catalog_id": int(row["catalog_id"]),
+                            "body_object_key": str(row["body_object_key"]),
+                            "source_bytes": int(row.get("source_bytes") or 0),
                             "cover_object_key": row.get("cover_object_key"),
                             "row_version": int(row.get("row_version") or 0),
                         }
-                    )
+                        for row in cursor.fetchall()
+                    ]
                 return result
 
     def list_books(
@@ -360,8 +421,27 @@ class MySQLPublicCatalog:
             "page_count": max(math.ceil(total / page_size), 1),
         }
 
-    def sitemap_book_ids(self, limit: int = 49_990) -> list[bytes]:
+    def sitemap_book_count(self) -> int:
+        with self.pool.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS total
+                    FROM books b
+                    INNER JOIN book_public_ids p ON p.catalog_id=b.id
+                    WHERE b.is_active=1
+                      AND b.body_available=1
+                      AND b.is_published=1
+                    """
+                )
+                row = cursor.fetchone()
+                return int((row or {}).get("total") or 0)
+
+    def sitemap_book_ids(
+        self, limit: int = 49_990, offset: int = 0
+    ) -> list[bytes]:
         safe_limit = min(max(int(limit), 1), 49_990)
+        safe_offset = max(int(offset), 0)
         with self.pool.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -373,9 +453,9 @@ class MySQLPublicCatalog:
                       AND b.body_available=1
                       AND b.is_published=1
                     ORDER BY b.id DESC
-                    LIMIT %s
+                    LIMIT %s OFFSET %s
                     """,
-                    (safe_limit,),
+                    (safe_limit, safe_offset),
                 )
                 return [bytes(row["public_id"]) for row in cursor.fetchall()]
 

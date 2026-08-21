@@ -159,7 +159,7 @@ jobs:
           PYTHONPATH=admin/src python \
             admin/scripts/electronic-library/apply_mysql_migrations.py \
             | tee "$RUNNER_TEMP/migration-skip.log"
-          test "$(grep -c '^skip ' "$RUNNER_TEMP/migration-skip.log")" = "23"
+          test "$(grep -c '^skip ' "$RUNNER_TEMP/migration-skip.log")" = "24"
           test "$(grep -Ec '^(apply|adopt) ' "$RUNNER_TEMP/migration-skip.log" || true)" = "0"
 
   mobile:
