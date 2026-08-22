@@ -90,10 +90,16 @@ class InMemoryProgressTransport implements ProgressTransport {
   Future<ProgressRecord> put(ProgressRecord record, {int? ifMatch}) async {
     final current = _records[record.bookId];
     if (current != null && _sameProgress(current, record)) return current;
-    if (current != null && ifMatch != null && current.revision != ifMatch) {
+    final validCreate =
+        current == null && ifMatch == null && record.revision == 0;
+    final validUpdate =
+        current != null &&
+        ifMatch == current.revision &&
+        record.revision == current.revision + 1;
+    if (!validCreate && !validUpdate) {
       throw const CoreException(
         CoreErrorCode.revisionConflict,
-        'If-Match does not match the current revision',
+        'Revision precondition failed',
       );
     }
     final winner = current == null

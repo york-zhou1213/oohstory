@@ -1,3 +1,5 @@
+import 'errors.dart';
+
 class ProgressRecord {
   ProgressRecord({
     required this.bookId,
@@ -9,24 +11,48 @@ class ProgressRecord {
     required this.revision,
     this.tombstone = false,
   }) {
-    if (bookId.isEmpty ||
-        documentVersion.isEmpty ||
-        location.isEmpty ||
-        deviceId.isEmpty) {
-      throw ArgumentError(
-        'Progress identifiers and location must not be empty',
+    if (<String>[
+      bookId,
+      documentVersion,
+      location,
+    ].any((value) => value.trim().isEmpty)) {
+      throw const CoreException(
+        CoreErrorCode.validationError,
+        'Progress identifiers and location must not be blank',
+      );
+    }
+    if (!_uuid.hasMatch(deviceId)) {
+      throw const CoreException(
+        CoreErrorCode.validationError,
+        'Device ID must be a UUID',
       );
     }
     if (!percentage.isFinite || percentage < 0 || percentage > 1) {
-      throw RangeError.range(percentage, 0, 1, 'percentage');
+      throw const CoreException(
+        CoreErrorCode.validationError,
+        'Percentage must be between 0 and 1',
+      );
     }
     if (revision < 0) {
-      throw RangeError.value(revision, 'revision', 'Must be nonnegative');
+      throw const CoreException(
+        CoreErrorCode.validationError,
+        'Revision must be nonnegative',
+      );
     }
     if (!updatedAt.isUtc) {
-      throw ArgumentError.value(updatedAt, 'updatedAt', 'Must be UTC');
+      throw const CoreException(
+        CoreErrorCode.validationError,
+        'Updated time must be UTC',
+      );
     }
   }
+
+  static final RegExp _uuid = RegExp(
+    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
+  );
+  static final RegExp _utcTimestamp = RegExp(
+    r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$',
+  );
 
   final String bookId;
   final String documentVersion;
@@ -37,16 +63,31 @@ class ProgressRecord {
   final int revision;
   final bool tombstone;
 
-  factory ProgressRecord.fromJson(Map<String, Object?> json) => ProgressRecord(
-    bookId: json['book_id'] as String,
-    documentVersion: json['document_version'] as String,
-    location: json['location'] as String,
-    percentage: (json['percentage'] as num).toDouble(),
-    deviceId: json['device_id'] as String,
-    updatedAt: DateTime.parse(json['updated_at'] as String).toUtc(),
-    revision: json['revision'] as int,
-    tombstone: json['tombstone'] as bool? ?? false,
-  );
+  factory ProgressRecord.fromJson(Map<String, Object?> json) {
+    try {
+      final timestamp = json['updated_at'] as String;
+      if (!_utcTimestamp.hasMatch(timestamp)) {
+        throw const FormatException('Timestamp must be RFC3339 UTC');
+      }
+      return ProgressRecord(
+        bookId: json['book_id'] as String,
+        documentVersion: json['document_version'] as String,
+        location: json['location'] as String,
+        percentage: (json['percentage'] as num).toDouble(),
+        deviceId: json['device_id'] as String,
+        updatedAt: DateTime.parse(timestamp),
+        revision: json['revision'] as int,
+        tombstone: json['tombstone'] as bool? ?? false,
+      );
+    } on CoreException {
+      rethrow;
+    } on Object {
+      throw const CoreException(
+        CoreErrorCode.validationError,
+        'Progress payload is invalid',
+      );
+    }
+  }
 
   Map<String, Object?> toJson() => <String, Object?>{
     'book_id': bookId,

@@ -15,7 +15,7 @@ void main() {
     documentVersion: version,
     location: 'chapter:1',
     percentage: percentage,
-    deviceId: 'device',
+    deviceId: '123e4567-e89b-12d3-a456-426614174000',
     updatedAt: DateTime.utc(2026, 8, 23, 0, minute),
     revision: revision,
     tombstone: tombstone,
@@ -65,7 +65,7 @@ void main() {
       documentVersion: 'v1',
       location: 'chapter:2',
       percentage: 0.2,
-      deviceId: 'device-z',
+      deviceId: '123e4567-e89b-12d3-a456-426614174001',
       updatedAt: DateTime.utc(2026, 8, 23),
       revision: 1,
     );
