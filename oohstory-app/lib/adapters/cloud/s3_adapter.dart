@@ -296,7 +296,7 @@ final class S3CloudAdapter extends HttpCloudLibraryAdapter {
     return pairs.map((entry) => '${entry.key}=${entry.value}').join('&');
   }
 
-  String _encode(String value) => Uri.encodeQueryComponent(value)
+  String _encode(String value) => Uri.encodeComponent(value)
       .replaceAll('!', '%21')
       .replaceAll("'", '%27')
       .replaceAll('(', '%28')

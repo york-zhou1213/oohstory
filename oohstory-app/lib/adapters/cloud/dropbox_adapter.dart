@@ -151,16 +151,10 @@ final class DropboxCloudAdapter extends HttpCloudLibraryAdapter {
   Future<void> delete(String path, {String? etag}) async {
     root.requireDescendant(path);
     if (etag != null) {
-      CloudEntry current;
-      try {
-        current = await stat(path);
-      } on CoreException catch (error) {
-        if (error.code == CoreErrorCode.notFound) return;
-        rethrow;
-      }
-      if (normalizedEtag(current.etag) != normalizedEtag(etag)) {
-        throw cloudStatusError(409);
-      }
+      throw const CoreException(
+        CoreErrorCode.unsupported,
+        'Dropbox does not support atomic conditional delete',
+      );
     }
     final response = await _authorizedJson('files/delete_v2', <String, Object?>{
       'path': root.slashPath(path),

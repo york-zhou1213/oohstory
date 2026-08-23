@@ -203,4 +203,37 @@ void main() {
     );
     expect(result.etag, 'current');
   });
+
+  test('S3 SigV4 uses AWS RFC3986 query encoding', () async {
+    final scope = CredentialScope('s3-signing-vector');
+    final credentials = MemoryCredentialStore(<String, String>{
+      scope.key('access_key'): 'AKIDEXAMPLE',
+      scope.key('secret_key'): 'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY',
+    });
+    final transport = FixtureTransport((request, _) async {
+      expect(
+        request.headers['authorization'],
+        'AWS4-HMAC-SHA256 '
+        'Credential=AKIDEXAMPLE/20260823/us-east-1/s3/aws4_request, '
+        'SignedHeaders=host;x-amz-content-sha256;x-amz-date, '
+        'Signature=8cf6bed4fdce411c655591eb0f2890286bd63ba399df968bcc9770b01e6d545a',
+      );
+      return CloudHttpResponse.bytes(
+        statusCode: 200,
+        body: utf8.encode('<ListBucketResult></ListBucketResult>'),
+      );
+    });
+    final adapter = S3CloudAdapter(
+      endpoint: Uri.parse('https://s3.example.test'),
+      bucket: 'fixture-bucket',
+      root: 'OOHStory',
+      region: 'us-east-1',
+      transport: transport,
+      credentialStore: credentials,
+      credentialScope: scope,
+      clock: () => DateTime.utc(2026, 8, 23, 12, 34, 56),
+    );
+
+    await adapter.list('My Books/雪+人');
+  });
 }

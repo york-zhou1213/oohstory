@@ -193,6 +193,7 @@ void main() {
       final store = InMemoryOfflineMutationStore();
       final sync = OfflineCloudSynchronizer(
         adapter: adapter,
+        accountId: 'account-a',
         store: store,
         clock: () => DateTime.utc(2026, 8, 23),
       );
@@ -209,22 +210,27 @@ void main() {
       expect(duplicate, first);
       await sync.enqueueDelete('books/a.epub', etag: 'v2');
       expect(
-        (await store.pending()).map((mutation) => mutation.type),
+        (await store.pending(sync.scope)).map((mutation) => mutation.type),
         <CloudMutationType>[CloudMutationType.write, CloudMutationType.delete],
       );
 
       await expectLater(sync.replay(), throwsA(isA<CoreException>()));
-      expect(await store.pending(), hasLength(2));
+      expect(await store.pending(sync.scope), hasLength(2));
       adapter.failWrites = false;
       expect(await sync.replay(), 2);
-      expect(await store.pending(), isEmpty);
+      expect(await store.pending(sync.scope), isEmpty);
       expect(adapter.writes.single, 'books/a.epub:v1:3');
       expect(adapter.deletes.single, 'books/a.epub:v2');
     },
   );
 
   test('queued mutations round-trip without exposing credentials', () {
+    final scope = CloudMutationScope(
+      providerId: 'fixture',
+      accountId: 'account-a',
+    );
     final mutation = QueuedCloudMutation(
+      scope: scope,
       idempotencyKey: 'idempotent',
       type: CloudMutationType.write,
       path: 'book.epub',
@@ -233,6 +239,7 @@ void main() {
       enqueuedAt: DateTime.utc(2026, 8, 23),
     );
     final restored = QueuedCloudMutation.fromJson(mutation.toJson());
+    expect(restored.scope, scope);
     expect(restored.idempotencyKey, mutation.idempotencyKey);
     expect(restored.bytes, mutation.bytes);
   });
@@ -240,8 +247,14 @@ void main() {
   test('offline replay rejects tampered persisted mutations', () async {
     final adapter = _RecordingAdapter();
     final store = InMemoryOfflineMutationStore();
+    final sync = OfflineCloudSynchronizer(
+      adapter: adapter,
+      accountId: 'account-a',
+      store: store,
+    );
     await store.put(
       QueuedCloudMutation(
+        scope: sync.scope,
         idempotencyKey: 'tampered-key',
         type: CloudMutationType.write,
         path: 'book.epub',
@@ -251,7 +264,7 @@ void main() {
       ),
     );
     await expectLater(
-      OfflineCloudSynchronizer(adapter: adapter, store: store).replay(),
+      sync.replay(),
       throwsA(
         isA<CoreException>().having(
           (error) => error.code,
@@ -261,17 +274,87 @@ void main() {
       ),
     );
     expect(adapter.writes, isEmpty);
-    expect(await store.pending(), hasLength(1));
+    expect(await store.pending(sync.scope), hasLength(1));
+  });
+
+  test('offline queues are isolated by provider and account', () async {
+    final store = InMemoryOfflineMutationStore();
+    final dropboxA = _RecordingAdapter('dropbox');
+    final dropboxB = _RecordingAdapter('dropbox');
+    final s3A = _RecordingAdapter('s3');
+    final syncDropboxA = OfflineCloudSynchronizer(
+      adapter: dropboxA,
+      accountId: 'account-a',
+      store: store,
+    );
+    final syncDropboxB = OfflineCloudSynchronizer(
+      adapter: dropboxB,
+      accountId: 'account-b',
+      store: store,
+    );
+    final syncS3A = OfflineCloudSynchronizer(
+      adapter: s3A,
+      accountId: 'account-a',
+      store: store,
+    );
+
+    final keys = <String>{
+      await syncDropboxA.enqueueDelete('book.epub'),
+      await syncDropboxB.enqueueDelete('book.epub'),
+      await syncS3A.enqueueDelete('book.epub'),
+    };
+    expect(keys, hasLength(3));
+    expect(await syncDropboxB.replay(), 1);
+    expect(dropboxA.deletes, isEmpty);
+    expect(dropboxB.deletes, <String>['book.epub:null']);
+    expect(s3A.deletes, isEmpty);
+    expect(await store.pending(syncDropboxA.scope), hasLength(1));
+    expect(await store.pending(syncS3A.scope), hasLength(1));
+  });
+
+  test('offline replay rejects a store returning another account', () async {
+    final adapter = _RecordingAdapter('dropbox');
+    final foreignScope = CloudMutationScope(
+      providerId: 'dropbox',
+      accountId: 'account-b',
+    );
+    final mutation = QueuedCloudMutation(
+      scope: foreignScope,
+      idempotencyKey: 'foreign',
+      type: CloudMutationType.delete,
+      path: 'book.epub',
+      etag: null,
+      bytes: Uint8List(0),
+      enqueuedAt: DateTime.utc(2026, 8, 23),
+    );
+    final sync = OfflineCloudSynchronizer(
+      adapter: adapter,
+      accountId: 'account-a',
+      store: _MisdirectedStore(mutation),
+    );
+    await expectLater(
+      sync.replay(),
+      throwsA(
+        isA<CoreException>().having(
+          (error) => error.code,
+          'code',
+          CoreErrorCode.validationError,
+        ),
+      ),
+    );
+    expect(adapter.deletes, isEmpty);
   });
 }
 
 final class _RecordingAdapter implements CloudLibraryAdapter {
+  _RecordingAdapter([this.providerId = 'recording']);
+
   bool failWrites = false;
   final List<String> writes = <String>[];
   final List<String> deletes = <String>[];
 
   @override
-  String get providerId => 'recording';
+  final String providerId;
 
   @override
   ProviderCapabilities get capabilities => ProviderCapabilities(
@@ -307,4 +390,20 @@ final class _RecordingAdapter implements CloudLibraryAdapter {
     writes.add('$path:$etag:${body.length}');
     return CloudEntry(path: path, isDirectory: false, etag: 'v2');
   }
+}
+
+final class _MisdirectedStore implements OfflineMutationStore {
+  _MisdirectedStore(this.mutation);
+
+  final QueuedCloudMutation mutation;
+
+  @override
+  Future<List<QueuedCloudMutation>> pending(CloudMutationScope scope) async =>
+      <QueuedCloudMutation>[mutation];
+
+  @override
+  Future<void> put(QueuedCloudMutation mutation) async {}
+
+  @override
+  Future<void> remove(CloudMutationScope scope, String idempotencyKey) async {}
 }

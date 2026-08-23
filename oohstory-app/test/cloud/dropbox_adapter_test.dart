@@ -109,7 +109,7 @@ void main() {
       )).etag,
       'rev2',
     );
-    await adapter.delete('a.epub', etag: 'rev2');
+    await adapter.delete('a.epub');
     expect(credentials.values[scope.key('access_token')], 'fresh-access-token');
     expect(
       transport.requests
@@ -123,95 +123,99 @@ void main() {
     );
   });
 
-  test('Dropbox refuses stale ETag deletion and path escape', () async {
-    final scope = CredentialScope('dropbox-negative');
-    final credentials = MemoryCredentialStore(<String, String>{
-      scope.key('access_token'): 'token',
-    });
-    final transport = FixtureTransport((request, _) async {
-      if (request.uri.path.endsWith('/get_metadata')) {
-        return jsonResponse(
-          200,
-          '{".tag":"file","name":"a.epub",'
-          '"path_display":"/OOHStory/a.epub","rev":"current"}',
-        );
-      }
-      fail('Delete must stop before Dropbox mutation');
-    });
-    final adapter = DropboxCloudAdapter(
-      root: 'OOHStory',
-      transport: transport,
-      credentialStore: credentials,
-      credentialScope: scope,
-      apiEndpoint: Uri.parse('https://dropbox.fixture/2'),
-      contentEndpoint: Uri.parse('https://dropbox-content.fixture/2'),
-      tokenEndpoint: Uri.parse('https://dropbox.fixture/oauth2/token'),
-    );
-    await expectLater(
-      adapter.delete('a.epub', etag: 'stale'),
-      throwsA(
-        isA<CoreException>().having(
-          (error) => error.code,
-          'code',
-          CoreErrorCode.revisionConflict,
+  test(
+    'Dropbox rejects conditional delete before a concurrent update',
+    () async {
+      final scope = CredentialScope('dropbox-negative');
+      final credentials = MemoryCredentialStore(<String, String>{
+        scope.key('access_token'): 'token',
+      });
+      final transport = FixtureTransport(
+        (_, _) async => fail(
+          'Conditional delete must not issue a non-atomic Dropbox request',
         ),
-      ),
-    );
-    await expectLater(
-      adapter.stat('../outside'),
-      throwsA(isA<CoreException>()),
-    );
-    expect(transport.requests, hasLength(1));
-  });
+      );
+      final adapter = DropboxCloudAdapter(
+        root: 'OOHStory',
+        transport: transport,
+        credentialStore: credentials,
+        credentialScope: scope,
+        apiEndpoint: Uri.parse('https://dropbox.fixture/2'),
+        contentEndpoint: Uri.parse('https://dropbox-content.fixture/2'),
+        tokenEndpoint: Uri.parse('https://dropbox.fixture/oauth2/token'),
+      );
+      await expectLater(
+        adapter.delete('a.epub', etag: 'stale'),
+        throwsA(
+          isA<CoreException>().having(
+            (error) => error.code,
+            'code',
+            CoreErrorCode.unsupported,
+          ),
+        ),
+      );
+      await expectLater(
+        adapter.stat('../outside'),
+        throwsA(isA<CoreException>()),
+      );
+      expect(transport.requests, isEmpty);
+    },
+  );
 
-  test('Dropbox exact update and delete retries are idempotent', () async {
-    final scope = CredentialScope('dropbox-idempotency');
-    final credentials = MemoryCredentialStore(<String, String>{
-      scope.key('access_token'): 'token',
-    });
-    var missing = false;
-    final transport = FixtureTransport((request, _) async {
-      switch (request.uri.path) {
-        case '/2/files/upload':
-          return jsonResponse(409, '{"error_summary":"conflict"}');
-        case '/2/files/download':
-          return CloudHttpResponse.bytes(statusCode: 200, body: <int>[5, 6]);
-        case '/2/files/get_metadata':
-          if (missing) {
-            return jsonResponse(404, '{"error_summary":"not_found"}');
-          }
-          return jsonResponse(
-            200,
-            '{".tag":"file","name":"a.epub",'
-            '"path_display":"/OOHStory/a.epub","rev":"current"}',
-          );
-      }
-      fail('Unexpected Dropbox request');
-    });
-    final adapter = DropboxCloudAdapter(
-      root: 'OOHStory',
-      transport: transport,
-      credentialStore: credentials,
-      credentialScope: scope,
-      apiEndpoint: Uri.parse('https://dropbox.fixture/2'),
-      contentEndpoint: Uri.parse('https://dropbox-content.fixture/2'),
-      tokenEndpoint: Uri.parse('https://dropbox.fixture/oauth2/token'),
-    );
-    expect(
-      (await adapter.write(
-        'a.epub',
-        Stream<List<int>>.value(<int>[5, 6]),
-        etag: 'old',
-      )).etag,
-      'current',
-    );
-    missing = true;
-    await adapter.delete('a.epub', etag: 'current');
-    expect(
-      transport.requests.where(
-        (request) => request.uri.path == '/2/files/delete_v2',
-      ),
-      isEmpty,
-    );
-  });
+  test(
+    'Dropbox exact update and unconditional delete retries are idempotent',
+    () async {
+      final scope = CredentialScope('dropbox-idempotency');
+      final credentials = MemoryCredentialStore(<String, String>{
+        scope.key('access_token'): 'token',
+      });
+      var missing = false;
+      final transport = FixtureTransport((request, _) async {
+        switch (request.uri.path) {
+          case '/2/files/upload':
+            return jsonResponse(409, '{"error_summary":"conflict"}');
+          case '/2/files/download':
+            return CloudHttpResponse.bytes(statusCode: 200, body: <int>[5, 6]);
+          case '/2/files/get_metadata':
+            if (missing) {
+              return jsonResponse(404, '{"error_summary":"not_found"}');
+            }
+            return jsonResponse(
+              200,
+              '{".tag":"file","name":"a.epub",'
+              '"path_display":"/OOHStory/a.epub","rev":"current"}',
+            );
+          case '/2/files/delete_v2':
+            return jsonResponse(409, '{"error_summary":"path/not_found/"}');
+        }
+        fail('Unexpected Dropbox request');
+      });
+      final adapter = DropboxCloudAdapter(
+        root: 'OOHStory',
+        transport: transport,
+        credentialStore: credentials,
+        credentialScope: scope,
+        apiEndpoint: Uri.parse('https://dropbox.fixture/2'),
+        contentEndpoint: Uri.parse('https://dropbox-content.fixture/2'),
+        tokenEndpoint: Uri.parse('https://dropbox.fixture/oauth2/token'),
+      );
+      expect(
+        (await adapter.write(
+          'a.epub',
+          Stream<List<int>>.value(<int>[5, 6]),
+          etag: 'old',
+        )).etag,
+        'current',
+      );
+      missing = true;
+      await adapter.delete('a.epub');
+      await adapter.delete('a.epub');
+      expect(
+        transport.requests.where(
+          (request) => request.uri.path == '/2/files/delete_v2',
+        ),
+        hasLength(2),
+      );
+    },
+  );
 }
