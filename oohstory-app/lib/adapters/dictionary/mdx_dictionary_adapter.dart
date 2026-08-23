@@ -167,7 +167,11 @@ class _MdxParser {
     final header = _decodeUtf16Header(headerBytes);
     final versionText = _attribute(header, 'GeneratedByEngineVersion');
     final version = double.tryParse(versionText);
-    if (version == null || version < 2 || version >= 3) {
+    if (!RegExp(r'^2(?:\.[0-9]{1,16})?$').hasMatch(versionText) ||
+        version == null ||
+        !version.isFinite ||
+        version < 2 ||
+        version >= 3) {
       throw const CoreException(
         CoreErrorCode.unsupported,
         'Only MDX engine version 2 is supported',

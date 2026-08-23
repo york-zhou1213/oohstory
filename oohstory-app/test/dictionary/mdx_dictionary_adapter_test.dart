@@ -53,6 +53,18 @@ void main() {
       );
     });
 
+    test('rejects non-finite and malformed engine versions', () {
+      for (final version in <String>['NaN', 'Infinity', '-Infinity', '2..0']) {
+        expect(
+          () => MdxDictionaryAdapter.fromBytes(
+            buildMdxFixture(engineVersion: version),
+          ),
+          throwsA(_coreError(CoreErrorCode.unsupported)),
+          reason: version,
+        );
+      }
+    });
+
     test('rejects malformed headers and block checksums', () {
       final badHeader = buildMdxFixture()..[8] ^= 0x01;
       final badKeyHeader = buildMdxFixture();

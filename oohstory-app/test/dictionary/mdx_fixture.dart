@@ -5,6 +5,7 @@ import 'dart:typed_data';
 Uint8List buildMdxFixture({
   bool compressed = true,
   bool encrypted = false,
+  String engineVersion = '2.0',
   List<MapEntry<String, String>> entries = const <MapEntry<String, String>>[
     MapEntry<String, String>('apple', '<b>first</b>'),
     MapEntry<String, String>('apple', '<b>second</b>'),
@@ -36,7 +37,7 @@ Uint8List buildMdxFixture({
   final keyInfoBlock = _block(keyInfoPayload, compressed: compressed);
   final recordBlock = _block(records, compressed: compressed);
   final header = _utf16Le(
-    '<Dictionary GeneratedByEngineVersion="2.0" '
+    '<Dictionary GeneratedByEngineVersion="$engineVersion" '
     'Encoding="UTF-8" Encrypted="${encrypted ? '2' : 'No'}"/>\u0000',
   );
   final keyHeader = <int>[

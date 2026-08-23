@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -10,32 +11,27 @@ import 'package:oohstory/core/models.dart';
 
 void main() {
   group('LocalOcrAdapter', () {
-    test('runs a deterministic local golden and reports languages', () async {
-      final engine = _GoldenEngine();
-      final adapter = LocalOcrAdapter.available(
-        engine: engine,
-        platform: 'Linux',
-      );
-      final image = _png(width: 32, height: 16);
+    test('recognizes text from a real PNG golden locally', () async {
+      final adapter = LocalOcrAdapter.portable(platform: 'Linux');
+      final image = base64Decode(_helloPngGolden);
 
-      final result = await adapter.recognize(image, locale: 'zh-hans');
+      final result = await adapter.recognize(image, locale: 'en');
 
-      expect(result.text, '本地识别 OK');
-      expect(result.confidence, 0.98);
+      expect(result.text, 'HELLO');
+      expect(result.confidence, greaterThan(0.99));
       expect(adapter.providerId, 'local-ocr-linux');
-      expect(adapter.supportedLanguages, <String>['en', 'zh-Hans']);
+      expect(adapter.supportedLanguages, <String>['en']);
       expect(adapter.capabilities.supports(AdapterCapability.localOcr), isTrue);
       expect(
         adapter.capabilities.supports(AdapterCapability.remoteOcr),
         isFalse,
       );
-      expect(engine.lastLocale, 'zh-Hans');
     });
 
     test(
       'clears the ephemeral image copy and does not mutate caller bytes',
       () async {
-        final engine = _GoldenEngine();
+        final engine = _RetainingEngine();
         final adapter = LocalOcrAdapter.available(
           engine: engine,
           platform: 'android',
@@ -52,7 +48,7 @@ void main() {
     );
 
     test('cancels before local engine execution', () async {
-      final engine = _GoldenEngine();
+      final engine = _RetainingEngine();
       final adapter = LocalOcrAdapter.available(
         engine: engine,
         platform: 'ios',
@@ -79,14 +75,14 @@ void main() {
       await engine.started.future;
 
       job.cancel();
-      engine.finish.complete();
 
       await expectLater(
-        job.result,
+        job.result.timeout(const Duration(seconds: 1)),
         throwsA(_coreError(CoreErrorCode.validationError)),
       );
       expect(engine.observedToken?.isCancelled, isTrue);
       expect(engine.retainedBytes, everyElement(0));
+      engine.finish.complete();
     });
 
     test('reports unsupported platforms without a fallback', () async {
@@ -107,7 +103,7 @@ void main() {
 
     test('enforces encoded-size, dimensions, pixels and image type', () {
       final adapter = LocalOcrAdapter.available(
-        engine: _GoldenEngine(),
+        engine: _RetainingEngine(),
         platform: 'windows',
         limits: const OcrImageLimits(
           maxEncodedBytes: 32,
@@ -171,7 +167,7 @@ void main() {
   });
 }
 
-class _GoldenEngine implements LocalOcrEngine {
+class _RetainingEngine implements LocalOcrEngine {
   Uint8List? retainedBytes;
   String? lastLocale;
   int calls = 0;
@@ -256,3 +252,8 @@ void _writeUint32Be(Uint8List bytes, int offset, int value) {
 
 Matcher _coreError(CoreErrorCode code) =>
     isA<CoreException>().having((error) => error.code, 'code', code);
+
+const String _helloPngGolden =
+    'iVBORw0KGgoAAAANSUhEUgAAAFkAAAAbCAAAAAAy8HwUAAAAUklEQVR4nGP4TyvA'
+    'MERNZmBAmA9mM6ACVBUIZehGIdQPN5MJGIRXAMIeNXmYmIyRyFCT0AgzGVV0aMTg'
+    'qMkDZDLuZIhd4D/R5fNgN5k2YCiaDABHfcuJcx5zoQAAAABJRU5ErkJggg==';
