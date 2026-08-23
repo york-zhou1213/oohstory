@@ -1,6 +1,8 @@
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:oohstory/adapters/dictionary/_zlib_decoder.dart';
 import 'package:oohstory/adapters/dictionary/dictionary.dart';
 import 'package:oohstory/core/capabilities.dart';
 import 'package:oohstory/core/errors.dart';
@@ -92,6 +94,20 @@ void main() {
       expect(
         () => MdxDictionaryAdapter.fromBytes(Uint8List.fromList(<int>[0, 1])),
         throwsA(_coreError(CoreErrorCode.validationError)),
+      );
+    });
+
+    test('rejects an incomplete Huffman table accepted by the old decoder', () {
+      final malformed = base64Decode(
+        'eJwFwYcBwDAIAzBqNmH8/20tAbZmvmSZTaklRskwj7riGEHR86m9mM/PNI3y'
+        'wSLpkLn66sNds6bVywGVRDIDpY8mJL/QFmTfR0hSV3fPGaMHKQ7dTGldHZpM'
+        'fcxWJeFFLrA2Ootlob6ZWBOPiicb5N7NUw8TTH7buK2Qb8+grU4Whg6vozVn'
+        'H0iUP6atoQPNGzsuDH1H3w/YtweK',
+      );
+
+      expect(
+        () => decodeZlib(malformed, maxOutputBytes: 10000),
+        throwsFormatException,
       );
     });
 

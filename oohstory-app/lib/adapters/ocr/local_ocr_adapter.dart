@@ -13,12 +13,14 @@ class OcrImageLimits {
     this.maxWidth = 8192,
     this.maxHeight = 8192,
     this.maxPixels = 32 * 1024 * 1024,
+    this.maxExpandedBytes = 48 * 1024 * 1024,
   });
 
   final int maxEncodedBytes;
   final int maxWidth;
   final int maxHeight;
   final int maxPixels;
+  final int maxExpandedBytes;
 }
 
 abstract interface class LocalOcrEngine {
@@ -191,8 +193,8 @@ class BitmapOcrEngine implements LocalOcrEngine {
   }) async {
     cancellation.throwIfCancelled();
     _validateImage(ephemeralImageBytes, limits);
-    final image = _decodePng(ephemeralImageBytes, cancellation);
-    final glyphs = _segmentGlyphs(image, cancellation);
+    final image = await _decodePng(ephemeralImageBytes, cancellation, limits);
+    final glyphs = await _segmentGlyphs(image, cancellation);
     if (glyphs.isEmpty) return const OcrResult(text: '', confidence: 1);
 
     final text = StringBuffer();
@@ -208,7 +210,7 @@ class BitmapOcrEngine implements LocalOcrEngine {
       if (text.isNotEmpty && glyph.start - previousEnd > typicalWidth * 0.75) {
         text.write(' ');
       }
-      final sample = _sampleGlyph(image, glyph);
+      final sample = await _sampleGlyph(image, glyph, cancellation);
       var bestCharacter = '?';
       var bestDistance = 36;
       for (final entry in _glyphTemplates.entries) {
@@ -230,7 +232,11 @@ class BitmapOcrEngine implements LocalOcrEngine {
   }
 }
 
-_Bitmap _decodePng(Uint8List bytes, OcrCancellationToken cancellation) {
+Future<_Bitmap> _decodePng(
+  Uint8List bytes,
+  OcrCancellationToken cancellation,
+  OcrImageLimits limits,
+) async {
   const signature = <int>[137, 80, 78, 71, 13, 10, 26, 10];
   if (!_startsWith(bytes, signature)) {
     throw const CoreException(
@@ -255,13 +261,13 @@ _Bitmap _decodePng(Uint8List bytes, OcrCancellationToken cancellation) {
     if (length > bytes.length - offset - 8) {
       throw const FormatException('PNG chunk length is invalid');
     }
-    final type = bytes.sublist(offset, offset + 4);
+    final type = Uint8List.sublistView(bytes, offset, offset + 4);
     offset += 4;
-    final data = bytes.sublist(offset, offset + length);
+    final data = Uint8List.sublistView(bytes, offset, offset + length);
     offset += length;
     final checksum = _uint32Be(bytes, offset);
     offset += 4;
-    if (_crc32(<int>[...type, ...data]) != checksum) {
+    if (await _crc32Chunk(type, data, cancellation) != checksum) {
       throw const FormatException('PNG chunk checksum mismatch');
     }
     final name = String.fromCharCodes(type);
@@ -329,32 +335,36 @@ _Bitmap _decodePng(Uint8List bytes, OcrCancellationToken cancellation) {
   final pixelStride = bytesPerPixel;
   final rowBytes = imageWidth * pixelStride;
   final expectedBytes = (rowBytes + 1) * imageHeight;
-  final inflated = decodeZlib(
+  if (expectedBytes > limits.maxExpandedBytes) {
+    throw const CoreException(
+      CoreErrorCode.payloadTooLarge,
+      'OCR decoded pixels exceed the configured memory limit',
+    );
+  }
+  final inflated = await decodeZlibAsync(
     compressed.takeBytes(),
     maxOutputBytes: expectedBytes,
+    checkCancelled: cancellation.throwIfCancelled,
   );
   if (inflated.length != expectedBytes) {
     throw const FormatException('PNG pixel data size is invalid');
   }
 
-  final pixels = List<Uint8List>.generate(
-    imageHeight,
-    (_) => Uint8List(rowBytes),
-    growable: false,
-  );
+  var previous = Uint8List(rowBytes);
+  var current = Uint8List(rowBytes);
+  final pixelCount = imageWidth * imageHeight;
+  final ink = Uint8List((pixelCount + 7) >> 3);
   var source = 0;
   for (var y = 0; y < imageHeight; y++) {
-    cancellation.throwIfCancelled();
+    if ((y & 63) == 0) await _yieldAndCheck(cancellation);
     final filter = inflated[source++];
     if (filter > 4) throw const FormatException('PNG row filter is invalid');
     for (var x = 0; x < rowBytes; x++) {
       final raw = inflated[source++];
-      final left = x >= pixelStride ? pixels[y][x - pixelStride] : 0;
-      final up = y > 0 ? pixels[y - 1][x] : 0;
-      final upLeft = y > 0 && x >= pixelStride
-          ? pixels[y - 1][x - pixelStride]
-          : 0;
-      pixels[y][x] = switch (filter) {
+      final left = x >= pixelStride ? current[x - pixelStride] : 0;
+      final up = y > 0 ? previous[x] : 0;
+      final upLeft = y > 0 && x >= pixelStride ? previous[x - pixelStride] : 0;
+      current[x] = switch (filter) {
         0 => raw,
         1 => (raw + left) & 0xff,
         2 => (raw + up) & 0xff,
@@ -363,55 +373,47 @@ _Bitmap _decodePng(Uint8List bytes, OcrCancellationToken cancellation) {
         _ => throw StateError('unreachable'),
       };
     }
-  }
-
-  final ink = List<Uint8List>.generate(
-    imageHeight,
-    (_) => Uint8List(imageWidth),
-    growable: false,
-  );
-  for (var y = 0; y < imageHeight; y++) {
-    cancellation.throwIfCancelled();
     for (var x = 0; x < imageWidth; x++) {
       final start = x * pixelStride;
       final (red, green, blue, alpha) = switch (pixelStride) {
-        1 => (pixels[y][start], pixels[y][start], pixels[y][start], 255),
+        1 => (current[start], current[start], current[start], 255),
         2 => (
-          pixels[y][start],
-          pixels[y][start],
-          pixels[y][start],
-          pixels[y][start + 1],
+          current[start],
+          current[start],
+          current[start],
+          current[start + 1],
         ),
-        3 => (
-          pixels[y][start],
-          pixels[y][start + 1],
-          pixels[y][start + 2],
-          255,
-        ),
+        3 => (current[start], current[start + 1], current[start + 2], 255),
         4 => (
-          pixels[y][start],
-          pixels[y][start + 1],
-          pixels[y][start + 2],
-          pixels[y][start + 3],
+          current[start],
+          current[start + 1],
+          current[start + 2],
+          current[start + 3],
         ),
         _ => throw StateError('unreachable'),
       };
       final luminance = (red * 299 + green * 587 + blue * 114) ~/ 1000;
-      ink[y][x] = alpha >= 128 && luminance < 128 ? 1 : 0;
+      if (alpha >= 128 && luminance < 128) {
+        final pixel = y * imageWidth + x;
+        ink[pixel >> 3] |= 1 << (pixel & 7);
+      }
     }
+    final swap = previous;
+    previous = current;
+    current = swap;
   }
   return _Bitmap(imageWidth, imageHeight, ink);
 }
 
-List<_GlyphBounds> _segmentGlyphs(
+Future<List<_GlyphBounds>> _segmentGlyphs(
   _Bitmap image,
   OcrCancellationToken cancellation,
-) {
+) async {
   var top = image.height;
   var bottom = 0;
   for (var y = 0; y < image.height; y++) {
-    cancellation.throwIfCancelled();
-    if (image.ink[y].contains(1)) {
+    if ((y & 63) == 0) await _yieldAndCheck(cancellation);
+    if (image.rowHasInk(y)) {
       if (y < top) top = y;
       bottom = y + 1;
     }
@@ -420,11 +422,11 @@ List<_GlyphBounds> _segmentGlyphs(
   final result = <_GlyphBounds>[];
   int? start;
   for (var x = 0; x <= image.width; x++) {
-    cancellation.throwIfCancelled();
+    if ((x & 63) == 0) await _yieldAndCheck(cancellation);
     var hasInk = false;
     if (x < image.width) {
       for (var y = top; y < bottom; y++) {
-        if (image.ink[y][x] != 0) {
+        if (image.isInk(x, y)) {
           hasInk = true;
           break;
         }
@@ -440,7 +442,11 @@ List<_GlyphBounds> _segmentGlyphs(
   return result;
 }
 
-List<int> _sampleGlyph(_Bitmap image, _GlyphBounds bounds) {
+Future<List<int>> _sampleGlyph(
+  _Bitmap image,
+  _GlyphBounds bounds,
+  OcrCancellationToken cancellation,
+) async {
   final result = <int>[];
   final width = bounds.end - bounds.start;
   final height = bounds.bottom - bounds.top;
@@ -453,8 +459,9 @@ List<int> _sampleGlyph(_Bitmap image, _GlyphBounds bounds) {
       var dark = 0;
       var total = 0;
       for (var y = top; y < bottom; y++) {
+        if ((y & 63) == 0) await _yieldAndCheck(cancellation);
         for (var x = left; x < right; x++) {
-          dark += image.ink[y][x];
+          if (image.isInk(x, y)) dark++;
           total++;
         }
       }
@@ -468,7 +475,19 @@ class _Bitmap {
   const _Bitmap(this.width, this.height, this.ink);
   final int width;
   final int height;
-  final List<Uint8List> ink;
+  final Uint8List ink;
+
+  bool isInk(int x, int y) {
+    final pixel = y * width + x;
+    return (ink[pixel >> 3] & (1 << (pixel & 7))) != 0;
+  }
+
+  bool rowHasInk(int y) {
+    for (var x = 0; x < width; x++) {
+      if (isInk(x, y)) return true;
+    }
+    return false;
+  }
 }
 
 class _GlyphBounds {
@@ -489,15 +508,27 @@ int _paeth(int left, int up, int upLeft) {
   return upLeft;
 }
 
-int _crc32(List<int> bytes) {
+Future<int> _crc32Chunk(
+  List<int> type,
+  List<int> data,
+  OcrCancellationToken cancellation,
+) async {
   var crc = 0xffffffff;
-  for (final byte in bytes) {
+  var processed = 0;
+  for (final byte in <Iterable<int>>[type, data].expand((part) => part)) {
     crc ^= byte;
     for (var bit = 0; bit < 8; bit++) {
       crc = (crc & 1) == 0 ? crc >> 1 : (crc >> 1) ^ 0xedb88320;
     }
+    processed++;
+    if ((processed & 0xffff) == 0) await _yieldAndCheck(cancellation);
   }
   return (crc ^ 0xffffffff) & 0xffffffff;
+}
+
+Future<void> _yieldAndCheck(OcrCancellationToken cancellation) async {
+  await Future<void>.delayed(Duration.zero);
+  cancellation.throwIfCancelled();
 }
 
 List<int> _glyph(String rows) => <int>[
@@ -559,7 +590,8 @@ void _validateLimits(OcrImageLimits limits) {
   if (limits.maxEncodedBytes <= 0 ||
       limits.maxWidth <= 0 ||
       limits.maxHeight <= 0 ||
-      limits.maxPixels <= 0) {
+      limits.maxPixels <= 0 ||
+      limits.maxExpandedBytes <= 0) {
     throw const CoreException(
       CoreErrorCode.validationError,
       'OCR image limits must be positive',

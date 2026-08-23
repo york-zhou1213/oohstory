@@ -1,6 +1,31 @@
 import '../../core/errors.dart';
+import 'dart:typed_data';
 
 List<int> decodeZlib(List<int> bytes, {required int maxOutputBytes}) {
+  final expectedAdler = _validateEnvelope(bytes, maxOutputBytes);
+  final reader = _DeflateReader(bytes, 2, bytes.length - 4, maxOutputBytes);
+  final output = reader.inflate();
+  if (reader.adler32 != expectedAdler) {
+    throw const FormatException('MDX zlib checksum mismatch');
+  }
+  return output;
+}
+
+Future<List<int>> decodeZlibAsync(
+  List<int> bytes, {
+  required int maxOutputBytes,
+  required void Function() checkCancelled,
+}) async {
+  final expectedAdler = _validateEnvelope(bytes, maxOutputBytes);
+  final reader = _DeflateReader(bytes, 2, bytes.length - 4, maxOutputBytes);
+  final output = await reader.inflateAsync(checkCancelled);
+  if (reader.adler32 != expectedAdler) {
+    throw const FormatException('MDX zlib checksum mismatch');
+  }
+  return output;
+}
+
+int _validateEnvelope(List<int> bytes, int maxOutputBytes) {
   if (maxOutputBytes < 0 || bytes.length < 6) {
     throw const FormatException('MDX zlib block is malformed');
   }
@@ -12,22 +37,15 @@ List<int> decodeZlib(List<int> bytes, {required int maxOutputBytes}) {
       (flags & 0x20) != 0) {
     throw const FormatException('MDX zlib header is invalid');
   }
-
-  final expectedAdler =
-      (bytes[bytes.length - 4] << 24) |
+  return (bytes[bytes.length - 4] << 24) |
       (bytes[bytes.length - 3] << 16) |
       (bytes[bytes.length - 2] << 8) |
       bytes[bytes.length - 1];
-  final reader = _DeflateReader(bytes, 2, bytes.length - 4, maxOutputBytes);
-  final output = reader.inflate();
-  if (_adler32(output) != expectedAdler) {
-    throw const FormatException('MDX zlib checksum mismatch');
-  }
-  return output;
 }
 
 class _DeflateReader {
-  _DeflateReader(this.bytes, this.offset, this.end, this.maxOutputBytes);
+  _DeflateReader(this.bytes, this.offset, this.end, this.maxOutputBytes)
+    : _output = Uint8List(maxOutputBytes);
 
   static const List<int> _codeLengthOrder = <int>[
     16,
@@ -183,7 +201,13 @@ class _DeflateReader {
   final int maxOutputBytes;
   int _bits = 0;
   int _bitCount = 0;
-  final List<int> _output = <int>[];
+  final Uint8List _output;
+  int _outputLength = 0;
+  int _adlerFirst = 1;
+  int _adlerSecond = 0;
+  int _nextYield = 64 * 1024;
+
+  int get adler32 => ((_adlerSecond << 16) | _adlerFirst) & 0xffffffff;
 
   List<int> inflate() {
     try {
@@ -205,7 +229,44 @@ class _DeflateReader {
       if (offset != end) {
         throw const FormatException('DEFLATE stream has trailing data');
       }
-      return List<int>.unmodifiable(_output);
+      return Uint8List.sublistView(_output, 0, _outputLength);
+    } on CoreException {
+      rethrow;
+    } on FormatException {
+      rethrow;
+    } on Object {
+      throw const FormatException('MDX zlib block is malformed');
+    }
+  }
+
+  Future<List<int>> inflateAsync(void Function() checkCancelled) async {
+    try {
+      await Future<void>.delayed(Duration.zero);
+      checkCancelled();
+      var isFinal = false;
+      while (!isFinal) {
+        isFinal = _readBits(1) != 0;
+        switch (_readBits(2)) {
+          case 0:
+            await _storedBlockAsync(checkCancelled);
+          case 1:
+            await _compressedBlockAsync(
+              _fixedLiteralTable(),
+              _fixedDistanceTable(),
+              checkCancelled,
+            );
+          case 2:
+            final tables = _dynamicTables();
+            await _compressedBlockAsync(tables.$1, tables.$2, checkCancelled);
+          default:
+            throw const FormatException('Reserved DEFLATE block type');
+        }
+      }
+      if (offset != end) {
+        throw const FormatException('DEFLATE stream has trailing data');
+      }
+      checkCancelled();
+      return Uint8List.sublistView(_output, 0, _outputLength);
     } on CoreException {
       rethrow;
     } on FormatException {
@@ -226,8 +287,30 @@ class _DeflateReader {
       throw const FormatException('Invalid stored DEFLATE block');
     }
     _ensureCapacity(length);
-    _output.addAll(bytes.sublist(offset, offset + length));
-    offset += length;
+    final stop = offset + length;
+    while (offset < stop) {
+      _append(bytes[offset++]);
+    }
+  }
+
+  Future<void> _storedBlockAsync(void Function() checkCancelled) async {
+    _bits = 0;
+    _bitCount = 0;
+    if (offset + 4 > end) throw const FormatException('Truncated block');
+    final length = bytes[offset] | (bytes[offset + 1] << 8);
+    final inverse = bytes[offset + 2] | (bytes[offset + 3] << 8);
+    offset += 4;
+    if ((length ^ 0xffff) != inverse || offset + length > end) {
+      throw const FormatException('Invalid stored DEFLATE block');
+    }
+    _ensureCapacity(length);
+    final stop = offset + length;
+    while (offset < stop) {
+      _append(bytes[offset++]);
+      if (_outputLength >= _nextYield) {
+        await _yieldNow(checkCancelled);
+      }
+    }
   }
 
   void _compressedBlock(_Huffman literals, _Huffman distances) {
@@ -235,7 +318,7 @@ class _DeflateReader {
       final symbol = literals.read(this);
       if (symbol < 256) {
         _ensureCapacity(1);
-        _output.add(symbol);
+        _append(symbol);
         continue;
       }
       if (symbol == 256) return;
@@ -252,12 +335,54 @@ class _DeflateReader {
       final distance =
           _distanceBases[distanceSymbol] +
           _readBits(_distanceExtra[distanceSymbol]);
-      if (distance <= 0 || distance > _output.length) {
+      if (distance <= 0 || distance > _outputLength) {
         throw const FormatException('Invalid DEFLATE back-reference');
       }
       _ensureCapacity(length);
       for (var index = 0; index < length; index++) {
-        _output.add(_output[_output.length - distance]);
+        _append(_output[_outputLength - distance]);
+      }
+    }
+  }
+
+  Future<void> _compressedBlockAsync(
+    _Huffman literals,
+    _Huffman distances,
+    void Function() checkCancelled,
+  ) async {
+    while (true) {
+      final symbol = literals.read(this);
+      if (symbol < 256) {
+        _ensureCapacity(1);
+        _append(symbol);
+        if (_outputLength >= _nextYield) {
+          await _yieldNow(checkCancelled);
+        }
+        continue;
+      }
+      if (symbol == 256) return;
+      if (symbol < 257 || symbol > 285) {
+        throw const FormatException('Invalid DEFLATE length symbol');
+      }
+      final lengthIndex = symbol - 257;
+      final length =
+          _lengthBases[lengthIndex] + _readBits(_lengthExtra[lengthIndex]);
+      final distanceSymbol = distances.read(this);
+      if (distanceSymbol >= _distanceBases.length) {
+        throw const FormatException('Invalid DEFLATE distance symbol');
+      }
+      final distance =
+          _distanceBases[distanceSymbol] +
+          _readBits(_distanceExtra[distanceSymbol]);
+      if (distance <= 0 || distance > _outputLength) {
+        throw const FormatException('Invalid DEFLATE back-reference');
+      }
+      _ensureCapacity(length);
+      for (var index = 0; index < length; index++) {
+        _append(_output[_outputLength - distance]);
+      }
+      if (_outputLength >= _nextYield) {
+        await _yieldNow(checkCancelled);
       }
     }
   }
@@ -270,7 +395,7 @@ class _DeflateReader {
     for (var index = 0; index < codeLengthCount; index++) {
       codeLengths[_codeLengthOrder[index]] = _readBits(3);
     }
-    final codeLengthTable = _Huffman(codeLengths);
+    final codeLengthTable = _Huffman(codeLengths, allowSingleCode: false);
     final lengths = <int>[];
     final total = literalCount + distanceCount;
     while (lengths.length < total) {
@@ -299,10 +424,7 @@ class _DeflateReader {
     if (literalLengths[256] == 0) {
       throw const FormatException('DEFLATE end marker is missing');
     }
-    return (
-      _Huffman(literalLengths),
-      _Huffman(lengths.sublist(literalCount), allowEmpty: true),
-    );
+    return (_Huffman(literalLengths), _Huffman(lengths.sublist(literalCount)));
   }
 
   int _readBits(int count) {
@@ -319,12 +441,26 @@ class _DeflateReader {
   }
 
   void _ensureCapacity(int additional) {
-    if (additional < 0 || additional > maxOutputBytes - _output.length) {
+    if (additional < 0 || additional > maxOutputBytes - _outputLength) {
       throw const CoreException(
         CoreErrorCode.payloadTooLarge,
         'MDX expanded data exceeds the configured size limit',
       );
     }
+  }
+
+  void _append(int value) {
+    _output[_outputLength++] = value;
+    _adlerFirst += value;
+    if (_adlerFirst >= 65521) _adlerFirst -= 65521;
+    _adlerSecond += _adlerFirst;
+    if (_adlerSecond >= 65521) _adlerSecond -= 65521;
+  }
+
+  Future<void> _yieldNow(void Function() checkCancelled) async {
+    _nextYield = _outputLength + 64 * 1024;
+    await Future<void>.delayed(Duration.zero);
+    checkCancelled();
   }
 
   static _Huffman _fixedLiteralTable() => _Huffman(<int>[
@@ -338,7 +474,7 @@ class _DeflateReader {
 }
 
 class _Huffman {
-  _Huffman(List<int> lengths, {bool allowEmpty = false}) {
+  _Huffman(List<int> lengths, {bool allowSingleCode = true}) {
     final counts = List<int>.filled(16, 0);
     for (final length in lengths) {
       if (length < 0 || length > 15) {
@@ -347,13 +483,20 @@ class _Huffman {
       if (length > 0) counts[length]++;
     }
     if (counts.skip(1).every((count) => count == 0)) {
-      if (allowEmpty) return;
       throw const FormatException('Empty Huffman table');
     }
     var available = 1;
     for (var length = 1; length <= 15; length++) {
       available = (available << 1) - counts[length];
       if (available < 0) throw const FormatException('Oversubscribed table');
+    }
+    final symbolCount = counts
+        .skip(1)
+        .fold<int>(0, (sum, count) => sum + count);
+    final isAllowedSingleCode =
+        allowSingleCode && symbolCount == 1 && counts[1] == 1;
+    if (available != 0 && !isAllowedSingleCode) {
+      throw const FormatException('Incomplete Huffman table');
     }
     final nextCode = List<int>.filled(16, 0);
     var code = 0;
@@ -391,15 +534,4 @@ int _reverseBits(int value, int length) {
     reversed = (reversed << 1) | ((value >> index) & 1);
   }
   return reversed;
-}
-
-int _adler32(List<int> bytes) {
-  const modulus = 65521;
-  var first = 1;
-  var second = 0;
-  for (final byte in bytes) {
-    first = (first + byte) % modulus;
-    second = (second + first) % modulus;
-  }
-  return ((second << 16) | first) & 0xffffffff;
 }

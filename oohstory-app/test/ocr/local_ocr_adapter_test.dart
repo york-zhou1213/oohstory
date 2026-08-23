@@ -85,6 +85,45 @@ void main() {
       engine.finish.complete();
     });
 
+    test(
+      'timed cancellation interrupts real 4000x4000 bitmap OCR',
+      () async {
+        final image = _largeGrayscalePng(width: 4000, height: 4000);
+        final adapter = LocalOcrAdapter.portable(platform: 'linux');
+        final watch = Stopwatch()..start();
+        final cancelIssued = Completer<Duration>();
+        final job = adapter.start(image, locale: 'en');
+        Timer(const Duration(milliseconds: 10), () {
+          cancelIssued.complete(watch.elapsed);
+          job.cancel();
+        });
+
+        await expectLater(
+          job.result.timeout(const Duration(seconds: 2)),
+          throwsA(_coreError(CoreErrorCode.validationError)),
+        );
+        final cancelAt = await cancelIssued.future;
+        expect(watch.elapsed - cancelAt, lessThan(const Duration(seconds: 1)));
+        expect(job.isCancelled, isTrue);
+      },
+      timeout: const Timeout(Duration(seconds: 10)),
+    );
+
+    test('rejects oversized RGBA expansion before pixel allocation', () async {
+      final adapter = LocalOcrAdapter.portable(platform: 'linux');
+      final image = _pngFile(
+        width: 4000,
+        height: 4000,
+        colorType: 6,
+        compressedPixels: ZLibCodec().encode(const <int>[]),
+      );
+
+      await expectLater(
+        adapter.recognize(image, locale: 'en'),
+        throwsA(_coreError(CoreErrorCode.payloadTooLarge)),
+      );
+    });
+
     test('reports unsupported platforms without a fallback', () async {
       final adapter = LocalOcrAdapter.unavailable(platform: 'web');
 
@@ -241,6 +280,79 @@ Uint8List _png({required int width, required int height}) {
   _writeUint32Be(bytes, 16, width);
   _writeUint32Be(bytes, 20, height);
   return bytes;
+}
+
+Uint8List _largeGrayscalePng({required int width, required int height}) {
+  final row = Uint8List(width + 1)..fillRange(1, width + 1, 0xff);
+  var compressed = const <int>[];
+  final encoder = ZLibCodec(level: 1).encoder.startChunkedConversion(
+    ByteConversionSink.withCallback((bytes) => compressed = bytes),
+  );
+  for (var y = 0; y < height; y++) {
+    encoder.add(row);
+  }
+  encoder.close();
+  return _pngFile(
+    width: width,
+    height: height,
+    colorType: 0,
+    compressedPixels: compressed,
+  );
+}
+
+Uint8List _pngFile({
+  required int width,
+  required int height,
+  required int colorType,
+  required List<int> compressedPixels,
+}) {
+  final header = Uint8List(13);
+  _writeUint32Be(header, 0, width);
+  _writeUint32Be(header, 4, height);
+  header[8] = 8;
+  header[9] = colorType;
+  return Uint8List.fromList(<int>[
+    137,
+    80,
+    78,
+    71,
+    13,
+    10,
+    26,
+    10,
+    ..._pngChunk('IHDR', header),
+    ..._pngChunk('IDAT', compressedPixels),
+    ..._pngChunk('IEND', const <int>[]),
+  ]);
+}
+
+List<int> _pngChunk(String type, List<int> data) {
+  final typeBytes = ascii.encode(type);
+  final checksum = _crc32(<int>[...typeBytes, ...data]);
+  return <int>[
+    ..._uint32(data.length),
+    ...typeBytes,
+    ...data,
+    ..._uint32(checksum),
+  ];
+}
+
+List<int> _uint32(int value) => <int>[
+  (value >> 24) & 0xff,
+  (value >> 16) & 0xff,
+  (value >> 8) & 0xff,
+  value & 0xff,
+];
+
+int _crc32(List<int> bytes) {
+  var crc = 0xffffffff;
+  for (final byte in bytes) {
+    crc ^= byte;
+    for (var bit = 0; bit < 8; bit++) {
+      crc = (crc & 1) == 0 ? crc >> 1 : (crc >> 1) ^ 0xedb88320;
+    }
+  }
+  return (crc ^ 0xffffffff) & 0xffffffff;
 }
 
 void _writeUint32Be(Uint8List bytes, int offset, int value) {
