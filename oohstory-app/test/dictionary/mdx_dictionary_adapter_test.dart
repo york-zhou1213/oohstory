@@ -111,6 +111,61 @@ void main() {
       );
     });
 
+    test('decodes a literal-only dynamic block with no distance codes', () {
+      final compressed = Uint8List.fromList(<int>[
+        0x78,
+        0x9c,
+        0x05,
+        0xc0,
+        0x81,
+        0x08,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x20,
+        0xb6,
+        0xfd,
+        0xa5,
+        0x4e,
+        0x00,
+        0x42,
+        0x00,
+        0x42,
+      ]);
+
+      expect(decodeZlib(compressed, maxOutputBytes: 1), <int>[65]);
+    });
+
+    test('rejects a distance reference when the distance table is empty', () {
+      final malformed = Uint8List.fromList(<int>[
+        0x78,
+        0x9c,
+        0x0d,
+        0x80,
+        0x81,
+        0x08,
+        0x00,
+        0x00,
+        0x00,
+        0x80,
+        0xd8,
+        0xde,
+        0x1f,
+        0xea,
+        0x63,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+      ]);
+
+      expect(
+        () => decodeZlib(malformed, maxOutputBytes: 258),
+        throwsFormatException,
+      );
+    });
+
     test('enforces input, entry and definition boundaries', () {
       final fixture = buildMdxFixture();
       expect(

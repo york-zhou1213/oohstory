@@ -424,7 +424,10 @@ class _DeflateReader {
     if (literalLengths[256] == 0) {
       throw const FormatException('DEFLATE end marker is missing');
     }
-    return (_Huffman(literalLengths), _Huffman(lengths.sublist(literalCount)));
+    return (
+      _Huffman(literalLengths),
+      _Huffman(lengths.sublist(literalCount), allowEmpty: true),
+    );
   }
 
   int _readBits(int count) {
@@ -474,7 +477,11 @@ class _DeflateReader {
 }
 
 class _Huffman {
-  _Huffman(List<int> lengths, {bool allowSingleCode = true}) {
+  _Huffman(
+    List<int> lengths, {
+    bool allowSingleCode = true,
+    bool allowEmpty = false,
+  }) {
     final counts = List<int>.filled(16, 0);
     for (final length in lengths) {
       if (length < 0 || length > 15) {
@@ -483,6 +490,7 @@ class _Huffman {
       if (length > 0) counts[length]++;
     }
     if (counts.skip(1).every((count) => count == 0)) {
+      if (allowEmpty) return;
       throw const FormatException('Empty Huffman table');
     }
     var available = 1;
