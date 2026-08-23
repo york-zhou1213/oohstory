@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:oohstory/adapters/formats/formats.dart';
 import 'package:oohstory/core/core.dart';
@@ -60,6 +62,39 @@ void main() {
     expect(document.sections, <String>['2.jpeg', '10.jpeg']);
   });
 
+  test(
+    'decodes encoded Header with SubStreams and EmptyStream files',
+    () async {
+      // 7-Zip 23.01: 7z a -t7z -mtc=off -mta=off -mtm=off <fixture> ...
+      final fixture = await File(
+        'test/fixtures/formats/cb7-default-header.cb7',
+      ).readAsBytes();
+      final document = await decoder.decode(Stream<List<int>>.value(fixture));
+
+      expect(document.version, 'cb7:7z:3');
+      expect(document.sections, <String>['2.jpg', '10.jpg']);
+
+      await expectLater(
+        const ComicArchiveFormatDecoder(
+          limits: FormatLimits(maxEntryBytes: 150),
+        ).decode(Stream<List<int>>.value(fixture)),
+        throwsA(
+          isA<CoreException>().having(
+            (error) => error.code,
+            'code',
+            CoreErrorCode.payloadTooLarge,
+          ),
+        ),
+      );
+    },
+  );
+
+  test('probe returns false for arbitrary binary TAR lookalikes', () async {
+    final header = List<int>.filled(512, 0)..[257] = 0xff;
+
+    expect(await decoder.probe('application/octet-stream', header), isFalse);
+  });
+
   test('rejects traversal paths before filtering archive entries', () async {
     for (final path in <String>['../escape.jpg', r'C:\escape.jpg']) {
       await expectLater(
@@ -120,23 +155,28 @@ void main() {
     }
   });
 
-  test('rejects encrypted RAR and encoded 7z headers explicitly', () async {
-    for (final fixture in <List<int>>[
-      rar4Fixture(<String, int>{'page.jpg': 1}, encrypted: true),
-      sevenZipFixture(const <String>[], encodedHeader: true),
-    ]) {
-      await expectLater(
-        decoder.decode(Stream<List<int>>.value(fixture)),
-        throwsA(
-          isA<CoreException>().having(
-            (error) => error.code,
-            'code',
-            CoreErrorCode.unsupported,
+  test(
+    'rejects encrypted RAR and AES-encrypted 7z headers explicitly',
+    () async {
+      for (final fixture in <List<int>>[
+        rar4Fixture(<String, int>{'page.jpg': 1}, encrypted: true),
+        await File(
+          'test/fixtures/formats/cb7-encrypted-header.cb7',
+        ).readAsBytes(),
+      ]) {
+        await expectLater(
+          decoder.decode(Stream<List<int>>.value(fixture)),
+          throwsA(
+            isA<CoreException>().having(
+              (error) => error.code,
+              'code',
+              CoreErrorCode.unsupported,
+            ),
           ),
-        ),
-      );
-    }
-  });
+        );
+      }
+    },
+  );
 
   test('enforces entry, page, size, and expansion limits', () async {
     final cases = <({ComicArchiveFormatDecoder decoder, List<int> fixture})>[

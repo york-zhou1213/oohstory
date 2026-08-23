@@ -6,6 +6,7 @@ import '../../core/errors.dart';
 import '../../core/models.dart';
 import '../contracts/adapter_contracts.dart';
 import '_binary.dart';
+import '_seven_zip_lzma.dart';
 import 'format_limits.dart';
 
 class ComicArchiveFormatDecoder implements FormatDecoder {
@@ -348,23 +349,67 @@ class ComicArchiveFormatDecoder implements FormatDecoder {
     if (crc32(bytes, nextStart, nextStart + nextSize) != nextCrc) {
       throw const FormatException('7z next header checksum mismatch');
     }
-    final header = ByteCursor(
+    var header = ByteCursor(
       bytes,
       offset: nextStart,
       end: nextStart + nextSize,
     );
     final marker = header.readByte();
     if (marker == 0x17) {
-      throw const CoreException(
-        CoreErrorCode.unsupported,
-        'Encoded or encrypted 7z headers are not supported',
-      );
-    }
-    if (marker != 0x01) {
+      final decoded = _decode7zEncodedHeader(bytes, header);
+      header = ByteCursor(decoded);
+      if (header.readByte() != 0x01) {
+        throw const FormatException('Decoded 7z header marker is invalid');
+      }
+    } else if (marker != 0x01) {
       throw const FormatException('7z header marker is invalid');
     }
-    List<String>? names;
-    var expanded = 0;
+    return _parse7zHeader(header);
+  }
+
+  Uint8List _decode7zEncodedHeader(Uint8List bytes, ByteCursor header) {
+    final streams = _parse7zStreamsInfo(header);
+    final pack = streams.packInfo;
+    final unpack = streams.unpackInfo;
+    if (pack == null || unpack == null || pack.sizes.length != 1) {
+      throw const FormatException('Encoded 7z header stream is invalid');
+    }
+    if (unpack.folders.length != 1) {
+      throw const FormatException('Encoded 7z header must use one folder');
+    }
+    final folder = unpack.folders.single;
+    if (folder.coders.length != 1 ||
+        folder.coders.single.inputs != 1 ||
+        folder.coders.single.outputs != 1) {
+      throw const FormatException('Encoded 7z header coder chain is invalid');
+    }
+    final packedStart = 32 + pack.position;
+    final packedSize = pack.sizes.single;
+    requireRange(bytes, packedStart, packedSize);
+    final packed = bytes.sublist(packedStart, packedStart + packedSize);
+    if (pack.crcs.isDefined(0) && crc32(packed) != pack.crcs.values[0]) {
+      throw const FormatException('Encoded 7z header checksum mismatch');
+    }
+    final coder = folder.coders.single;
+    final unpackedSize = folder.finalOutputSize;
+    _validateExpansion(unpackedSize, packedSize);
+    final decoded = _sameBytes(coder.method, const <int>[0x00])
+        ? Uint8List.fromList(packed)
+        : _sameBytes(coder.method, const <int>[0x03, 0x01, 0x01])
+        ? decodeSevenZipLzma(packed, unpackedSize, coder.properties)
+        : throw const FormatException('Unknown encoded 7z header codec');
+    if (decoded.length != unpackedSize) {
+      throw const FormatException('Encoded 7z header length mismatch');
+    }
+    if (folder.crc != null && crc32(decoded) != folder.crc) {
+      throw const FormatException('Decoded 7z header checksum mismatch');
+    }
+    return decoded;
+  }
+
+  _ArchiveResult _parse7zHeader(ByteCursor header) {
+    _SevenZipStreamsInfo? streams;
+    _SevenZipFilesInfo? files;
     while (header.offset < header.end) {
       final id = header.readByte();
       if (id == 0x00) break;
@@ -377,20 +422,37 @@ class ComicArchiveFormatDecoder implements FormatDecoder {
             'Additional 7z streams are not supported',
           );
         case 0x04:
-          expanded = _parse7zStreamsInfo(header);
+          streams = _parse7zStreamsInfo(header);
         case 0x05:
-          names = _parse7zFilesInfo(header);
+          files = _parse7zFilesInfo(header);
         default:
           throw const FormatException('Unknown 7z header section');
       }
     }
-    if (names == null) throw const FormatException('7z file list is missing');
+    if (files == null) throw const FormatException('7z file list is missing');
+    final streamSizes = streams?.substreamSizes ?? const <int>[];
     final entries = <_ArchiveEntry>[];
-    for (final name in names) {
-      final safePath = _validatePath(name);
-      if (!safePath.endsWith('/')) {
-        _addEntry(entries, safePath, 0, 0, enforceExpanded: false);
+    var streamIndex = 0;
+    var expanded = 0;
+    for (var index = 0; index < files.names.length; index++) {
+      final safePath = _validatePath(files.names[index]);
+      if (files.emptyStreams[index]) {
+        if (!files.emptyFiles[index]) continue;
+        expanded = _addEntry(entries, safePath, 0, expanded);
+      } else {
+        if (streamIndex >= streamSizes.length) {
+          throw const FormatException('7z file stream table is truncated');
+        }
+        expanded = _addEntry(
+          entries,
+          safePath,
+          streamSizes[streamIndex++],
+          expanded,
+        );
       }
+    }
+    if (streamIndex != streamSizes.length) {
+      throw const FormatException('7z file stream table has extra entries');
     }
     return _ArchiveResult('cb7:7z:${entries.length}', entries, expanded);
   }
@@ -403,41 +465,66 @@ class ComicArchiveFormatDecoder implements FormatDecoder {
     }
   }
 
-  int _parse7zStreamsInfo(ByteCursor header) {
-    var expanded = 0;
+  _SevenZipStreamsInfo _parse7zStreamsInfo(ByteCursor header) {
+    _SevenZipPackInfo? packInfo;
     _SevenZipUnpackInfo? unpackInfo;
+    List<int>? substreamSizes;
     while (true) {
       final id = header.readByte();
-      if (id == 0x00) return expanded;
+      if (id == 0x00) {
+        if (unpackInfo != null) {
+          substreamSizes ??= unpackInfo.folders
+              .map((folder) => folder.finalOutputSize)
+              .toList();
+        }
+        return _SevenZipStreamsInfo(
+          packInfo,
+          unpackInfo,
+          substreamSizes ?? const <int>[],
+        );
+      }
       switch (id) {
         case 0x06:
-          _skip7zPackInfo(header);
+          packInfo = _parse7zPackInfo(header);
         case 0x07:
           unpackInfo = _parse7zUnpackInfo(header);
-          expanded = unpackInfo.expandedBytes;
         case 0x08:
           if (unpackInfo == null) {
             throw const FormatException('7z substreams precede folders');
           }
-          _skip7zSubStreamsInfo(header, unpackInfo);
+          substreamSizes = _parse7zSubStreamsInfo(header, unpackInfo);
         default:
           throw const FormatException('Unknown 7z streams section');
       }
     }
   }
 
-  void _skip7zPackInfo(ByteCursor header) {
-    header.read7zUint64();
+  _SevenZipPackInfo _parse7zPackInfo(ByteCursor header) {
+    final position = header.read7zUint64();
     final streams = header.read7zUint64();
+    if (streams > limits.maxEntries) {
+      throw const CoreException(
+        CoreErrorCode.payloadTooLarge,
+        '7z archive exceeds the configured stream limit',
+      );
+    }
+    List<int>? sizes;
+    var crcs = _SevenZipDigests.undefined(streams);
     while (true) {
       final id = header.readByte();
-      if (id == 0x00) return;
+      if (id == 0x00) {
+        if (sizes == null || sizes.length != streams) {
+          throw const FormatException('7z pack sizes are missing');
+        }
+        return _SevenZipPackInfo(position, sizes, crcs);
+      }
       if (id == 0x09) {
+        sizes = <int>[];
         for (var index = 0; index < streams; index++) {
-          header.read7zUint64();
+          sizes.add(header.read7zUint64());
         }
       } else if (id == 0x0a) {
-        _skip7zDigests(header, streams);
+        crcs = _read7zDigests(header, streams);
       } else {
         throw const FormatException('Unknown 7z pack property');
       }
@@ -449,6 +536,12 @@ class ComicArchiveFormatDecoder implements FormatDecoder {
       throw const FormatException('7z folder section is missing');
     }
     final folders = header.read7zUint64();
+    if (folders > limits.maxEntries) {
+      throw const CoreException(
+        CoreErrorCode.payloadTooLarge,
+        '7z archive exceeds the configured folder limit',
+      );
+    }
     if (header.readByte() != 0) {
       throw const CoreException(
         CoreErrorCode.unsupported,
@@ -456,41 +549,63 @@ class ComicArchiveFormatDecoder implements FormatDecoder {
       );
     }
     final outputCounts = <int>[];
+    final parsedFolders = <_SevenZipFolder>[];
     for (var index = 0; index < folders; index++) {
-      outputCounts.add(_parse7zFolder(header));
+      final folder = _parse7zFolder(header);
+      parsedFolders.add(folder);
+      outputCounts.add(folder.outputCount);
     }
     if (header.readByte() != 0x0c) {
       throw const FormatException('7z unpack sizes are missing');
     }
-    var expanded = 0;
-    for (final outputs in outputCounts) {
+    for (
+      var folderIndex = 0;
+      folderIndex < outputCounts.length;
+      folderIndex++
+    ) {
+      final sizes = <int>[];
+      final outputs = outputCounts[folderIndex];
       for (var index = 0; index < outputs; index++) {
-        expanded += header.read7zUint64();
-        if (expanded > limits.maxExpandedBytes) {
-          throw const CoreException(
-            CoreErrorCode.payloadTooLarge,
-            'Comic archive exceeds the configured expansion limit',
-          );
-        }
+        sizes.add(header.read7zUint64());
       }
+      parsedFolders[folderIndex].outputSizes = sizes;
     }
-    var folderCrcDefined = List<bool>.filled(folders, false);
+    var folderCrc = _SevenZipDigests.undefined(folders);
     final next = header.readByte();
     if (next == 0x0a) {
-      folderCrcDefined = _skip7zDigests(header, folders);
+      folderCrc = _read7zDigests(header, folders);
       if (header.readByte() != 0x00) {
         throw const FormatException('7z unpack section is not terminated');
       }
     } else if (next != 0x00) {
       throw const FormatException('Unknown 7z unpack property');
     }
-    return _SevenZipUnpackInfo(expanded, folderCrcDefined);
+    var expanded = 0;
+    for (var index = 0; index < parsedFolders.length; index++) {
+      final folder = parsedFolders[index];
+      if (folderCrc.isDefined(index)) folder.crc = folderCrc.values[index];
+      expanded += folder.finalOutputSize;
+      if (expanded > limits.maxExpandedBytes) {
+        throw const CoreException(
+          CoreErrorCode.payloadTooLarge,
+          'Comic archive exceeds the configured expansion limit',
+        );
+      }
+    }
+    return _SevenZipUnpackInfo(parsedFolders);
   }
 
-  int _parse7zFolder(ByteCursor header) {
+  _SevenZipFolder _parse7zFolder(ByteCursor header) {
     final coders = header.read7zUint64();
+    if (coders < 1 || coders > limits.maxEntries) {
+      throw const CoreException(
+        CoreErrorCode.payloadTooLarge,
+        '7z folder exceeds the configured coder limit',
+      );
+    }
     var totalInputs = 0;
     var totalOutputs = 0;
+    final parsedCoders = <_SevenZipCoder>[];
     for (var index = 0; index < coders; index++) {
       final flags = header.readByte();
       final codec = header.readBytes(flags & 0x0f);
@@ -506,7 +621,12 @@ class ComicArchiveFormatDecoder implements FormatDecoder {
         inputs = header.read7zUint64();
         outputs = header.read7zUint64();
       }
-      if ((flags & 0x20) != 0) header.skip(header.read7zUint64());
+      if (inputs < 1 || outputs < 1) {
+        throw const FormatException('Invalid 7z coder stream count');
+      }
+      final properties = (flags & 0x20) != 0
+          ? header.readBytes(header.read7zUint64())
+          : const <int>[];
       if ((flags & 0x80) != 0) {
         throw const CoreException(
           CoreErrorCode.unsupported,
@@ -515,12 +635,24 @@ class ComicArchiveFormatDecoder implements FormatDecoder {
       }
       totalInputs += inputs;
       totalOutputs += outputs;
+      if (totalInputs > limits.maxEntries || totalOutputs > limits.maxEntries) {
+        throw const CoreException(
+          CoreErrorCode.payloadTooLarge,
+          '7z folder exceeds the configured stream limit',
+        );
+      }
+      parsedCoders.add(_SevenZipCoder(codec, properties, inputs, outputs));
     }
     final bindPairs = totalOutputs - 1;
+    final boundOutputs = <int>{};
     for (var index = 0; index < bindPairs; index++) {
-      header
-        ..read7zUint64()
-        ..read7zUint64();
+      final output = header.read7zUint64();
+      final input = header.read7zUint64();
+      if (output >= totalOutputs ||
+          input >= totalInputs ||
+          !boundOutputs.add(output)) {
+        throw const FormatException('Invalid 7z folder bind pair');
+      }
     }
     final packedStreams = totalInputs - bindPairs;
     if (packedStreams > 1) {
@@ -528,45 +660,79 @@ class ComicArchiveFormatDecoder implements FormatDecoder {
         header.read7zUint64();
       }
     }
-    return totalOutputs;
+    final finalOutputs = <int>[
+      for (var index = 0; index < totalOutputs; index++)
+        if (!boundOutputs.contains(index)) index,
+    ];
+    if (finalOutputs.length != 1) {
+      throw const FormatException('7z folder has no final output stream');
+    }
+    return _SevenZipFolder(parsedCoders, totalOutputs, finalOutputs.single);
   }
 
-  void _skip7zSubStreamsInfo(
+  List<int> _parse7zSubStreamsInfo(
     ByteCursor header,
     _SevenZipUnpackInfo unpackInfo,
   ) {
-    final streams = List<int>.filled(unpackInfo.folderCrcDefined.length, 1);
+    final streams = List<int>.filled(unpackInfo.folders.length, 1);
     var id = header.readByte();
     if (id == 0x0d) {
+      var total = 0;
       for (var index = 0; index < streams.length; index++) {
         streams[index] = header.read7zUint64();
-      }
-      id = header.readByte();
-    }
-    if (id == 0x09) {
-      for (final count in streams) {
-        for (var index = 1; index < count; index++) {
-          header.read7zUint64();
+        total += streams[index];
+        if (total > limits.maxEntries) {
+          throw const CoreException(
+            CoreErrorCode.payloadTooLarge,
+            '7z archive exceeds the configured stream limit',
+          );
         }
       }
       id = header.readByte();
+    }
+    final sizes = <int>[];
+    if (id == 0x09) {
+      for (var folderIndex = 0; folderIndex < streams.length; folderIndex++) {
+        final count = streams[folderIndex];
+        var remaining = unpackInfo.folders[folderIndex].finalOutputSize;
+        for (var index = 1; index < count; index++) {
+          final size = header.read7zUint64();
+          if (size > remaining) {
+            throw const FormatException('Invalid 7z substream size');
+          }
+          sizes.add(size);
+          remaining -= size;
+        }
+        if (count > 0) sizes.add(remaining);
+      }
+      id = header.readByte();
+    } else {
+      if (streams.any((count) => count > 1)) {
+        throw const FormatException('7z substream sizes are missing');
+      }
+      for (var index = 0; index < streams.length; index++) {
+        if (streams[index] == 1) {
+          sizes.add(unpackInfo.folders[index].finalOutputSize);
+        }
+      }
     }
     if (id == 0x0a) {
       var digests = 0;
       for (var index = 0; index < streams.length; index++) {
-        if (streams[index] != 1 || !unpackInfo.folderCrcDefined[index]) {
+        if (streams[index] != 1 || unpackInfo.folders[index].crc == null) {
           digests += streams[index];
         }
       }
-      _skip7zDigests(header, digests);
+      _read7zDigests(header, digests);
       id = header.readByte();
     }
     if (id != 0x00) {
       throw const FormatException('Unknown 7z substreams property');
     }
+    return sizes;
   }
 
-  List<bool> _skip7zDigests(ByteCursor header, int count) {
+  _SevenZipDigests _read7zDigests(ByteCursor header, int count) {
     final allDefined = header.readByte();
     final definitions = List<bool>.filled(count, allDefined != 0);
     if (allDefined == 0) {
@@ -577,11 +743,17 @@ class ComicArchiveFormatDecoder implements FormatDecoder {
         }
       }
     }
-    header.skip(definitions.where((defined) => defined).length * 4);
-    return definitions;
+    final values = List<int>.filled(count, 0);
+    for (var index = 0; index < count; index++) {
+      if (definitions[index]) {
+        final bytes = header.readBytes(4);
+        values[index] = uint32Le(bytes, 0);
+      }
+    }
+    return _SevenZipDigests(definitions, values);
   }
 
-  List<String> _parse7zFilesInfo(ByteCursor header) {
+  _SevenZipFilesInfo _parse7zFilesInfo(ByteCursor header) {
     final count = header.read7zUint64();
     if (count > limits.maxEntries) {
       throw const CoreException(
@@ -590,6 +762,8 @@ class ComicArchiveFormatDecoder implements FormatDecoder {
       );
     }
     List<String>? names;
+    var emptyStreams = List<bool>.filled(count, false);
+    var emptyFiles = List<bool>.filled(count, false);
     while (true) {
       final property = header.readByte();
       if (property == 0x00) break;
@@ -598,8 +772,13 @@ class ComicArchiveFormatDecoder implements FormatDecoder {
       if (end > header.end) {
         throw const FormatException('7z file property is truncated');
       }
+      final propertyHeader = ByteCursor(
+        header.bytes,
+        offset: header.offset,
+        end: end,
+      );
       if (property == 0x11) {
-        if (header.readByte() != 0) {
+        if (propertyHeader.readByte() != 0) {
           throw const CoreException(
             CoreErrorCode.unsupported,
             'External 7z filenames are not supported',
@@ -607,9 +786,9 @@ class ComicArchiveFormatDecoder implements FormatDecoder {
         }
         final units = <int>[];
         final decoded = <String>[];
-        while (header.offset < end) {
-          final low = header.readByte();
-          final high = header.readByte();
+        while (propertyHeader.offset < end) {
+          final low = propertyHeader.readByte();
+          final high = propertyHeader.readByte();
           final unit = low | (high << 8);
           if (unit == 0) {
             decoded.add(String.fromCharCodes(units));
@@ -622,11 +801,31 @@ class ComicArchiveFormatDecoder implements FormatDecoder {
           throw const FormatException('7z filename table is invalid');
         }
         names = decoded;
+      } else if (property == 0x0e) {
+        emptyStreams = _read7zBoolVector(propertyHeader, count);
+      } else if (property == 0x0f) {
+        final emptyCount = emptyStreams.where((empty) => empty).length;
+        final compact = _read7zBoolVector(propertyHeader, emptyCount);
+        var compactIndex = 0;
+        for (var index = 0; index < count; index++) {
+          if (emptyStreams[index]) emptyFiles[index] = compact[compactIndex++];
+        }
       }
       header.offset = end;
     }
     if (names == null) throw const FormatException('7z filenames are missing');
-    return names;
+    return _SevenZipFilesInfo(names, emptyStreams, emptyFiles);
+  }
+
+  List<bool> _read7zBoolVector(ByteCursor header, int count) {
+    final values = List<bool>.filled(count, false);
+    for (var index = 0; index < (count + 7) ~/ 8; index++) {
+      final bits = header.readByte();
+      for (var bit = 0; bit < 8 && index * 8 + bit < count; bit++) {
+        values[index * 8 + bit] = (bits & (0x80 >> bit)) != 0;
+      }
+    }
+    return values;
   }
 
   int _addEntry(
@@ -765,7 +964,14 @@ class ComicArchiveFormatDecoder implements FormatDecoder {
   bool _digit(int codeUnit) => codeUnit >= 0x30 && codeUnit <= 0x39;
 
   bool _isTar(List<int> bytes) =>
-      bytes.length >= 512 && ascii.decode(bytes.sublist(257, 262)) == 'ustar';
+      bytes.length >= 512 &&
+      _sameBytes(bytes.sublist(257, 262), const <int>[
+        0x75,
+        0x73,
+        0x74,
+        0x61,
+        0x72,
+      ]);
 
   String _tarText(List<int> bytes, int offset, int length) {
     final field = bytes.sublist(offset, offset + length);
@@ -814,8 +1020,75 @@ class _ArchiveResult {
 }
 
 class _SevenZipUnpackInfo {
-  const _SevenZipUnpackInfo(this.expandedBytes, this.folderCrcDefined);
+  const _SevenZipUnpackInfo(this.folders);
 
-  final int expandedBytes;
-  final List<bool> folderCrcDefined;
+  final List<_SevenZipFolder> folders;
+}
+
+class _SevenZipStreamsInfo {
+  const _SevenZipStreamsInfo(
+    this.packInfo,
+    this.unpackInfo,
+    this.substreamSizes,
+  );
+
+  final _SevenZipPackInfo? packInfo;
+  final _SevenZipUnpackInfo? unpackInfo;
+  final List<int> substreamSizes;
+}
+
+class _SevenZipPackInfo {
+  const _SevenZipPackInfo(this.position, this.sizes, this.crcs);
+
+  final int position;
+  final List<int> sizes;
+  final _SevenZipDigests crcs;
+}
+
+class _SevenZipDigests {
+  const _SevenZipDigests(this.defined, this.values);
+
+  factory _SevenZipDigests.undefined(int count) => _SevenZipDigests(
+    List<bool>.filled(count, false),
+    List<int>.filled(count, 0),
+  );
+
+  final List<bool> defined;
+  final List<int> values;
+
+  bool isDefined(int index) => defined[index];
+}
+
+class _SevenZipCoder {
+  const _SevenZipCoder(this.method, this.properties, this.inputs, this.outputs);
+
+  final List<int> method;
+  final List<int> properties;
+  final int inputs;
+  final int outputs;
+}
+
+class _SevenZipFolder {
+  _SevenZipFolder(this.coders, this.outputCount, this.finalOutputIndex);
+
+  final List<_SevenZipCoder> coders;
+  final int outputCount;
+  final int finalOutputIndex;
+  List<int> outputSizes = const <int>[];
+  int? crc;
+
+  int get finalOutputSize {
+    if (finalOutputIndex >= outputSizes.length) {
+      throw const FormatException('7z folder output size is missing');
+    }
+    return outputSizes[finalOutputIndex];
+  }
+}
+
+class _SevenZipFilesInfo {
+  const _SevenZipFilesInfo(this.names, this.emptyStreams, this.emptyFiles);
+
+  final List<String> names;
+  final List<bool> emptyStreams;
+  final List<bool> emptyFiles;
 }
