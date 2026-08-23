@@ -108,29 +108,83 @@ final class PackageHttpTransport implements CloudHttpTransport {
     CancellationToken? cancellationToken,
   }) async {
     cancellationToken?.throwIfCancelled();
-    final outgoing = http.AbortableStreamedRequest(
+    final stopBody = Completer<void>();
+    final stopSignal = cancellationToken == null
+        ? stopBody.future
+        : Future.any<void>(<Future<void>>[
+            stopBody.future,
+            cancellationToken.whenCancelled,
+          ]);
+    final outgoing = _CloudStreamedRequest(
       request.method,
       request.uri,
-      abortTrigger: cancellationToken?.whenCancelled,
+      abortTrigger: stopSignal,
     )..followRedirects = false;
     if (request.contentLength != null) {
       outgoing.contentLength = request.contentLength!;
     }
     outgoing.headers.addAll(request.headers);
-    final body = request.bodyFactory?.call();
-    if (body != null) {
-      await for (final chunk in body) {
-        cancellationToken?.throwIfCancelled();
-        outgoing.sink.add(chunk);
-      }
-    }
-    await outgoing.sink.close();
+
+    http.StreamedResponse? response;
+    Object? responseError;
+    StackTrace? responseStackTrace;
+    final responseDone =
+        Future<http.StreamedResponse>.sync(
+          () => _client.send(outgoing),
+        ).then<void>(
+          (value) => response = value,
+          onError: (Object error, StackTrace stackTrace) {
+            responseError = error;
+            responseStackTrace = stackTrace;
+            if (!stopBody.isCompleted) stopBody.complete();
+          },
+        );
+
+    await Future.any<void>(<Future<void>>[
+      outgoing.whenListening,
+      responseDone,
+      stopSignal,
+    ]);
     cancellationToken?.throwIfCancelled();
-    final response = await _client.send(outgoing);
+    if (responseError != null) {
+      Error.throwWithStackTrace(responseError!, responseStackTrace!);
+    }
+    if (!outgoing.isListening) {
+      throw StateError('HTTP client completed without consuming the request');
+    }
+
+    Object? bodyError;
+    StackTrace? bodyStackTrace;
+    final bodyDone =
+        _writeRequestBody(
+          outgoing,
+          request.bodyFactory,
+          stopSignal,
+          cancellationToken,
+          () {
+            if (!stopBody.isCompleted) stopBody.complete();
+          },
+        ).then<void>(
+          (_) {},
+          onError: (Object error, StackTrace stackTrace) {
+            bodyError = error;
+            bodyStackTrace = stackTrace;
+            if (!stopBody.isCompleted) stopBody.complete();
+          },
+        );
+
+    await Future.wait<void>(<Future<void>>[responseDone, bodyDone]);
+    cancellationToken?.throwIfCancelled();
+    if (bodyError != null) {
+      Error.throwWithStackTrace(bodyError!, bodyStackTrace!);
+    }
+    if (responseError != null) {
+      Error.throwWithStackTrace(responseError!, responseStackTrace!);
+    }
     return CloudHttpResponse(
-      statusCode: response.statusCode,
-      headers: response.headers,
-      body: response.stream.transform(
+      statusCode: response!.statusCode,
+      headers: response!.headers,
+      body: response!.stream.transform(
         StreamTransformer<List<int>, List<int>>.fromHandlers(
           handleData: (chunk, sink) {
             try {
@@ -143,6 +197,87 @@ final class PackageHttpTransport implements CloudHttpTransport {
         ),
       ),
     );
+  }
+
+  Future<void> _writeRequestBody(
+    _CloudStreamedRequest outgoing,
+    Stream<List<int>> Function()? bodyFactory,
+    Future<void> stopSignal,
+    CancellationToken? cancellationToken,
+    void Function() stopRequest,
+  ) async {
+    Object? bodyError;
+    StackTrace? bodyStackTrace;
+    try {
+      final body = bodyFactory?.call();
+      if (body != null) {
+        await outgoing.sink.addStream(_untilStopped(body, stopSignal));
+      }
+    } on Object catch (error, stackTrace) {
+      bodyError = error;
+      bodyStackTrace = stackTrace;
+      stopRequest();
+    }
+
+    Object? closeError;
+    StackTrace? closeStackTrace;
+    final closeDone = outgoing.sink.close().then<void>(
+      (_) {},
+      onError: (Object error, StackTrace stackTrace) {
+        closeError = error;
+        closeStackTrace = stackTrace;
+      },
+    );
+    await closeDone;
+    cancellationToken?.throwIfCancelled();
+    if (bodyError != null) {
+      Error.throwWithStackTrace(bodyError, bodyStackTrace!);
+    }
+    if (closeError != null) {
+      Error.throwWithStackTrace(closeError!, closeStackTrace!);
+    }
+  }
+
+  Stream<List<int>> _untilStopped(
+    Stream<List<int>> body,
+    Future<void> stopSignal,
+  ) async* {
+    final iterator = StreamIterator<List<int>>(body);
+    try {
+      while (true) {
+        final event = await Future.any<int>(<Future<int>>[
+          iterator.moveNext().then((hasNext) => hasNext ? 1 : 0),
+          stopSignal.then((_) => -1),
+        ]);
+        if (event <= 0) return;
+        yield iterator.current;
+      }
+    } finally {
+      await iterator.cancel();
+    }
+  }
+}
+
+final class _CloudStreamedRequest extends http.BaseRequest with http.Abortable {
+  _CloudStreamedRequest(super.method, super.url, {this.abortTrigger});
+
+  @override
+  final Future<void>? abortTrigger;
+
+  final Completer<void> _listening = Completer<void>();
+  late final StreamController<List<int>> _body = StreamController<List<int>>(
+    sync: true,
+    onListen: () => _listening.complete(),
+  );
+
+  StreamSink<List<int>> get sink => _body.sink;
+  Future<void> get whenListening => _listening.future;
+  bool get isListening => _listening.isCompleted;
+
+  @override
+  http.ByteStream finalize() {
+    super.finalize();
+    return http.ByteStream(_body.stream);
   }
 }
 
