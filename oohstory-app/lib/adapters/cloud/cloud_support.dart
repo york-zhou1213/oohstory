@@ -194,6 +194,13 @@ final class PackageHttpTransport implements CloudHttpTransport {
               sink.addError(error, stackTrace);
             }
           },
+          handleError: (error, stackTrace, sink) {
+            if (cancellationToken?.isCancelled ?? false) {
+              sink.addError(const CloudOperationCancelled(), stackTrace);
+              return;
+            }
+            sink.addError(error, stackTrace);
+          },
         ),
       ),
     );

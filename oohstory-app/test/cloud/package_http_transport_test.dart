@@ -2,6 +2,7 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -73,6 +74,96 @@ void main() {
       final response = await sent.timeout(const Duration(seconds: 1));
       expect(response.statusCode, HttpStatus.created);
     });
+
+    test(
+      'maps cancellation after response headers to the domain error',
+      () async {
+        final rawServer = await ServerSocket.bind(
+          InternetAddress.loopbackIPv4,
+          0,
+        );
+        Socket? acceptedSocket;
+        addTearDown(() async {
+          acceptedSocket?.destroy();
+          await rawServer.close();
+        });
+        final releaseBody = Completer<void>();
+        final serverDone = Completer<void>();
+        final token = CancellationToken();
+        rawServer.listen((socket) async {
+          acceptedSocket = socket;
+          try {
+            final requestHead = Completer<String>();
+            var received = '';
+            socket.listen(
+              (bytes) {
+                received += ascii.decode(bytes);
+                if (!requestHead.isCompleted && received.contains('\r\n\r\n')) {
+                  requestHead.complete(received);
+                }
+              },
+              onError: (Object error, StackTrace stackTrace) {
+                if (!requestHead.isCompleted) {
+                  requestHead.completeError(error, stackTrace);
+                }
+              },
+              onDone: () {
+                if (!requestHead.isCompleted) {
+                  requestHead.completeError(
+                    StateError('Client closed before sending request headers'),
+                  );
+                }
+              },
+            );
+            expect(
+              await requestHead.future.timeout(const Duration(seconds: 1)),
+              startsWith('GET /slow-download HTTP/1.1\r\n'),
+            );
+            socket.add(
+              ascii.encode(
+                'HTTP/1.1 200 OK\r\n'
+                'Content-Length: 3\r\n'
+                'Connection: close\r\n\r\n',
+              ),
+            );
+            await socket.flush();
+            await releaseBody.future;
+            socket.add(<int>[1, 2, 3]);
+            await socket.flush();
+            await socket.close();
+          } on Object catch (error, stackTrace) {
+            if (!token.isCancelled) {
+              serverDone.completeError(error, stackTrace);
+            }
+          } finally {
+            if (!serverDone.isCompleted) serverDone.complete();
+          }
+        });
+
+        final response = await transport
+            .send(
+              CloudHttpRequest(
+                method: 'GET',
+                uri: Uri.parse(
+                  'http://${rawServer.address.address}:'
+                  '${rawServer.port}/slow-download',
+                ),
+              ),
+              cancellationToken: token,
+            )
+            .timeout(const Duration(seconds: 1));
+
+        final bodyDone = response.body.drain<void>();
+        token.cancel();
+
+        await expectLater(
+          bodyDone.timeout(const Duration(seconds: 1)),
+          throwsA(isA<CloudOperationCancelled>()),
+        );
+        releaseBody.complete();
+        await serverDone.future.timeout(const Duration(seconds: 1));
+      },
+    );
   });
 
   test(
@@ -167,6 +258,21 @@ void main() {
     );
     await bodyCancelled.future.timeout(const Duration(seconds: 1));
   });
+
+  test('preserves response body errors when not cancelled', () async {
+    final error = StateError('response body failed');
+    final response =
+        await PackageHttpTransport(
+          client: _ResponseBodyFailingClient(error),
+        ).send(
+          CloudHttpRequest(
+            method: 'GET',
+            uri: Uri.parse('https://fixture.test/download'),
+          ),
+        );
+
+    await expectLater(response.body.drain<void>(), throwsA(same(error)));
+  });
 }
 
 Uri _serverUri(HttpServer server, String path) =>
@@ -204,5 +310,17 @@ final class _FailingAfterListenClient extends http.BaseClient {
       throw error;
     }
     throw StateError('request body ended before transport failure');
+  }
+}
+
+final class _ResponseBodyFailingClient extends http.BaseClient {
+  _ResponseBodyFailingClient(this.error);
+
+  final Object error;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    await request.finalize().drain<void>();
+    return http.StreamedResponse(Stream<List<int>>.error(error), 200);
   }
 }
