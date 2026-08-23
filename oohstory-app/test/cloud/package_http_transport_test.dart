@@ -273,6 +273,31 @@ void main() {
 
     await expectLater(response.body.drain<void>(), throwsA(same(error)));
   });
+
+  test('preserves response body errors after cancellation', () async {
+    final error = StateError('response body failed after cancellation');
+    final stackTrace = StackTrace.current;
+    final token = CancellationToken();
+    final response =
+        await PackageHttpTransport(
+          client: _ResponseBodyFailingClient(error, stackTrace),
+        ).send(
+          CloudHttpRequest(
+            method: 'GET',
+            uri: Uri.parse('https://fixture.test/download'),
+          ),
+          cancellationToken: token,
+        );
+    token.cancel();
+
+    try {
+      await response.body.drain<void>();
+      fail('Expected the response body error');
+    } on Object catch (caughtError, caughtStackTrace) {
+      expect(caughtError, same(error));
+      expect(caughtStackTrace, same(stackTrace));
+    }
+  });
 }
 
 Uri _serverUri(HttpServer server, String path) =>
@@ -314,13 +339,17 @@ final class _FailingAfterListenClient extends http.BaseClient {
 }
 
 final class _ResponseBodyFailingClient extends http.BaseClient {
-  _ResponseBodyFailingClient(this.error);
+  _ResponseBodyFailingClient(this.error, [this.stackTrace]);
 
   final Object error;
+  final StackTrace? stackTrace;
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
     await request.finalize().drain<void>();
-    return http.StreamedResponse(Stream<List<int>>.error(error), 200);
+    return http.StreamedResponse(
+      Stream<List<int>>.error(error, stackTrace),
+      200,
+    );
   }
 }
