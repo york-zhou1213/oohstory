@@ -66,6 +66,29 @@ void main() {
     expect(retry, same(first));
   });
 
+  test('reference transport validates exact update retry If-Match', () async {
+    final transport = InMemoryProgressTransport();
+    await transport.put(record());
+    final updated = await transport.put(record(revision: 1), ifMatch: 0);
+
+    expect(await transport.put(record(revision: 1), ifMatch: 0), same(updated));
+    for (final request in <Future<ProgressRecord> Function()>[
+      () => transport.put(record(revision: 1)),
+      () => transport.put(record(revision: 1), ifMatch: 999),
+    ]) {
+      await expectLater(
+        request(),
+        throwsA(
+          isA<CoreException>().having(
+            (error) => error.code,
+            'code',
+            CoreErrorCode.revisionConflict,
+          ),
+        ),
+      );
+    }
+  });
+
   test('reference transport retries delete idempotently', () async {
     final transport = InMemoryProgressTransport();
     await transport.put(record());

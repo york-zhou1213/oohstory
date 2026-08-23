@@ -51,7 +51,7 @@ class ProgressRecord {
     r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
   );
   static final RegExp _utcTimestamp = RegExp(
-    r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$',
+    r'^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|\+00:00)$',
   );
 
   final String bookId;
@@ -66,8 +66,23 @@ class ProgressRecord {
   factory ProgressRecord.fromJson(Map<String, Object?> json) {
     try {
       final timestamp = json['updated_at'] as String;
-      if (!_utcTimestamp.hasMatch(timestamp)) {
+      final match = _utcTimestamp.firstMatch(timestamp);
+      if (match == null) {
         throw const FormatException('Timestamp must be RFC3339 UTC');
+      }
+      final parsedTimestamp = DateTime.parse(timestamp);
+      final fields = <int>[
+        parsedTimestamp.year,
+        parsedTimestamp.month,
+        parsedTimestamp.day,
+        parsedTimestamp.hour,
+        parsedTimestamp.minute,
+        parsedTimestamp.second,
+      ];
+      for (var index = 0; index < fields.length; index++) {
+        if (fields[index] != int.parse(match.group(index + 1)!)) {
+          throw const FormatException('Timestamp date is invalid');
+        }
       }
       return ProgressRecord(
         bookId: json['book_id'] as String,
@@ -75,7 +90,7 @@ class ProgressRecord {
         location: json['location'] as String,
         percentage: (json['percentage'] as num).toDouble(),
         deviceId: json['device_id'] as String,
-        updatedAt: DateTime.parse(timestamp),
+        updatedAt: parsedTimestamp,
         revision: json['revision'] as int,
         tombstone: json['tombstone'] as bool? ?? false,
       );

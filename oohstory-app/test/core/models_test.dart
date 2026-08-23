@@ -5,6 +5,15 @@ import 'package:oohstory/core/core.dart';
 
 void main() {
   final timestamp = DateTime.utc(2026, 8, 23, 1, 2, 3);
+  Map<String, Object?> validPayload() => ProgressRecord(
+    bookId: 'book',
+    documentVersion: 'v1',
+    location: 'page:1',
+    percentage: 0.5,
+    deviceId: '123e4567-e89b-12d3-a456-426614174000',
+    updatedAt: timestamp,
+    revision: 0,
+  ).toJson();
 
   test('progress serialization matches frozen contract deterministically', () {
     final record = ProgressRecord(
@@ -76,15 +85,7 @@ void main() {
   });
 
   test('progress JSON rejects malformed types and non-UTC timestamps', () {
-    final valid = ProgressRecord(
-      bookId: 'book',
-      documentVersion: 'v1',
-      location: 'page:1',
-      percentage: 0.5,
-      deviceId: '123e4567-e89b-12d3-a456-426614174000',
-      updatedAt: timestamp,
-      revision: 0,
-    ).toJson();
+    final valid = validPayload();
 
     for (final payload in <Map<String, Object?>>[
       <String, Object?>{...valid, 'revision': '0'},
@@ -102,6 +103,32 @@ void main() {
         ),
       );
     }
+  });
+
+  test('progress JSON accepts explicit zero offset', () {
+    final record = ProgressRecord.fromJson(<String, Object?>{
+      ...validPayload(),
+      'updated_at': '2026-08-23T01:02:03+00:00',
+    });
+
+    expect(record.updatedAt, timestamp);
+    expect(record.updatedAt.isUtc, isTrue);
+  });
+
+  test('progress JSON rejects out-of-range calendar dates', () {
+    expect(
+      () => ProgressRecord.fromJson(<String, Object?>{
+        ...validPayload(),
+        'updated_at': '2026-02-30T01:02:03Z',
+      }),
+      throwsA(
+        isA<CoreException>().having(
+          (error) => error.code,
+          'code',
+          CoreErrorCode.validationError,
+        ),
+      ),
+    );
   });
 
   test('error envelope uses contract wire code and stable key order', () {

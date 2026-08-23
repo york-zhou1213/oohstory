@@ -89,7 +89,11 @@ class InMemoryProgressTransport implements ProgressTransport {
   @override
   Future<ProgressRecord> put(ProgressRecord record, {int? ifMatch}) async {
     final current = _records[record.bookId];
-    if (current != null && _sameProgress(current, record)) return current;
+    if (current != null &&
+        _sameProgress(current, record) &&
+        ifMatch == (current.revision == 0 ? null : current.revision - 1)) {
+      return current;
+    }
     final validCreate =
         current == null && ifMatch == null && record.revision == 0;
     final validUpdate =
