@@ -55,10 +55,7 @@ final class S3CloudAdapter extends HttpCloudLibraryAdapter {
       if (validCursor != null) 'continuation-token': validCursor,
     };
     final response = await _signed(
-      CloudHttpRequest(
-        method: 'GET',
-        uri: endpointWithSegments(<String>[bucket], queryParameters: query),
-      ),
+      CloudHttpRequest(method: 'GET', uri: _listUri(query)),
       const <int>[],
     );
     await expectStatus(response, const <int>{200});
@@ -183,6 +180,10 @@ final class S3CloudAdapter extends HttpCloudLibraryAdapter {
     ...root.resolve(root.requireDescendant(path)),
   ]);
 
+  Uri _listUri(Map<String, String> query) => endpointWithSegments(<String>[
+    bucket,
+  ]).replace(query: _encodeQuery(query.entries));
+
   Future<CloudHttpResponse> _signed(
     CloudHttpRequest request,
     List<int> payload,
@@ -283,12 +284,17 @@ final class S3CloudAdapter extends HttpCloudLibraryAdapter {
   }
 
   String _canonicalQuery(Uri uri) {
-    final pairs = <MapEntry<String, String>>[];
-    uri.queryParametersAll.forEach((key, values) {
-      for (final value in values) {
-        pairs.add(MapEntry(_encode(key), _encode(value)));
-      }
-    });
+    return _encodeQuery(
+      uri.queryParametersAll.entries.expand(
+        (entry) => entry.value.map((value) => MapEntry(entry.key, value)),
+      ),
+    );
+  }
+
+  String _encodeQuery(Iterable<MapEntry<String, String>> entries) {
+    final pairs = entries
+        .map((entry) => MapEntry(_encode(entry.key), _encode(entry.value)))
+        .toList();
     pairs.sort((left, right) {
       final keyOrder = left.key.compareTo(right.key);
       return keyOrder != 0 ? keyOrder : left.value.compareTo(right.value);

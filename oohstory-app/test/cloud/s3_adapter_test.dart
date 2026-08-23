@@ -212,6 +212,11 @@ void main() {
     });
     final transport = FixtureTransport((request, _) async {
       expect(
+        request.uri.query,
+        'delimiter=%2F&list-type=2&'
+        'prefix=OOHStory%2FMy%20Books%2F%E9%9B%AA%2B%E4%BA%BA%2F',
+      );
+      expect(
         request.headers['authorization'],
         'AWS4-HMAC-SHA256 '
         'Credential=AKIDEXAMPLE/20260823/us-east-1/s3/aws4_request, '
