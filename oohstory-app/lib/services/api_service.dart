@@ -1,27 +1,17 @@
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
-import 'package:http/io_client.dart' as io_client;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/book.dart';
+import 'http_client_factory.dart';
 
-const _appUserAgent = 'OOHStoryApp/1.18 (Flutter; official)';
+const _appUserAgent = 'OOHStoryApp/1.27.0 (Flutter; official)';
 
-class _OOHClient extends http.BaseClient {
+class OohHttpClient extends http.BaseClient {
   late final http.Client _inner;
 
-  _OOHClient() {
-    final httpClient = HttpClient()
-      ..badCertificateCallback = _rejectBadCert
-      ..connectionTimeout = const Duration(seconds: 15)
-      ..idleTimeout = const Duration(seconds: 30);
-    _inner = io_client.IOClient(httpClient);
-  }
-
-  static bool _rejectBadCert(X509Certificate cert, String host, int port) {
-    return false;
-  }
+  OohHttpClient() : _inner = createOohHttpClient();
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) {
@@ -29,7 +19,9 @@ class _OOHClient extends http.BaseClient {
         request.url.scheme != 'https') {
       throw ApiException('不安全的连接已被阻止', 0);
     }
-    request.headers.putIfAbsent('User-Agent', () => _appUserAgent);
+    if (!kIsWeb) {
+      request.headers.putIfAbsent('User-Agent', () => _appUserAgent);
+    }
     return _inner.send(request);
   }
 
@@ -40,7 +32,7 @@ class _OOHClient extends http.BaseClient {
 class ApiService {
   static const String baseUrl = 'https://oohstory.com';
 
-  final http.Client _client = _OOHClient();
+  final http.Client _client = OohHttpClient();
 
   Future<Map<String, dynamic>> _getJson(String path) async {
     final response = await _client.get(Uri.parse('$baseUrl$path'));
@@ -138,6 +130,9 @@ class ApiService {
 
   String coverUrl(String bookId) => '$baseUrl/api/v1/books/$bookId/cover';
 
+  String mediaCoverArtUrl(String bookId) =>
+      '$baseUrl/api/v1/books/$bookId/cover?variant=media-art';
+
   Future<ChapterCatalog> getChapterCatalog(String bookId) async {
     final data = await _getJson('/api/v1/books/$bookId/chapters');
     final list = (data['chapters'] ?? data['items'] ?? []) as List;
@@ -165,9 +160,17 @@ class ApiService {
   }
 
   String fullCoverUrl(String? relativePath) {
-    if (relativePath == null || relativePath.isEmpty) return '';
-    if (relativePath.startsWith('http')) return relativePath;
-    return '$baseUrl$relativePath';
+    final source = relativePath?.trim() ?? '';
+    if (source.isEmpty) return '';
+    final base = Uri.parse(baseUrl);
+    final parsed = Uri.tryParse(source);
+    if (parsed == null) return '';
+    final resolved = parsed.hasScheme ? parsed : base.resolveUri(parsed);
+    if (resolved.scheme != 'https') return '';
+    if (resolved.host == 'www.oohstory.com') {
+      return resolved.replace(host: base.host).toString();
+    }
+    return resolved.toString();
   }
 
   Future<List<Deconstruction>> getDeconstructions() async {
@@ -192,6 +195,21 @@ class ApiService {
         .toList();
   }
 
+  Future<Map<String, dynamic>> getAndroidUpdate({
+    required int versionCode,
+    required String versionName,
+  }) {
+    final params = {
+      'version_code': versionCode.toString(),
+      'version_name': versionName,
+    };
+    final path = Uri(
+      path: '/api/v1/app/android/latest',
+      queryParameters: params,
+    ).toString();
+    return _getJson(path);
+  }
+
   Future<String> audiobookClientId() async {
     final preferences = await SharedPreferences.getInstance();
     const key = 'oohstory_audiobook_client_id';
@@ -214,6 +232,8 @@ class ApiService {
     required String voice,
     required double rate,
     String emotion = 'auto',
+    bool resume = true,
+    int startParagraphIndex = 0,
   }) async {
     final clientId = await audiobookClientId();
     final response = await _client.post(
@@ -231,6 +251,8 @@ class ApiService {
         'voice': voice,
         'emotion': emotion,
         'rate': rate,
+        'resume': resume,
+        'start_paragraph_index': max(0, startParagraphIndex),
       }),
     );
     if (response.statusCode != 201) {
@@ -239,15 +261,107 @@ class ApiService {
     return jsonDecode(response.body) as Map<String, dynamic>;
   }
 
-  Future<Map<String, dynamic>?> prefetchAudiobookNext(String sessionId) async {
+  Future<void> saveAudiobookProgress(
+    String sessionId, {
+    required String chapterId,
+    required int paragraphIndex,
+    required int itemIndex,
+    required int audioOffsetMs,
+  }) async {
+    if (sessionId.isEmpty || chapterId.isEmpty) return;
     final clientId = await audiobookClientId();
+    final response = await _client.put(
+      Uri.parse('$baseUrl/api/v1/audiobook/sessions/$sessionId/progress'),
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Audiobook-Client': clientId,
+      },
+      body: jsonEncode({
+        'chapter_id': int.parse(chapterId),
+        'paragraph_index': max(0, paragraphIndex),
+        'item_index': max(0, itemIndex),
+        'audio_offset_ms': max(0, audioOffsetMs),
+      }),
+    );
+    if (response.statusCode != 204) {
+      throw ApiException('听书进度保存失败', response.statusCode);
+    }
+  }
+
+  Future<Map<String, dynamic>?> prefetchAudiobookNext(
+    String sessionId, {
+    String? fromChapterId,
+  }) async {
+    final clientId = await audiobookClientId();
+    final query = <String, String>{};
+    if (fromChapterId != null && fromChapterId.isNotEmpty) {
+      query['from_chapter_id'] = fromChapterId;
+    }
     final response = await _client.post(
-      Uri.parse('$baseUrl/api/v1/audiobook/sessions/$sessionId/next'),
+      Uri.parse(
+        '$baseUrl/api/v1/audiobook/sessions/$sessionId/next',
+      ).replace(queryParameters: query.isEmpty ? null : query),
       headers: {'X-Audiobook-Client': clientId},
     );
     if (response.statusCode != 200) return null;
     return (jsonDecode(response.body) as Map<String, dynamic>)['next']
         as Map<String, dynamic>?;
+  }
+
+  Future<void> activateAudiobookChapter(
+    String sessionId,
+    String chapterId,
+  ) async {
+    if (sessionId.isEmpty || chapterId.isEmpty) return;
+    final clientId = await audiobookClientId();
+    final response = await _client.post(
+      Uri.parse(
+        '$baseUrl/api/v1/audiobook/sessions/$sessionId/chapters/$chapterId/activate',
+      ),
+      headers: {'X-Audiobook-Client': clientId},
+    );
+    if (response.statusCode != 204) {
+      throw ApiException('听书章节切换失败', response.statusCode);
+    }
+  }
+
+  Uri audiobookContinuousStreamUri(
+    String endpoint, {
+    required int start,
+    required int offsetMs,
+    required String streamId,
+  }) {
+    final uri = Uri.parse(
+      endpoint.startsWith('http') ? endpoint : '$baseUrl$endpoint',
+    );
+    return uri.replace(
+      queryParameters: {
+        ...uri.queryParameters,
+        'start': start.toString(),
+        'offset_ms': offsetMs.toString(),
+        'stream_id': streamId,
+        'continuous': '1',
+        'full_chapter': '1',
+      },
+    );
+  }
+
+  Future<Map<String, dynamic>?> fetchAudiobookTimeline(
+    String sessionId,
+    String manifestHash, {
+    required int start,
+    int limit = 5,
+  }) async {
+    if (sessionId.isEmpty || manifestHash.isEmpty) return null;
+    final clientId = await audiobookClientId();
+    final response = await _client.get(
+      Uri.parse(
+        '$baseUrl/api/v1/audiobook/sessions/$sessionId/chapters/$manifestHash/timeline',
+      ).replace(queryParameters: {'start': '$start', 'limit': '$limit'}),
+      headers: {'X-Audiobook-Client': clientId},
+    );
+    if (response.statusCode != 200) return null;
+    return jsonDecode(response.body) as Map<String, dynamic>;
   }
 
   Future<http.Response> fetchAudiobookSegment(String endpoint) async {

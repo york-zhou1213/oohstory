@@ -40,7 +40,8 @@ android {
         val variant = this
         variant.outputs.all {
             val output = this as com.android.build.gradle.internal.api.BaseVariantOutputImpl
-            output.outputFileName = "OohStory-v${variant.versionName}.apk"
+            output.outputFileName =
+                "OOHStory-v${variant.versionName}+${variant.versionCode}.apk"
         }
     }
 }

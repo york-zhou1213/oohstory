@@ -1,5 +1,5 @@
 import 'dart:convert';
-import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -31,6 +31,14 @@ class AccountUser {
     displayName: json['display_name'] as String? ?? '读者',
     emailVerified: json['email_verified'] as bool? ?? false,
     googleLinked: json['google_linked'] as bool? ?? false,
+  );
+
+  AccountUser copyWith({String? displayName}) => AccountUser(
+    id: id,
+    email: email,
+    displayName: displayName ?? this.displayName,
+    emailVerified: emailVerified,
+    googleLinked: googleLinked,
   );
 }
 
@@ -64,7 +72,7 @@ class AccountService extends ChangeNotifier {
   static const _requestTimeout = Duration(seconds: 20);
   static const _uploadTimeout = Duration(minutes: 4);
 
-  final http.Client _client = http.Client();
+  final http.Client _client = OohHttpClient();
   String? _token;
   AccountUser? user;
   bool initialized = false;
@@ -75,12 +83,23 @@ class AccountService extends ChangeNotifier {
   };
 
   bool get isSignedIn => user != null && _token != null;
+  Map<String, String> get authHeaders => _token == null
+      ? const {}
+      : <String, String>{'Authorization': 'Bearer $_token'};
   bool get googleAvailable =>
-      _webClientId.isNotEmpty && (!Platform.isIOS || _iosClientId.isNotEmpty);
+      _webClientId.isNotEmpty &&
+      (defaultTargetPlatform != TargetPlatform.iOS || _iosClientId.isNotEmpty);
 
   String get platformClient {
-    if (Platform.isIOS) return 'ios';
-    return 'android';
+    if (kIsWeb) return 'web';
+    return switch (defaultTargetPlatform) {
+      TargetPlatform.android => 'android',
+      TargetPlatform.iOS => 'ios',
+      TargetPlatform.macOS => 'macos',
+      TargetPlatform.windows => 'windows',
+      TargetPlatform.linux => 'linux',
+      TargetPlatform.fuchsia => 'fuchsia',
+    };
   }
 
   Future<Map<String, dynamic>> _request(
@@ -188,7 +207,10 @@ class AccountService extends ChangeNotifier {
     if (!googleAvailable) throw const AccountException('Google 登录尚未配置');
     final google = GoogleSignIn(
       scopes: const ['email', 'profile'],
-      clientId: Platform.isIOS && _iosClientId.isNotEmpty ? _iosClientId : null,
+      clientId:
+          defaultTargetPlatform == TargetPlatform.iOS && _iosClientId.isNotEmpty
+          ? _iosClientId
+          : null,
       serverClientId: _webClientId,
     );
     final account = await google.signIn();
@@ -238,24 +260,92 @@ class AccountService extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<Map<String, dynamic>> profile() async {
+    if (!isSignedIn) throw const AccountException('请先登录');
+    return _request('/api/v1/me/profile');
+  }
+
+  Future<Map<String, dynamic>> updateProfile({
+    required String displayName,
+    required String bio,
+    required String gender,
+    String? birthday,
+    required String location,
+  }) async {
+    if (!isSignedIn) throw const AccountException('请先登录');
+    final data = await _request(
+      '/api/v1/me/profile',
+      method: 'PUT',
+      body: {
+        'display_name': displayName.trim(),
+        'bio': bio.trim(),
+        'gender': gender,
+        'birthday': birthday == null || birthday.isEmpty ? null : birthday,
+        'location': location.trim(),
+      },
+    );
+    final profile = Map<String, dynamic>.from(data['profile'] as Map);
+    user = user?.copyWith(displayName: profile['display_name'] as String?);
+    notifyListeners();
+    return data;
+  }
+
+  Future<Map<String, dynamic>> changePassword({
+    required String currentPassword,
+    required String newPassword,
+  }) {
+    if (!isSignedIn) throw const AccountException('请先登录');
+    return _request(
+      '/api/v1/me/password',
+      method: 'POST',
+      body: {'current_password': currentPassword, 'new_password': newPassword},
+    );
+  }
+
+  String avatarUrl(String relative) =>
+      relative.startsWith('http') ? relative : '${ApiService.baseUrl}$relative';
+
+  Future<Map<String, dynamic>> uploadAvatar(String path) async {
+    if (!isSignedIn) throw const AccountException('请先登录');
+    final request = http.MultipartRequest(
+      'POST',
+      Uri.parse('${ApiService.baseUrl}/api/v1/me/avatar'),
+    );
+    request.headers.addAll({'Accept': 'application/json', ...authHeaders});
+    request.files.add(await http.MultipartFile.fromPath('file', path));
+    return _sendMultipart(request, timeout: _uploadTimeout);
+  }
+
+  Future<void> removeAvatar() async {
+    if (!isSignedIn) throw const AccountException('请先登录');
+    await _request('/api/v1/me/avatar', method: 'DELETE');
+  }
+
+  Future<Map<String, dynamic>> readingLevel() async {
+    if (!isSignedIn) throw const AccountException('请先登录');
+    return _request('/api/v1/me/reading-level');
+  }
+
+  Future<Map<String, dynamic>> sendReadingHeartbeat({
+    required String bookId,
+    int activeSeconds = 30,
+  }) async {
+    if (!isSignedIn) return const {};
+    return _request(
+      '/api/v1/me/reading-heartbeat',
+      method: 'POST',
+      body: {
+        'event_id': _uuidV4(),
+        'book_id': bookId,
+        'active_seconds': activeSeconds.clamp(1, 60),
+      },
+    );
+  }
+
   Future<void> mergeLocalState(LocalStorageService storage) async {
     if (!isSignedIn) return;
-    final history = storage
-        .getHistory()
-        .map(
-          (entry) => {
-            'book_id': entry.book.id,
-            'title': entry.book.title,
-            'author': entry.book.author,
-            'cover_url': entry.book.coverUrl ?? '',
-            'chapter_id': int.tryParse(entry.lastChapterId) ?? 1,
-            'progress': 0,
-            'updated_at': DateTime.fromMillisecondsSinceEpoch(
-              entry.lastReadAt,
-            ).toUtc().toIso8601String(),
-          },
-        )
-        .toList();
+    final localHistory = storage.getHistory();
+    final history = localHistory.map(_readingState).toList();
     final favorites = storage
         .getFavorites()
         .map(
@@ -276,10 +366,27 @@ class AccountService extends ChangeNotifier {
       body: {
         'history': history,
         'favorites': favorites,
-        'bookshelf': <dynamic>[],
+        'bookshelf': localHistory.map(_automaticShelfState).toList(),
       },
     );
     storage.mergeCloudState(cloudState);
+    notifyListeners();
+  }
+
+  /// Persist one authoritative reading checkpoint and automatically promote
+  /// the work into the account bookshelf. The API performs partial upserts, so
+  /// this does not replace unrelated account records.
+  Future<void> syncReadingEntry(HistoryEntry entry) async {
+    if (!isSignedIn) return;
+    cloudState = await _request(
+      '/api/v1/me/state',
+      method: 'PUT',
+      body: {
+        'history': [_readingState(entry)],
+        'favorites': <dynamic>[],
+        'bookshelf': [_automaticShelfState(entry)],
+      },
+    );
     notifyListeners();
   }
 
@@ -288,7 +395,12 @@ class AccountService extends ChangeNotifier {
         (item) => item is Map && item['book_id'] == bookId,
       );
 
-  Future<void> setBookCollection(String kind, Book book, bool enabled) async {
+  Future<void> setBookCollection(
+    String kind,
+    Book book,
+    bool enabled, {
+    String note = '',
+  }) async {
     if (!isSignedIn) throw const AccountException('请先登录');
     if (kind != 'favorites' && kind != 'bookshelf') {
       throw const AccountException('记录类型无效');
@@ -300,7 +412,11 @@ class AccountService extends ChangeNotifier {
         body: {
           'history': <dynamic>[],
           'favorites': kind == 'favorites' ? [_bookState(book)] : <dynamic>[],
-          'bookshelf': kind == 'bookshelf' ? [_bookState(book)] : <dynamic>[],
+          'bookshelf': kind == 'bookshelf'
+              ? [
+                  {..._bookState(book), 'note': note.trim()},
+                ]
+              : <dynamic>[],
         },
       );
     } else {
@@ -315,6 +431,44 @@ class AccountService extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> updateBookshelfNote(
+    Map<String, dynamic> item,
+    String note,
+  ) async {
+    if (!isSignedIn) throw const AccountException('请先登录');
+    cloudState = await _request(
+      '/api/v1/me/state',
+      method: 'PUT',
+      body: {
+        'history': <dynamic>[],
+        'favorites': <dynamic>[],
+        'bookshelf': [
+          {
+            'book_id': item['book_id'],
+            'title': item['title'] ?? '',
+            'author': item['author'] ?? '',
+            'cover_url': item['cover_url'] ?? '',
+            'note': note.trim(),
+            'updated_at': DateTime.now().toUtc().toIso8601String(),
+          },
+        ],
+      },
+    );
+    notifyListeners();
+  }
+
+  Future<void> removeState(String kind, String bookId) async {
+    if (!isSignedIn) throw const AccountException('请先登录');
+    await _request('/api/v1/me/state/$kind/$bookId', method: 'DELETE');
+    cloudState = {
+      ...cloudState,
+      kind: (cloudState[kind] as List? ?? const [])
+          .where((item) => item is! Map || item['book_id'] != bookId)
+          .toList(),
+    };
+    notifyListeners();
+  }
+
   Map<String, dynamic> _bookState(Book book) => {
     'book_id': book.id,
     'title': book.title,
@@ -322,6 +476,38 @@ class AccountService extends ChangeNotifier {
     'cover_url': book.coverUrl ?? '',
     'updated_at': DateTime.now().toUtc().toIso8601String(),
   };
+
+  Map<String, dynamic> _readingState(HistoryEntry entry) => {
+    'book_id': entry.book.id,
+    'title': entry.book.title,
+    'author': entry.book.author,
+    'cover_url': entry.book.coverUrl ?? '',
+    'chapter_id': entry.lastChapterPosition,
+    'progress': entry.chapterProgress,
+    'updated_at': DateTime.fromMillisecondsSinceEpoch(
+      entry.lastReadAt,
+    ).toUtc().toIso8601String(),
+  };
+
+  Map<String, dynamic> _automaticShelfState(HistoryEntry entry) => {
+    'book_id': entry.book.id,
+    'title': entry.book.title,
+    'author': entry.book.author,
+    'cover_url': entry.book.coverUrl ?? '',
+    'note': _existingBookshelfNote(entry.book.id),
+    'updated_at': DateTime.fromMillisecondsSinceEpoch(
+      entry.lastReadAt,
+    ).toUtc().toIso8601String(),
+  };
+
+  String _existingBookshelfNote(String bookId) {
+    for (final item in cloudState['bookshelf'] as List? ?? const []) {
+      if (item is Map && item['book_id'] == bookId) {
+        return item['note'] as String? ?? '';
+      }
+    }
+    return '';
+  }
 
   Future<List<Map<String, dynamic>>> uploads() async {
     final data = await _request('/api/v1/me/uploads');
@@ -339,14 +525,142 @@ class AccountService extends ChangeNotifier {
     request.headers['Accept'] = 'application/json';
     request.headers['Authorization'] = 'Bearer $_token';
     request.files.add(await http.MultipartFile.fromPath('file', path));
-    final streamed = await _client.send(request).timeout(_uploadTimeout);
-    final response = await http.Response.fromStream(
-      streamed,
-    ).timeout(_uploadTimeout);
-    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    return _sendMultipart(request, timeout: _uploadTimeout);
+  }
+
+  Future<List<Map<String, dynamic>>> novelSubmissions() async {
+    final data = await _request('/api/v1/me/novel-submissions');
+    return (data['items'] as List? ?? const [])
+        .map((item) => Map<String, dynamic>.from(item as Map))
+        .toList();
+  }
+
+  Future<List<Map<String, dynamic>>> categories() async {
+    final data = await _request('/api/v1/categories');
+    return (data['items'] as List? ?? const [])
+        .map((item) => Map<String, dynamic>.from(item as Map))
+        .toList();
+  }
+
+  Future<Map<String, dynamic>> uploadNovel({
+    required Map<String, String> metadata,
+    required String manuscriptPath,
+    required String coverPath,
+  }) async {
+    if (!isSignedIn) throw const AccountException('请先登录');
+    final request = http.MultipartRequest(
+      'POST',
+      Uri.parse('${ApiService.baseUrl}/api/v1/me/novel-submissions'),
+    );
+    request.headers.addAll({'Accept': 'application/json', ...authHeaders});
+    request.fields['metadata'] = jsonEncode(metadata);
+    request.files.add(
+      await http.MultipartFile.fromPath('manuscript', manuscriptPath),
+    );
+    request.files.add(await http.MultipartFile.fromPath('cover', coverPath));
+    return _sendMultipart(request, timeout: _uploadTimeout);
+  }
+
+  Future<Map<String, dynamic>> notifications({int limit = 100}) async {
+    if (!isSignedIn) throw const AccountException('请先登录');
+    return _request('/api/v1/me/notifications?limit=${limit.clamp(1, 200)}');
+  }
+
+  Future<void> markNotificationRead([String? notificationId]) async {
+    if (!isSignedIn) throw const AccountException('请先登录');
+    final path = notificationId == null
+        ? '/api/v1/me/notifications/read'
+        : '/api/v1/me/notifications/$notificationId/read';
+    await _request(path, method: 'POST');
+  }
+
+  Future<Map<String, dynamic>> chapterComments(
+    String bookId,
+    String chapterId,
+  ) => _request('/api/v1/books/$bookId/chapters/$chapterId/comments');
+
+  Future<Map<String, dynamic>> bookComments(String bookId) =>
+      _request('/api/v1/books/$bookId/comments');
+
+  Future<Map<String, dynamic>> createBookComment({
+    required String bookId,
+    required String content,
+  }) {
+    if (!isSignedIn) throw const AccountException('请先登录后再评论');
+    return _request(
+      '/api/v1/books/$bookId/comments',
+      method: 'POST',
+      body: {'content': content.trim()},
+    );
+  }
+
+  Future<Map<String, dynamic>> addBookCommentLike(String commentId) {
+    if (!isSignedIn) throw const AccountException('请先登录后再点赞');
+    return _request('/api/v1/comments/$commentId/likes', method: 'POST');
+  }
+
+  Future<Map<String, dynamic>> createParagraphComment({
+    required String bookId,
+    required String chapterId,
+    required int paragraphIndex,
+    required String content,
+  }) {
+    if (!isSignedIn) throw const AccountException('请先登录后再评论');
+    return _request(
+      '/api/v1/books/$bookId/chapters/$chapterId/comments',
+      method: 'POST',
+      body: {'paragraph_index': paragraphIndex, 'content': content.trim()},
+    );
+  }
+
+  Future<Map<String, dynamic>> addParagraphCommentLike(String commentId) {
+    if (!isSignedIn) throw const AccountException('请先登录后再点赞');
+    return _request(
+      '/api/v1/paragraph-comments/$commentId/likes',
+      method: 'POST',
+    );
+  }
+
+  Future<Map<String, dynamic>> recommendationStatus(String bookId) {
+    if (!isSignedIn) throw const AccountException('请先登录');
+    return _request('/api/v1/books/$bookId/recommendation');
+  }
+
+  Future<Map<String, dynamic>> recommendBook(String bookId, {String? eventId}) {
+    if (!isSignedIn) throw const AccountException('请先登录后推荐作品');
+    return _request(
+      '/api/v1/books/$bookId/recommend',
+      method: 'POST',
+      body: {'event_id': eventId ?? _uuidV4()},
+    );
+  }
+
+  Future<Map<String, dynamic>> _sendMultipart(
+    http.MultipartRequest request, {
+    required Duration timeout,
+  }) async {
+    final streamed = await _client.send(request).timeout(timeout);
+    final response = await http.Response.fromStream(streamed).timeout(timeout);
+    final data = response.body.isEmpty
+        ? <String, dynamic>{}
+        : jsonDecode(response.body) as Map<String, dynamic>;
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw AccountException(data['detail'] as String? ?? '上传失败');
+      throw AccountException(
+        data['detail'] as String? ?? '请求失败（${response.statusCode}）',
+      );
     }
     return data;
+  }
+
+  String _uuidV4() {
+    final random = Random.secure();
+    final bytes = List<int>.generate(16, (_) => random.nextInt(256));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    final hex = bytes
+        .map((value) => value.toRadixString(16).padLeft(2, '0'))
+        .join();
+    return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-'
+        '${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
   }
 }
