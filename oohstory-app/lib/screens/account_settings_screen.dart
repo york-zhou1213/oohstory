@@ -2,6 +2,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../services/account_service.dart';
+import '../services/authenticated_resource.dart';
 import '../theme/app_theme.dart';
 import '../utils/user_content_guard.dart';
 import '../widgets/account_success_toast.dart';
@@ -263,7 +264,10 @@ class _AccountSettingsScreenState extends State<AccountSettingsScreen> {
             ? null
             : NetworkImage(
                 _account.avatarUrl(_avatarUrl!),
-                headers: _account.authHeaders,
+                headers: oohstoryAuthenticatedResourceHeaders(
+                  _account.avatarUrl(_avatarUrl!),
+                  _account.authHeaders,
+                ),
               ),
         child: _avatarUrl == null ? const Icon(Icons.person, size: 34) : null,
       ),

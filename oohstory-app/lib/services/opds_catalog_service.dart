@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:xml/xml.dart';
 
 import 'local_storage_service.dart';
+import 'bounded_stream.dart';
 
 class OpdsBookEntry {
   final String title;
@@ -42,24 +43,23 @@ class OpdsCatalogService {
 
   Future<List<OpdsBookEntry>> fetch(Uri catalogUri) async {
     _validateUri(catalogUri);
+    final request = http.Request('GET', catalogUri)
+      ..headers['Accept'] =
+          'application/opds+json, application/atom+xml, application/xml;q=0.9';
     final response = await _client
-        .get(
-          catalogUri,
-          headers: const {
-            'Accept':
-                'application/opds+json, application/atom+xml, application/xml;q=0.9',
-          },
-        )
+        .send(request)
         .timeout(const Duration(seconds: 20));
     if (response.statusCode < 200 || response.statusCode >= 300) {
+      await _cancelResponse(response);
       throw HttpException('OPDS 目录返回 HTTP ${response.statusCode}');
     }
-    if (response.bodyBytes.length > _maxCatalogBytes) {
-      throw const FormatException('OPDS 目录不能超过 4 MB');
-    }
-    final body = utf8
-        .decode(response.bodyBytes, allowMalformed: true)
-        .trimLeft();
+    final bytes = await _readResponse(
+      response,
+      maxBytes: _maxCatalogBytes,
+      timeout: const Duration(seconds: 20),
+      tooLarge: const FormatException('OPDS 目录不能超过 4 MB'),
+    );
+    final body = utf8.decode(bytes, allowMalformed: true).trimLeft();
     return body.startsWith('{')
         ? _parseOpds2(body, catalogUri)
         : _parseOpds1(body, catalogUri);
@@ -76,27 +76,21 @@ class OpdsCatalogService {
         .send(request)
         .timeout(const Duration(seconds: 25));
     if (response.statusCode < 200 || response.statusCode >= 300) {
+      await _cancelResponse(response);
       throw HttpException('书籍下载返回 HTTP ${response.statusCode}');
     }
-    final declaredLength = response.contentLength;
-    if (declaredLength != null && declaredLength > _maxBookBytes) {
-      throw const FormatException('单本 OPDS 书籍不能超过 256 MB');
-    }
-    final bytes = <int>[];
-    await for (final chunk in response.stream.timeout(
-      const Duration(seconds: 30),
-    )) {
-      bytes.addAll(chunk);
-      if (bytes.length > _maxBookBytes) {
-        throw const FormatException('单本 OPDS 书籍不能超过 256 MB');
-      }
-    }
+    final bytes = await _readResponse(
+      response,
+      maxBytes: _maxBookBytes,
+      timeout: const Duration(seconds: 30),
+      tooLarge: const FormatException('单本 OPDS 书籍不能超过 256 MB'),
+    );
     final temp = await getTemporaryDirectory();
     final file = File(
       '${temp.path}/opds-${DateTime.now().microsecondsSinceEpoch}.${entry.format}',
     );
     try {
-      await file.writeAsBytes(Uint8List.fromList(bytes), flush: true);
+      await file.writeAsBytes(bytes, flush: true);
       return await storage.importLocalBook(file.path, entry.fileName);
     } finally {
       if (await file.exists()) await file.delete();
@@ -232,6 +226,32 @@ class OpdsCatalogService {
   void _validateUri(Uri uri) {
     if (!uri.hasAuthority || (uri.scheme != 'http' && uri.scheme != 'https')) {
       throw const FormatException('OPDS 地址必须是完整的 HTTP 或 HTTPS 地址');
+    }
+  }
+
+  Future<Uint8List> _readResponse(
+    http.StreamedResponse response, {
+    required int maxBytes,
+    required Duration timeout,
+    required FormatException tooLarge,
+  }) async {
+    final declaredLength = response.contentLength;
+    if (declaredLength != null && declaredLength > maxBytes) {
+      await _cancelResponse(response);
+      throw tooLarge;
+    }
+    return collectBoundedBytes(
+      response.stream.timeout(timeout),
+      maxBytes: maxBytes,
+      tooLarge: () => tooLarge,
+    );
+  }
+
+  Future<void> _cancelResponse(http.StreamedResponse response) async {
+    try {
+      await cancelByteStream(response.stream);
+    } on Object {
+      // Preserve the HTTP/status/size error that requires cancellation.
     }
   }
 

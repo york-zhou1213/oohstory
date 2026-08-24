@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import '../services/api_service.dart';
+import '../services/authenticated_resource.dart';
 import '../services/local_storage_service.dart';
 import '../services/reading_progress.dart';
 import '../services/account_service.dart';
@@ -380,7 +381,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       _account.avatarUrl(
                         _accountProfile['avatar_url'] as String,
                       ),
-                      headers: _account.authHeaders,
+                      headers: oohstoryAuthenticatedResourceHeaders(
+                        _account.avatarUrl(
+                          _accountProfile['avatar_url'] as String,
+                        ),
+                        _account.authHeaders,
+                      ),
                       fit: BoxFit.cover,
                       errorBuilder: (_, __, ___) => const Icon(
                         Icons.person_rounded,

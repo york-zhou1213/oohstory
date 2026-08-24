@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as path_utils;
 import '../models/book.dart';
 import '../models/reader_preferences.dart';
+import 'bounded_stream.dart';
 import 'offline_book_parser.dart';
 
 class BookMeta {
@@ -265,6 +266,7 @@ class LocalStorageService {
   static const _annotationsKey = 'oohstory_offline_annotations_v1';
   static const _readingStatsKey = 'oohstory_offline_reading_stats_v1';
   static const _backupSchema = 2;
+  static const _maxBackupBytes = 1024 * 1024 * 1024;
   final OfflineBookParser _bookParser = const OfflineBookParser();
 
   late SharedPreferences _prefs;
@@ -1017,10 +1019,14 @@ class LocalStorageService {
 
   Future<void> restoreOfflineBackup(String filePath) async {
     final source = File(filePath);
-    if (await source.length() > 1024 * 1024 * 1024) {
+    if (await source.length() > _maxBackupBytes) {
       throw const FormatException('离线备份不能超过 1 GB');
     }
-    final bytes = await source.readAsBytes();
+    final bytes = await collectBoundedBytes(
+      source.openRead(),
+      maxBytes: _maxBackupBytes,
+      tooLarge: () => const FormatException('离线备份不能超过 1 GB'),
+    );
     final archive = ZipDecoder().decodeBytes(bytes, verify: true);
     var expandedBytes = 0;
     for (final entry in archive.files) {
