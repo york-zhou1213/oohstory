@@ -1,16 +1,28 @@
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import '../services/api_service.dart';
+import '../services/authenticated_resource.dart';
 import '../services/local_storage_service.dart';
 import '../services/reading_progress.dart';
 import '../services/account_service.dart';
+import '../services/app_update_service.dart';
+import '../models/book.dart';
 import '../theme/app_theme.dart';
 import 'book_detail_screen.dart';
-import 'local_reader_screen.dart';
+import 'offline_book_screen.dart';
+import 'reader_screen.dart';
+import 'offline_notes_screen.dart';
 import 'history_page.dart';
 import 'favorites_page.dart';
 import 'auth_screen.dart';
-import 'user_uploads_screen.dart';
+import 'account_records_screen.dart';
+import 'account_settings_screen.dart';
+import 'notifications_screen.dart';
+import 'submission_center_screen.dart';
+import 'deconstruction_screen.dart';
+import 'bookshelf_page.dart';
+import '../widgets/reading_identity.dart';
+import '../main.dart' show ttsService;
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -31,6 +43,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
   List<DownloadedBookInfo> _downloads = [];
   List<LocalBookInfo> _localBooks = [];
   int _totalDownloadSize = 0;
+  Map<String, dynamic> _accountProfile = const {};
+  Map<String, dynamic> _accountReading = const {};
+  int _unreadNotifications = 0;
 
   @override
   void initState() {
@@ -47,14 +62,19 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   void _accountChanged() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    setState(() {});
+    if (_account.isSignedIn && _accountReading.isEmpty) _loadAccountSummary();
   }
 
   Future<void> _init() async {
     await _storage.init();
     await _progress.init();
     await _account.initialize();
-    if (_account.isSignedIn) await _account.mergeLocalState(_storage);
+    if (_account.isSignedIn) {
+      await _account.mergeLocalState(_storage);
+      await _loadAccountSummary();
+    }
     _refresh();
     setState(() => _initialized = true);
   }
@@ -71,6 +91,37 @@ class _ProfileScreenState extends State<ProfileScreen> {
     });
   }
 
+  Future<void> _loadAccountSummary() async {
+    if (!_account.isSignedIn) return;
+    try {
+      final results = await Future.wait([
+        _account.profile(),
+        _account.notifications(limit: 1),
+      ]);
+      if (!mounted) return;
+      setState(() {
+        _accountProfile = Map<String, dynamic>.from(
+          results[0]['profile'] as Map,
+        );
+        _accountReading = Map<String, dynamic>.from(
+          results[0]['reading'] as Map,
+        );
+        _unreadNotifications =
+            (results[1]['unread_count'] as num?)?.toInt() ?? 0;
+      });
+    } catch (_) {
+      // Device-only reading remains available when account metadata is offline.
+    }
+  }
+
+  Future<void> _refreshAll() async {
+    _refresh();
+    if (_account.isSignedIn) {
+      await _account.refreshCloudState();
+      await _loadAccountSummary();
+    }
+  }
+
   void _openBook(String bookId) {
     Navigator.of(context)
         .push(
@@ -82,7 +133,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   void _openLocalBook(LocalBookInfo book) {
     Navigator.of(
       context,
-    ).push(MaterialPageRoute(builder: (_) => LocalReaderScreen(book: book)));
+    ).push(MaterialPageRoute(builder: (_) => buildOfflineBookScreen(book)));
   }
 
   Future<void> _openAuth() async {
@@ -91,6 +142,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     ).push<bool>(MaterialPageRoute(builder: (_) => const AuthScreen()));
     if (changed == true) {
       await _account.mergeLocalState(_storage);
+      await _loadAccountSummary();
       _refresh();
     }
   }
@@ -111,53 +163,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   void _openCloudBookshelf() {
-    final books = _account.cloudState['bookshelf'] as List? ?? const [];
-    showModalBottomSheet<void>(
-      context: context,
-      showDragHandle: true,
-      isScrollControlled: true,
-      builder: (context) => SafeArea(
-        child: SizedBox(
-          height: MediaQuery.sizeOf(context).height * .7,
-          child: Column(
-            children: [
-              const Padding(
-                padding: EdgeInsets.fromLTRB(20, 4, 20, 14),
-                child: Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    '云端私人书架',
-                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
-                  ),
-                ),
-              ),
-              Expanded(
-                child: books.isEmpty
-                    ? const Center(child: Text('还没有加入云端书架的作品'))
-                    : ListView.builder(
-                        itemCount: books.length,
-                        itemBuilder: (context, index) {
-                          final book = Map<String, dynamic>.from(
-                            books[index] as Map,
-                          );
-                          return ListTile(
-                            leading: const CircleAvatar(
-                              child: Icon(Icons.book_outlined),
-                            ),
-                            title: Text(book['title'] as String? ?? ''),
-                            subtitle: Text(book['author'] as String? ?? ''),
-                            trailing: const Icon(Icons.chevron_right),
-                            onTap: () {
-                              Navigator.pop(context);
-                              _openBook(book['book_id'] as String);
-                            },
-                          );
-                        },
-                      ),
-              ),
-            ],
-          ),
-        ),
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => const AccountRecordsScreen(kind: 'bookshelf'),
       ),
     );
   }
@@ -221,10 +229,17 @@ class _ProfileScreenState extends State<ProfileScreen> {
     final isDark = theme.brightness == Brightness.dark;
 
     return RefreshIndicator(
-      onRefresh: () async => _refresh(),
+      onRefresh: _refreshAll,
       child: CustomScrollView(
         slivers: [
           SliverToBoxAdapter(child: _buildHeader(theme, isDark)),
+          if (_account.isSignedIn && _accountReading.isNotEmpty)
+            SliverToBoxAdapter(
+              child: ReadingIdentityCard(reading: _accountReading),
+            ),
+          SliverToBoxAdapter(child: _buildContentTools(theme)),
+          if (_account.isSignedIn)
+            SliverToBoxAdapter(child: _buildAccountActions(theme)),
           SliverToBoxAdapter(child: _buildStatsRow(theme, isDark)),
 
           // Local source files intentionally remain device-only.
@@ -285,6 +300,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
           ),
 
           SliverToBoxAdapter(child: _buildSettingsSection(theme, isDark)),
+          if (_account.isSignedIn)
+            SliverToBoxAdapter(child: _buildLogoutButton()),
           const SliverToBoxAdapter(child: SizedBox(height: 100)),
         ],
       ),
@@ -336,19 +353,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
       margin: const EdgeInsets.fromLTRB(16, 8, 16, 0),
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [Color(0xFF6C5CE7), Color(0xFF8B7CF6), Color(0xFFA29BFE)],
-        ),
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: [
-          BoxShadow(
-            color: AppTheme.seedPurple.withValues(alpha: 0.3),
-            blurRadius: 20,
-            offset: const Offset(0, 8),
-          ),
-        ],
+        gradient: AppTheme.heroGradient,
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: [AppTheme.softShadow(theme.brightness)],
       ),
       child: Row(
         children: [
@@ -363,25 +370,61 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 width: 2,
               ),
             ),
-            child: const Icon(
-              Icons.person_rounded,
-              color: Colors.white,
-              size: 28,
-            ),
+            child: (_accountProfile['avatar_url'] as String? ?? '').isEmpty
+                ? const Icon(
+                    Icons.person_rounded,
+                    color: Colors.white,
+                    size: 28,
+                  )
+                : ClipOval(
+                    child: Image.network(
+                      _account.avatarUrl(
+                        _accountProfile['avatar_url'] as String,
+                      ),
+                      headers: oohstoryAuthenticatedResourceHeaders(
+                        _account.avatarUrl(
+                          _accountProfile['avatar_url'] as String,
+                        ),
+                        _account.authHeaders,
+                      ),
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) => const Icon(
+                        Icons.person_rounded,
+                        color: Colors.white,
+                        size: 28,
+                      ),
+                    ),
+                  ),
           ),
           const SizedBox(width: 16),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  _account.user?.displayName ?? '我的书房',
-                  style: TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.w800,
-                    color: Colors.white,
-                    letterSpacing: -0.3,
-                  ),
+                Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        _account.user?.displayName ?? '我的书房',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.w800,
+                          color: Colors.white,
+                          letterSpacing: -0.3,
+                        ),
+                      ),
+                    ),
+                    if (_accountReading.isNotEmpty) ...[
+                      const SizedBox(width: 8),
+                      ReadingRankBadge(
+                        level: (_accountReading['level'] as num?)?.toInt() ?? 1,
+                        roman: _accountReading['roman'] as String? ?? 'Ⅰ',
+                        size: 28,
+                      ),
+                    ],
+                  ],
                 ),
                 const SizedBox(height: 4),
                 Text(
@@ -411,21 +454,29 @@ class _ProfileScreenState extends State<ProfileScreen> {
               color: theme.colorScheme.surface,
               icon: const Icon(Icons.more_horiz_rounded, color: Colors.white),
               onSelected: (value) async {
-                if (value == 'uploads') {
+                if (value == 'submissions') {
                   await Navigator.of(context).push(
                     MaterialPageRoute(
-                      builder: (_) => const UserUploadsScreen(),
+                      builder: (_) => const SubmissionCenterScreen(),
                     ),
                   );
+                } else if (value == 'notifications') {
+                  await Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => const NotificationsScreen(),
+                    ),
+                  );
+                  await _loadAccountSummary();
                 } else if (value == 'google-link') {
                   await _linkGoogle();
-                } else if (value == 'logout') {
-                  await _account.logout();
-                  _refresh();
                 }
               },
               itemBuilder: (_) => [
-                const PopupMenuItem(value: 'uploads', child: Text('拆书上传记录')),
+                const PopupMenuItem(value: 'submissions', child: Text('我的投稿')),
+                const PopupMenuItem(
+                  value: 'notifications',
+                  child: Text('消息中心'),
+                ),
                 if (!_account.user!.googleLinked)
                   PopupMenuItem(
                     value: 'google-link',
@@ -436,13 +487,283 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           : 'Google 绑定待配置',
                     ),
                   ),
-                const PopupMenuItem(value: 'logout', child: Text('退出登录')),
               ],
             ),
         ],
       ),
     );
   }
+
+  Widget _buildAccountActions(ThemeData theme) {
+    final items = <(IconData, String, String, VoidCallback)>[
+      (
+        Icons.history_rounded,
+        '阅读记录',
+        '${(_account.cloudState['history'] as List? ?? const []).length} 本',
+        () => Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => const AccountRecordsScreen(kind: 'history'),
+          ),
+        ),
+      ),
+      (
+        Icons.favorite_rounded,
+        '收藏记录',
+        '${(_account.cloudState['favorites'] as List? ?? const []).length} 本',
+        () => Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => const AccountRecordsScreen(kind: 'favorites'),
+          ),
+        ),
+      ),
+      (
+        Icons.shelves,
+        '我的书架',
+        '${(_account.cloudState['bookshelf'] as List? ?? const []).length} 本',
+        _openCloudBookshelf,
+      ),
+      (
+        Icons.manage_accounts_rounded,
+        '资料与安全',
+        '头像 · 密码',
+        () async {
+          await Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const AccountSettingsScreen()),
+          );
+          await _loadAccountSummary();
+        },
+      ),
+      (
+        Icons.upload_file_rounded,
+        '我的投稿',
+        '拆书文 · 小说',
+        () => Navigator.of(context).push(
+          MaterialPageRoute(builder: (_) => const SubmissionCenterScreen()),
+        ),
+      ),
+      (
+        Icons.notifications_rounded,
+        '消息中心',
+        _unreadNotifications > 0 ? '$_unreadNotifications 条未读' : '暂无未读',
+        () async {
+          await Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const NotificationsScreen()),
+          );
+          await _loadAccountSummary();
+        },
+      ),
+    ];
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final columns = constraints.maxWidth >= 640 ? 3 : 2;
+          final width = (constraints.maxWidth - ((columns - 1) * 12)) / columns;
+          return Wrap(
+            spacing: 12,
+            runSpacing: 12,
+            children: items
+                .map(
+                  (item) => SizedBox(
+                    width: width,
+                    child: Material(
+                      color: theme.colorScheme.surface,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(
+                          AppTheme.cardRadius,
+                        ),
+                        side: BorderSide(
+                          color: theme.colorScheme.outlineVariant,
+                        ),
+                      ),
+                      child: InkWell(
+                        onTap: item.$4,
+                        borderRadius: BorderRadius.circular(
+                          AppTheme.cardRadius,
+                        ),
+                        child: Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Row(
+                            children: [
+                              Container(
+                                width: 42,
+                                height: 42,
+                                alignment: Alignment.center,
+                                decoration: BoxDecoration(
+                                  color: AppTheme.seedPurple.withValues(
+                                    alpha: .1,
+                                  ),
+                                  borderRadius: BorderRadius.circular(13),
+                                ),
+                                child: Icon(
+                                  item.$1,
+                                  size: 20,
+                                  color: theme.colorScheme.primary,
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      item.$2,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 3),
+                                    Text(
+                                      item.$3,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        color:
+                                            theme.colorScheme.onSurfaceVariant,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                )
+                .toList(),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildContentTools(ThemeData theme) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
+      child: Column(
+        children: [
+          _contentToolTile(
+            theme,
+            icon: Icons.auto_stories_rounded,
+            title: '拆书档案',
+            subtitle: '查看深度拆解、写作技法与设定资料',
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => Scaffold(
+                  appBar: AppBar(title: const Text('拆书档案')),
+                  body: const DeconstructionScreen(),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          _contentToolTile(
+            theme,
+            icon: Icons.offline_pin_rounded,
+            title: '本地离线书库',
+            subtitle: '导入、备份与管理离线书籍',
+            onTap: () => Navigator.of(
+              context,
+            ).push(MaterialPageRoute(builder: (_) => const BookshelfPage())),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _contentToolTile(
+    ThemeData theme, {
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required VoidCallback onTap,
+  }) {
+    return Material(
+      color: theme.colorScheme.surface,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(AppTheme.cardRadius),
+        side: BorderSide(color: theme.colorScheme.outlineVariant),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 15),
+          child: Row(
+            children: [
+              Container(
+                width: 46,
+                height: 46,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.primaryContainer,
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Icon(icon, color: theme.colorScheme.onPrimaryContainer),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      subtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Icon(
+                Icons.chevron_right_rounded,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLogoutButton() => Padding(
+    padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
+    child: Align(
+      alignment: Alignment.centerRight,
+      child: TextButton.icon(
+        onPressed: () async {
+          ttsService.stop();
+          await _account.logout();
+          if (!mounted) return;
+          setState(() {
+            _accountProfile = const {};
+            _accountReading = const {};
+            _unreadNotifications = 0;
+          });
+          _refresh();
+        },
+        icon: const Icon(Icons.logout_rounded, size: 18),
+        label: const Text('退出登录'),
+        style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
+      ),
+    ),
+  );
 
   Widget _buildStatsRow(ThemeData theme, bool isDark) {
     final cardColor = isDark ? const Color(0xFF1E1E30) : Colors.white;
@@ -453,24 +774,36 @@ class _ProfileScreenState extends State<ProfileScreen> {
           _statCard(
             theme,
             cardColor,
-            '${_history.length}',
+            '${_account.isSignedIn ? (_account.cloudState['history'] as List? ?? const []).length : _history.length}',
             '已读',
             Icons.auto_stories,
             const Color(0xFF6C5CE7),
             onTap: () => Navigator.of(context)
-                .push(MaterialPageRoute(builder: (_) => const HistoryPage()))
+                .push(
+                  MaterialPageRoute(
+                    builder: (_) => _account.isSignedIn
+                        ? const AccountRecordsScreen(kind: 'history')
+                        : const HistoryPage(),
+                  ),
+                )
                 .then((_) => _refresh()),
           ),
           const SizedBox(width: 10),
           _statCard(
             theme,
             cardColor,
-            '${_favorites.length}',
+            '${_account.isSignedIn ? (_account.cloudState['favorites'] as List? ?? const []).length : _favorites.length}',
             '收藏',
             Icons.favorite,
             const Color(0xFFFD79A8),
             onTap: () => Navigator.of(context)
-                .push(MaterialPageRoute(builder: (_) => const FavoritesPage()))
+                .push(
+                  MaterialPageRoute(
+                    builder: (_) => _account.isSignedIn
+                        ? const AccountRecordsScreen(kind: 'favorites')
+                        : const FavoritesPage(),
+                  ),
+                )
                 .then((_) => _refresh()),
           ),
           const SizedBox(width: 10),
@@ -1082,10 +1415,40 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 ),
                 onPressed: () => _showDeleteDownloadDialog(dl),
               ),
-              onTap: () => _openBook(dl.book.id),
+              onTap: () => _openDownloadedBook(dl),
             ),
           );
         }).toList(),
+      ),
+    );
+  }
+
+  void _openDownloadedBook(DownloadedBookInfo downloaded) {
+    if (downloaded.chapters.isEmpty) return;
+    final chapters = downloaded.chapters
+        .map(
+          (chapter) => Chapter(
+            id: chapter.id,
+            title: chapter.title,
+            position: chapter.position,
+          ),
+        )
+        .toList();
+    final book = Book(
+      id: downloaded.book.id,
+      title: downloaded.book.title,
+      author: downloaded.book.author,
+      coverUrl: downloaded.book.coverUrl,
+      chapterCount: chapters.length,
+    );
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ReaderScreen(
+          bookId: book.id,
+          chapterId: chapters.first.id,
+          chapters: chapters,
+          book: book,
+        ),
       ),
     );
   }
@@ -1108,6 +1471,20 @@ class _ProfileScreenState extends State<ProfileScreen> {
         ),
         child: Column(
           children: [
+            _settingsTile(
+              theme,
+              Icons.collections_bookmark_rounded,
+              '书签与批注',
+              subtitle: '本地保存 · 可导出',
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const OfflineNotesScreen()),
+              ),
+            ),
+            Divider(
+              height: 1,
+              indent: 52,
+              color: theme.colorScheme.onSurface.withValues(alpha: 0.06),
+            ),
             _settingsTile(
               theme,
               Icons.cleaning_services_rounded,
@@ -1135,7 +1512,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
               theme,
               Icons.info_outline_rounded,
               '关于',
-              subtitle: 'OohStory v1.3.3',
+              subtitle: 'OohStory v${AppUpdateService.currentVersionName}',
               onTap: _showAbout,
             ),
           ],
@@ -1240,6 +1617,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
             onPressed: () async {
               await _storage.deleteLocalBook(book.id);
               _refresh();
+              if (!ctx.mounted) return;
               Navigator.pop(ctx);
             },
             style: FilledButton.styleFrom(backgroundColor: Colors.red.shade400),
@@ -1265,6 +1643,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
             onPressed: () async {
               await _storage.deleteDownloadedBook(dl.book.id);
               _refresh();
+              if (!ctx.mounted) return;
               Navigator.pop(ctx);
             },
             style: FilledButton.styleFrom(backgroundColor: Colors.red.shade400),
@@ -1530,7 +1909,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     showAboutDialog(
       context: context,
       applicationName: 'OohStory',
-      applicationVersion: 'v1.3.3',
+      applicationVersion: 'v${AppUpdateService.currentVersionName}',
       applicationIcon: Container(
         width: 48,
         height: 48,

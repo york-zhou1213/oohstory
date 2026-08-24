@@ -4,6 +4,36 @@ import '../services/api_service.dart';
 import '../theme/app_theme.dart';
 import 'reader_screen.dart';
 
+String volumeChapterDisplayTitle(String chapterTitle, String volumeTitle) {
+  final original = chapterTitle.trim();
+  final volume = volumeTitle.trim();
+  if (original.isEmpty || volume.isEmpty) return original;
+  const separatorPattern = r'[\s\-–—_:：·・/\\]';
+  final parts = volume
+      .split(RegExp('$separatorPattern+', unicode: true))
+      .where((part) => part.isNotEmpty)
+      .toList();
+  if (parts.isEmpty) return original;
+  final prefix = parts.map(RegExp.escape).join('$separatorPattern*');
+  final repeatedPrefix = RegExp(
+    '^$separatorPattern*$prefix$separatorPattern+',
+    caseSensitive: false,
+    unicode: true,
+  );
+  final stripped = original.replaceFirst(repeatedPrefix, '').trim();
+  return stripped.isEmpty ? original : stripped;
+}
+
+String volumeDisplayTitle(String bookTitle, String volumeTitle) {
+  final book = bookTitle.trim();
+  final volume = volumeTitle.trim();
+  final generic = RegExp(
+    r'^第[0-9０-９一二三四五六七八九十百零〇两]+卷$',
+    unicode: true,
+  ).hasMatch(volume);
+  return generic && book.isNotEmpty ? '$book $volume' : volume;
+}
+
 class VolumeDetailScreen extends StatefulWidget {
   final String bookId;
   final Volume volume;
@@ -31,7 +61,10 @@ class _VolumeDetailScreenState extends State<VolumeDetailScreen>
   void initState() {
     super.initState();
     final hasIllustrations = widget.volume.illustrationPaths.isNotEmpty;
-    _tabController = TabController(length: hasIllustrations ? 2 : 1, vsync: this);
+    _tabController = TabController(
+      length: hasIllustrations ? 2 : 1,
+      vsync: this,
+    );
   }
 
   @override
@@ -42,14 +75,16 @@ class _VolumeDetailScreenState extends State<VolumeDetailScreen>
   }
 
   void _openReader(String chapterId) {
-    Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => ReaderScreen(
-        bookId: widget.bookId,
-        chapterId: chapterId,
-        chapters: widget.chapters,
-        book: widget.book,
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ReaderScreen(
+          bookId: widget.bookId,
+          chapterId: chapterId,
+          chapters: widget.chapters,
+          book: widget.book,
+        ),
       ),
-    ));
+    );
   }
 
   @override
@@ -57,11 +92,15 @@ class _VolumeDetailScreenState extends State<VolumeDetailScreen>
     final theme = Theme.of(context);
     final vol = widget.volume;
     final hasIllustrations = vol.illustrationPaths.isNotEmpty;
+    final displayTitle = volumeDisplayTitle(
+      widget.book?.title ?? '',
+      vol.title,
+    );
 
     return Scaffold(
       appBar: AppBar(
         title: Text(
-          vol.title,
+          displayTitle,
           style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
@@ -73,7 +112,10 @@ class _VolumeDetailScreenState extends State<VolumeDetailScreen>
             if (hasIllustrations)
               Tab(text: '插画 (${vol.illustrationPaths.length})'),
           ],
-          labelStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+          labelStyle: const TextStyle(
+            fontSize: 14,
+            fontWeight: FontWeight.w600,
+          ),
           indicatorColor: AppTheme.seedPurple,
           labelColor: AppTheme.seedPurple,
         ),
@@ -102,7 +144,9 @@ class _VolumeDetailScreenState extends State<VolumeDetailScreen>
           padding: const EdgeInsets.symmetric(horizontal: 12),
           child: ListTile(
             dense: true,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10),
+            ),
             leading: Container(
               width: 28,
               height: 28,
@@ -122,10 +166,12 @@ class _VolumeDetailScreenState extends State<VolumeDetailScreen>
               ),
             ),
             title: Text(
-              ch.title,
-              maxLines: 1,
+              volumeChapterDisplayTitle(ch.title, widget.volume.title),
+              maxLines: 2,
               overflow: TextOverflow.ellipsis,
-              style: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w500),
+              style: theme.textTheme.bodyMedium?.copyWith(
+                fontWeight: FontWeight.w500,
+              ),
             ),
             trailing: ch.wordCount != null
                 ? Text(
@@ -157,7 +203,7 @@ class _VolumeDetailScreenState extends State<VolumeDetailScreen>
       itemBuilder: (context, i) {
         final url = _api.illustrationUrl(widget.bookId, paths[i]);
         return GestureDetector(
-          onTap: () => _showFullImage(context, url, i, paths),
+          onTap: () => _showFullImage(context, i, paths),
           child: ClipRRect(
             borderRadius: BorderRadius.circular(10),
             child: Image.network(
@@ -168,7 +214,9 @@ class _VolumeDetailScreenState extends State<VolumeDetailScreen>
                   color: theme.colorScheme.surfaceContainerHighest,
                   borderRadius: BorderRadius.circular(10),
                 ),
-                child: const Center(child: Icon(Icons.broken_image_outlined, size: 32)),
+                child: const Center(
+                  child: Icon(Icons.broken_image_outlined, size: 32),
+                ),
               ),
             ),
           ),
@@ -177,15 +225,16 @@ class _VolumeDetailScreenState extends State<VolumeDetailScreen>
     );
   }
 
-  void _showFullImage(
-      BuildContext context, String url, int index, List<String> allPaths) {
-    Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => _IllustrationViewer(
-        bookId: widget.bookId,
-        paths: allPaths,
-        initialIndex: index,
+  void _showFullImage(BuildContext context, int index, List<String> allPaths) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => _IllustrationViewer(
+          bookId: widget.bookId,
+          paths: allPaths,
+          initialIndex: index,
+        ),
       ),
-    ));
+    );
   }
 }
 
@@ -254,15 +303,18 @@ class _IllustrationViewerState extends State<_IllustrationViewer> {
                     child: CircularProgressIndicator(
                       value: progress.expectedTotalBytes != null
                           ? progress.cumulativeBytesLoaded /
-                              progress.expectedTotalBytes!
+                                progress.expectedTotalBytes!
                           : null,
                       color: Colors.white54,
                     ),
                   );
                 },
                 errorBuilder: (_, __, ___) => const Center(
-                  child: Icon(Icons.broken_image_outlined,
-                      size: 48, color: Colors.white38),
+                  child: Icon(
+                    Icons.broken_image_outlined,
+                    size: 48,
+                    color: Colors.white38,
+                  ),
                 ),
               ),
             ),

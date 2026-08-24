@@ -2,6 +2,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../services/account_service.dart';
+import '../widgets/account_success_toast.dart';
 
 class UserUploadsScreen extends StatefulWidget {
   const UserUploadsScreen({super.key});
@@ -44,19 +45,23 @@ class _UserUploadsScreenState extends State<UserUploadsScreen> {
   Future<void> _pickAndUpload() async {
     final selected = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      allowedExtensions: const ['txt', 'epub'],
+      allowedExtensions: const ['zip'],
       allowMultiple: false,
     );
     final path = selected?.files.single.path;
     if (path == null) return;
     setState(() {
       _uploading = true;
-      _message = '正在隔离、验毒并检查文件结构…';
+      _message = '正在上传文件…';
     });
     try {
       final result = await AccountService.instance.uploadSource(path);
       if (mounted) {
-        setState(() => _message = result['message'] as String? ?? '已进入归纳队列');
+        setState(() => _message = '');
+        showAccountSuccessToast(
+          context,
+          message: result['message'] as String? ?? '上传成功，正在等待审核',
+        );
       }
       await _load();
     } catch (error) {
@@ -68,7 +73,8 @@ class _UserUploadsScreenState extends State<UserUploadsScreen> {
 
   String _status(String value) =>
       const {
-        'quarantined': '隔离扫描中',
+        'quarantined': '等待后台检查',
+        'scanning': '后台安全检查中',
         'clean_queued': '已验毒 · 等待归纳',
         'processing': '正在归纳',
         'completed': '已完成',

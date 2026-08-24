@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 
 import '../services/account_service.dart';
 import '../services/local_storage_service.dart';
+import '../utils/user_content_guard.dart';
+import '../widgets/user_content_notice_dialog.dart';
 
 class AuthScreen extends StatefulWidget {
   const AuthScreen({super.key});
@@ -30,7 +32,10 @@ class _AuthScreenState extends State<AuthScreen> {
     super.dispose();
   }
 
-  Future<void> _finish(Future<void> Function() operation) async {
+  Future<void> _finish(
+    Future<void> Function() operation, {
+    bool contentIdentity = false,
+  }) async {
     setState(() {
       _busy = true;
       _error = '';
@@ -42,7 +47,18 @@ class _AuthScreenState extends State<AuthScreen> {
       await AccountService.instance.mergeLocalState(storage);
       if (mounted) Navigator.of(context).pop(true);
     } catch (error) {
-      if (mounted) setState(() => _error = error.toString());
+      if (!mounted) return;
+      final message = error.toString();
+      if (contentIdentity &&
+          UserContentGuard.isModerationMessage(message, identity: true)) {
+        await showUserContentNoticeDialog(
+          context,
+          issue: message,
+          identity: true,
+        );
+      } else {
+        setState(() => _error = message);
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -50,6 +66,17 @@ class _AuthScreenState extends State<AuthScreen> {
 
   Future<void> _submit() async {
     if (!_formKey.currentState!.validate()) return;
+    if (_register) {
+      final issue = UserContentGuard.issue(_name.text, identity: true);
+      if (issue != null) {
+        await showUserContentNoticeDialog(
+          context,
+          issue: issue,
+          identity: true,
+        );
+        return;
+      }
+    }
     await _finish(
       () => _register
           ? AccountService.instance.register(
@@ -62,6 +89,7 @@ class _AuthScreenState extends State<AuthScreen> {
               email: _email.text,
               password: _password.text,
             ),
+      contentIdentity: _register,
     );
   }
 
@@ -186,7 +214,9 @@ class _AuthScreenState extends State<AuthScreen> {
                           ),
                           const SizedBox(height: 6),
                           Text(
-                            _register ? '当前仅限受邀读者注册，一个账户同步三端。' : '继续上次没有读完的故事。',
+                            _register
+                                ? '现在开放注册，邀请码为选填项，一个账户同步三端。'
+                                : '继续上次没有读完的故事。',
                             style: TextStyle(
                               color: theme.colorScheme.onSurface.withValues(
                                 alpha: .56,
@@ -252,10 +282,11 @@ class _AuthScreenState extends State<AuthScreen> {
                                     padding: const EdgeInsets.only(bottom: 13),
                                     child: _field(
                                       _invite,
-                                      '邀请码',
+                                      '邀请码（选填）',
                                       Icons.vpn_key_outlined,
                                       validator: (value) =>
-                                          value == null ||
+                                          value != null &&
+                                              value.trim().isNotEmpty &&
                                               value.trim().length < 20
                                           ? '请输入有效邀请码'
                                           : null,
@@ -335,7 +366,7 @@ class _AuthScreenState extends State<AuthScreen> {
                                     ),
                                   )
                                 : Text(
-                                    _register ? '凭邀请码创建账户' : '安全登录',
+                                    _register ? '创建账户' : '安全登录',
                                     style: const TextStyle(
                                       fontWeight: FontWeight.w800,
                                     ),

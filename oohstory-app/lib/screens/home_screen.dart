@@ -4,8 +4,9 @@ import '../services/api_service.dart';
 import '../services/local_storage_service.dart';
 import '../services/reading_progress.dart';
 import '../models/book.dart';
-import '../widgets/book_card.dart';
 import '../theme/app_theme.dart';
+import '../widgets/home_hero_carousel.dart';
+import '../widgets/ooh_ui.dart';
 import 'book_detail_screen.dart';
 import 'reader_screen.dart';
 import 'library_screen.dart';
@@ -24,6 +25,14 @@ String heroChapterCountLabelFor(Book book) {
   return '${count != null && count > 0 ? count : '?'}章';
 }
 
+double heroCoverWidthFor(double availableWidth) {
+  return (availableWidth * 0.35).clamp(124.0, 200.0).toDouble();
+}
+
+double heroCoverHeightFor(double availableWidth) {
+  return heroCoverWidthFor(availableWidth) * 1.42;
+}
+
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
@@ -38,9 +47,7 @@ class _HomeScreenState extends State<HomeScreen> {
   List<Book> _featured = [];
   List<Book> _recommendations = [];
   List<Book> _longNovels = [];
-  List<Book> _shortNovels = [];
   Map<String, List<Book>> _categoryBooks = {};
-  Map<String, dynamic> _stats = {};
   bool _loading = true;
   String? _error;
   HistoryEntry? _lastRead;
@@ -68,9 +75,6 @@ class _HomeScreenState extends State<HomeScreen> {
       final longs = (data['long_novels'] as List? ?? [])
           .map((e) => Book.fromJson(e as Map<String, dynamic>))
           .toList();
-      final shorts = (data['short_novels'] as List? ?? [])
-          .map((e) => Book.fromJson(e as Map<String, dynamic>))
-          .toList();
       final catBooksRaw = data['category_books'] as Map<String, dynamic>? ?? {};
       final catBooks = <String, List<Book>>{};
       catBooksRaw.forEach((key, val) {
@@ -81,24 +85,23 @@ class _HomeScreenState extends State<HomeScreen> {
         }
       });
       final history = _storage.getHistory();
-      if (mounted)
+      if (mounted) {
         setState(() {
           _featured = books;
           _recommendations = recs;
           _longNovels = longs;
-          _shortNovels = shorts;
           _categoryBooks = catBooks;
-          _stats = data['stats'] as Map<String, dynamic>? ?? {};
           _lastRead = history.isNotEmpty ? history.first : null;
           _loading = false;
         });
-      _startHeroTimer();
+      }
     } catch (e) {
-      if (mounted)
+      if (mounted) {
         setState(() {
           _error = e.toString();
           _loading = false;
         });
+      }
     }
   }
 
@@ -160,32 +163,20 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
-    if (_loading) return const Center(child: CircularProgressIndicator());
+    if (_loading) return const OohLoadingState(itemCount: 8);
     if (_error != null) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              Icons.cloud_off,
-              size: 48,
-              color: theme.colorScheme.onSurface.withValues(alpha: 0.3),
-            ),
-            const SizedBox(height: 16),
-            Text('无法连接服务器', style: theme.textTheme.titleMedium),
-            const SizedBox(height: 12),
-            FilledButton(
-              onPressed: () {
-                setState(() {
-                  _loading = true;
-                  _error = null;
-                });
-                _load();
-              },
-              child: const Text('重试'),
-            ),
-          ],
-        ),
+      return OohMessageState(
+        icon: Icons.cloud_off_rounded,
+        title: '暂时无法连接',
+        message: '网络恢复后即可继续浏览，已下载的内容仍可离线阅读。',
+        actionLabel: '重新连接',
+        onAction: () {
+          setState(() {
+            _loading = true;
+            _error = null;
+          });
+          _load();
+        },
       );
     }
 
@@ -193,8 +184,12 @@ class _HomeScreenState extends State<HomeScreen> {
       onRefresh: _load,
       child: CustomScrollView(
         slivers: [
-          SliverToBoxAdapter(child: _buildHero(theme)),
           SliverToBoxAdapter(child: _buildSearchBar(theme, isDark)),
+          SliverToBoxAdapter(
+            child: _featured.isEmpty
+                ? _buildHero(theme)
+                : _buildEditorialHero(theme),
+          ),
           if (_lastRead != null)
             SliverToBoxAdapter(child: _buildContinueReading(theme, isDark)),
           // stats removed
@@ -221,22 +216,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 color: const Color(0xFFE17055),
               ),
             ),
-            SliverToBoxAdapter(child: _buildLongNovelList(theme, isDark)),
+            SliverToBoxAdapter(child: _buildLongNovelList(theme)),
           ],
-          if (_categoryBooks.isNotEmpty) ...[
-            SliverToBoxAdapter(
-              child: _sectionHeader(
-                theme,
-                '热门分类',
-                '分类推荐',
-                Icons.bolt_rounded,
-                color: const Color(0xFF00B894),
-              ),
-            ),
-            SliverToBoxAdapter(
-              child: _buildCategoryRecommendations(theme, isDark),
-            ),
-          ],
+          if (_categoryBooks.isNotEmpty)
+            SliverToBoxAdapter(child: _buildCategoryRecommendations(theme)),
           SliverToBoxAdapter(
             child: _sectionHeader(
               theme,
@@ -255,315 +238,219 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildHorizontalBookScroll(ThemeData theme, List<Book> books) {
-    return SizedBox(
-      height: 180,
-      child: ListView.builder(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 16),
-        itemCount: books.length,
-        itemBuilder: (context, i) {
-          final book = books[i];
-          final coverUrl = book.coverUrl != null
-              ? _api.fullCoverUrl(book.coverUrl)
-              : _api.coverUrl(book.id);
-          return GestureDetector(
-            onTap: () => Navigator.of(context).push(
-              MaterialPageRoute(
-                builder: (_) => BookDetailScreen(bookId: book.id),
-              ),
-            ),
-            child: Container(
-              width: 88,
-              margin: EdgeInsets.only(right: i < books.length - 1 ? 8 : 0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(6),
-                    child: Image.network(
-                      coverUrl,
-                      width: 88,
-                      height: 124,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, __, ___) => Container(
-                        width: 88,
-                        height: 124,
-                        decoration: BoxDecoration(
-                          gradient: LinearGradient(
-                            begin: Alignment.topLeft,
-                            end: Alignment.bottomRight,
-                            colors: [
-                              theme.colorScheme.primaryContainer,
-                              theme.colorScheme.tertiaryContainer,
-                            ],
-                          ),
-                          borderRadius: BorderRadius.circular(6),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final tablet = constraints.maxWidth >= 720;
+        final coverWidth = tablet ? 132.0 : 112.0;
+        final coverHeight = coverWidth * 1.5;
+        final horizontal = OohPageMetrics.horizontalPadding(
+          constraints.maxWidth,
+        );
+        return SizedBox(
+          height: coverHeight + 74,
+          child: ListView.separated(
+            scrollDirection: Axis.horizontal,
+            padding: EdgeInsets.symmetric(horizontal: horizontal),
+            itemCount: books.length,
+            separatorBuilder: (_, __) => SizedBox(width: tablet ? 18 : 13),
+            itemBuilder: (context, i) {
+              final book = books[i];
+              final coverUrl = book.coverUrl != null
+                  ? _api.fullCoverUrl(book.coverUrl)
+                  : _api.coverUrl(book.id);
+              return Semantics(
+                button: true,
+                label: '打开《${book.title}》',
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(14),
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => BookDetailScreen(bookId: book.id),
+                    ),
+                  ),
+                  child: SizedBox(
+                    width: coverWidth,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        OohBookCover(
+                          imageUrl: coverUrl,
+                          title: book.title,
+                          width: coverWidth,
+                          height: coverHeight,
                         ),
-                        child: Center(
-                          child: Text(
-                            book.title.length > 2
-                                ? book.title.substring(0, 2)
-                                : book.title,
-                            style: TextStyle(
-                              fontSize: 14,
-                              fontWeight: FontWeight.w700,
-                              color: theme.colorScheme.onPrimaryContainer,
-                            ),
+                        const SizedBox(height: 10),
+                        Text(
+                          book.title,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            fontWeight: FontWeight.w700,
+                            height: 1.2,
                           ),
                         ),
-                      ),
+                        const SizedBox(height: 3),
+                        Text(
+                          book.author,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.bodySmall,
+                        ),
+                      ],
                     ),
                   ),
-                  const SizedBox(height: 5),
-                  Text(
-                    book.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      fontWeight: FontWeight.w500,
-                      fontSize: 11,
-                      height: 1.3,
-                    ),
-                  ),
-                  Text(
-                    book.author,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 9,
-                      color: theme.colorScheme.onSurface.withValues(alpha: 0.5),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          );
-        },
-      ),
+                ),
+              );
+            },
+          ),
+        );
+      },
     );
   }
 
-  Widget _buildLongNovelList(ThemeData theme, bool isDark) {
-    final cardColor = isDark ? const Color(0xFF1A1D27) : Colors.white;
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16),
-      child: Column(
-        children: _longNovels.take(6).map((book) {
-          final coverUrl = book.coverUrl != null
-              ? _api.fullCoverUrl(book.coverUrl)
-              : _api.coverUrl(book.id);
-          return Padding(
-            padding: const EdgeInsets.only(bottom: 12),
-            child: GestureDetector(
-              onTap: () => Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => BookDetailScreen(bookId: book.id),
-                ),
-              ),
-              child: Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: cardColor,
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(
-                    color: theme.colorScheme.outlineVariant.withValues(
-                      alpha: 0.3,
-                    ),
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(6),
-                      child: Image.network(
-                        coverUrl,
-                        width: 80,
-                        height: 112,
-                        fit: BoxFit.cover,
-                        errorBuilder: (_, __, ___) => Container(
-                          width: 80,
-                          height: 112,
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              begin: Alignment.topLeft,
-                              end: Alignment.bottomRight,
-                              colors: [
-                                theme.colorScheme.primaryContainer,
-                                theme.colorScheme.tertiaryContainer,
-                              ],
-                            ),
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          child: Center(
-                            child: Text(
-                              book.title.length > 2
-                                  ? book.title.substring(0, 2)
-                                  : book.title,
-                              style: TextStyle(
-                                fontSize: 16,
-                                fontWeight: FontWeight.w700,
-                                color: theme.colorScheme.onPrimaryContainer,
-                              ),
-                            ),
-                          ),
-                        ),
+  Widget _buildLongNovelList(ThemeData theme) {
+    final books = _longNovels.take(4).toList();
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final horizontal = OohPageMetrics.horizontalPadding(
+          constraints.maxWidth,
+        );
+        return Padding(
+          padding: EdgeInsets.symmetric(horizontal: horizontal),
+          child: Column(
+            children: List.generate(books.length, (index) {
+              final book = books[index];
+              final coverUrl = book.coverUrl != null
+                  ? _api.fullCoverUrl(book.coverUrl)
+                  : _api.coverUrl(book.id);
+              return Column(
+                children: [
+                  InkWell(
+                    borderRadius: BorderRadius.circular(12),
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => BookDetailScreen(bookId: book.id),
                       ),
                     ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      child: Row(
                         children: [
-                          Text(
-                            book.title,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: theme.textTheme.titleSmall?.copyWith(
-                              fontWeight: FontWeight.w600,
-                            ),
+                          OohBookCover(
+                            imageUrl: coverUrl,
+                            title: book.title,
+                            width: 72,
+                            height: 108,
+                            borderRadius: BorderRadius.circular(9),
                           ),
-                          if (book.description != null &&
-                              book.description!.isNotEmpty) ...[
-                            const SizedBox(height: 4),
-                            Text(
-                              book.description!,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: theme.colorScheme.onSurface.withValues(
-                                  alpha: 0.55,
-                                ),
-                                height: 1.5,
-                              ),
-                            ),
-                          ],
-                          const SizedBox(height: 8),
-                          Wrap(
-                            spacing: 6,
-                            runSpacing: 4,
-                            children: [
-                              if (book.category != null)
-                                _metaTag(theme, book.category!),
-                              Text(
-                                book.author,
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  color: theme.colorScheme.onSurface.withValues(
-                                    alpha: 0.5,
-                                  ),
-                                ),
-                              ),
-                              _statusTag(book.status),
-                              if (book.wordCount != null)
+                          const SizedBox(width: 16),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
                                 Text(
-                                  _formatWordCount(book.wordCount!),
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    color: theme.colorScheme.onSurface
-                                        .withValues(alpha: 0.5),
+                                  book.title,
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.titleMedium?.copyWith(
+                                    height: 1.28,
                                   ),
                                 ),
-                            ],
+                                if (book.description?.isNotEmpty == true) ...[
+                                  const SizedBox(height: 7),
+                                  Text(
+                                    book.description!,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: theme.textTheme.bodySmall?.copyWith(
+                                      height: 1.45,
+                                    ),
+                                  ),
+                                ],
+                                const SizedBox(height: 10),
+                                Text(
+                                  [
+                                    book.author,
+                                    if (book.wordCount != null)
+                                      _formatWordCount(book.wordCount!),
+                                    book.status == 'finished' ? '完结' : '连载',
+                                  ].join('  '),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.labelSmall?.copyWith(
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
                         ],
                       ),
                     ),
-                  ],
-                ),
-              ),
-            ),
-          );
-        }).toList(),
-      ),
+                  ),
+                  if (index < books.length - 1)
+                    Divider(height: 1, color: theme.colorScheme.outlineVariant),
+                ],
+              );
+            }),
+          ),
+        );
+      },
     );
   }
 
-  Widget _metaTag(ThemeData theme, String text) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-      decoration: BoxDecoration(
-        color: AppTheme.seedPurple.withValues(alpha: 0.1),
-        borderRadius: BorderRadius.circular(3),
-      ),
-      child: Text(
-        text,
-        style: TextStyle(
-          fontSize: 10,
-          color: AppTheme.seedPurple,
-          fontWeight: FontWeight.w500,
-        ),
-      ),
-    );
-  }
-
-  Widget _statusTag(String? status) {
-    final isFinished = status == 'finished' || status == '完结';
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-      decoration: BoxDecoration(
-        color: (isFinished ? const Color(0xFF00B894) : const Color(0xFFE17055))
-            .withValues(alpha: 0.1),
-        borderRadius: BorderRadius.circular(3),
-      ),
-      child: Text(
-        isFinished ? '已完本' : '连载中',
-        style: TextStyle(
-          fontSize: 10,
-          color: isFinished ? const Color(0xFF00B894) : const Color(0xFFE17055),
-          fontWeight: FontWeight.w500,
-        ),
-      ),
-    );
-  }
-
-  Widget _buildCategoryRecommendations(ThemeData theme, bool isDark) {
+  Widget _buildCategoryRecommendations(ThemeData theme) {
     final sortedEntries = _categoryBooks.entries.toList()
       ..sort((a, b) => b.value.length.compareTo(a.value.length));
-    final catNames = sortedEntries.take(4).map((e) => e.key).toList();
+    final catNames = sortedEntries.take(2).map((e) => e.key).toList();
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16),
+      padding: EdgeInsets.zero,
       child: Column(
         children: catNames.map((catName) {
-          final books = (_categoryBooks[catName] ?? []).take(10).toList();
+          final books = (_categoryBooks[catName] ?? []).take(8).toList();
           if (books.isEmpty) return const SizedBox.shrink();
           return Padding(
             padding: const EdgeInsets.only(bottom: 16),
             child: Column(
               children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text(
-                      catName,
-                      style: theme.textTheme.titleSmall?.copyWith(
-                        fontWeight: FontWeight.w600,
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        catName,
+                        style: theme.textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
-                    ),
-                    GestureDetector(
-                      onTap: () => Navigator.of(context).push(
-                        MaterialPageRoute(
-                          builder: (_) => Scaffold(
-                            appBar: AppBar(title: Text(catName)),
-                            body: const LibraryScreen(),
+                      GestureDetector(
+                        onTap: () => Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (_) => Scaffold(
+                              appBar: AppBar(title: Text(catName)),
+                              body: LibraryScreen(initialCategory: catName),
+                            ),
+                          ),
+                        ),
+                        child: Text(
+                          '查看全部',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: theme.colorScheme.primary,
+                            fontWeight: FontWeight.w600,
                           ),
                         ),
                       ),
-                      child: Text(
-                        '更多→',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: AppTheme.seedPurple,
-                        ),
-                      ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 10),
                 SizedBox(
-                  height: 180,
+                  height: 226,
                   child: ListView.builder(
                     scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
                     itemCount: books.length,
                     itemBuilder: (context, i) {
                       final book = books[i];
@@ -577,59 +464,29 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                         ),
                         child: Container(
-                          width: 88,
+                          width: 112,
                           margin: EdgeInsets.only(
                             right: i < books.length - 1 ? 10 : 0,
                           ),
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(6),
-                                child: Image.network(
-                                  coverUrl,
-                                  width: 88,
-                                  height: 124,
-                                  fit: BoxFit.cover,
-                                  errorBuilder: (_, __, ___) => Container(
-                                    width: 88,
-                                    height: 124,
-                                    decoration: BoxDecoration(
-                                      gradient: LinearGradient(
-                                        begin: Alignment.topLeft,
-                                        end: Alignment.bottomRight,
-                                        colors: [
-                                          theme.colorScheme.primaryContainer,
-                                          theme.colorScheme.tertiaryContainer,
-                                        ],
-                                      ),
-                                      borderRadius: BorderRadius.circular(6),
-                                    ),
-                                    child: Center(
-                                      child: Text(
-                                        book.title.length > 2
-                                            ? book.title.substring(0, 2)
-                                            : book.title,
-                                        style: TextStyle(
-                                          fontSize: 14,
-                                          fontWeight: FontWeight.w700,
-                                          color: theme
-                                              .colorScheme
-                                              .onPrimaryContainer,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ),
+                              OohBookCover(
+                                imageUrl: coverUrl,
+                                title: book.title,
+                                width: 112,
+                                height: 168,
+                                borderRadius: BorderRadius.circular(9),
                               ),
-                              const SizedBox(height: 4),
+                              const SizedBox(height: 8),
                               Text(
                                 book.title,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: theme.textTheme.bodySmall?.copyWith(
                                   fontWeight: FontWeight.w500,
-                                  fontSize: 12,
+                                  fontSize: 13,
+                                  height: 1.25,
                                 ),
                               ),
                               if (book.author.isNotEmpty)
@@ -659,8 +516,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   String _formatWordCount(int count) {
-    if (count >= 10000)
+    if (count >= 10000) {
       return '${(count / 10000).toStringAsFixed(count >= 1000000 ? 0 : 1)}万字';
+    }
     return '$count字';
   }
 
@@ -671,88 +529,29 @@ class _HomeScreenState extends State<HomeScreen> {
     IconData icon, {
     Color? color,
   }) {
-    final accent = color ?? AppTheme.seedPurple;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 24, 20, 12),
-      child: Row(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(6),
-            decoration: BoxDecoration(
-              color: accent.withValues(alpha: 0.1),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Icon(icon, size: 16, color: accent),
-          ),
-          const SizedBox(width: 10),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                kicker,
-                style: TextStyle(
-                  fontSize: 10,
-                  fontWeight: FontWeight.w600,
-                  color: accent,
-                  letterSpacing: 1,
-                ),
-              ),
-              Text(
-                title,
-                style: theme.textTheme.titleMedium?.copyWith(
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
+    return OohSectionHeader(title: title, subtitle: kicker);
   }
 
   Widget _buildSearchBar(ThemeData theme, bool isDark) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-      child: GestureDetector(
-        onTap: () {
-          Navigator.of(context).push(
+    return LayoutBuilder(
+      builder: (context, constraints) => Padding(
+        padding: EdgeInsets.fromLTRB(
+          OohPageMetrics.horizontalPadding(constraints.maxWidth),
+          12,
+          OohPageMetrics.horizontalPadding(constraints.maxWidth),
+          0,
+        ),
+        child: SearchBar(
+          hintText: '搜索书名、作者或分类',
+          leading: const Icon(Icons.search_rounded),
+          trailing: const [Icon(Icons.arrow_forward_rounded, size: 18)],
+          onTap: () => Navigator.of(context).push(
             MaterialPageRoute(
               builder: (_) => Scaffold(
                 appBar: AppBar(title: const Text('书库')),
                 body: const LibraryScreen(),
               ),
             ),
-          );
-        },
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          decoration: BoxDecoration(
-            color: isDark ? const Color(0xFF1E1E30) : Colors.white,
-            borderRadius: BorderRadius.circular(14),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: 0.04),
-                blurRadius: 8,
-                offset: const Offset(0, 2),
-              ),
-            ],
-          ),
-          child: Row(
-            children: [
-              Icon(
-                Icons.search,
-                size: 20,
-                color: theme.colorScheme.onSurface.withValues(alpha: 0.35),
-              ),
-              const SizedBox(width: 10),
-              Text(
-                '搜索书名、作者...',
-                style: TextStyle(
-                  fontSize: 14,
-                  color: theme.colorScheme.onSurface.withValues(alpha: 0.35),
-                ),
-              ),
-            ],
           ),
         ),
       ),
@@ -766,59 +565,25 @@ class _HomeScreenState extends State<HomeScreen> {
         ? (progressData.within * 100).round()
         : 0;
 
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-      child: GestureDetector(
-        onTap: _navigatingToReader ? null : () => _openContinueReading(entry),
-        child: Container(
-          padding: const EdgeInsets.all(14),
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: isDark
-                  ? [const Color(0xFF2A2545), const Color(0xFF1E1E30)]
-                  : [const Color(0xFFF0EDFF), const Color(0xFFE8E4FF)],
-            ),
-            borderRadius: BorderRadius.circular(16),
-            boxShadow: [
-              BoxShadow(
-                color: AppTheme.seedPurple.withValues(alpha: 0.08),
-                blurRadius: 12,
-                offset: const Offset(0, 4),
-              ),
-            ],
-          ),
+    return LayoutBuilder(
+      builder: (context, constraints) => Padding(
+        padding: EdgeInsets.fromLTRB(
+          OohPageMetrics.horizontalPadding(constraints.maxWidth),
+          14,
+          OohPageMetrics.horizontalPadding(constraints.maxWidth),
+          0,
+        ),
+        child: OohSurface(
+          onTap: _navigatingToReader ? null : () => _openContinueReading(entry),
+          padding: const EdgeInsets.all(16),
           child: Row(
             children: [
-              ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: Image.network(
-                  _api.coverUrl(entry.book.id),
-                  width: 48,
-                  height: 64,
-                  fit: BoxFit.cover,
-                  errorBuilder: (_, __, ___) => Container(
-                    width: 48,
-                    height: 64,
-                    decoration: BoxDecoration(
-                      color: AppTheme.seedPurple.withValues(alpha: 0.15),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Center(
-                      child: Text(
-                        entry.book.title.length > 1
-                            ? entry.book.title.substring(0, 1)
-                            : entry.book.title,
-                        style: const TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w700,
-                          color: AppTheme.seedPurple,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
+              OohBookCover(
+                imageUrl: _api.coverUrl(entry.book.id),
+                title: entry.book.title,
+                width: 52,
+                height: 72,
+                borderRadius: BorderRadius.circular(9),
               ),
               const SizedBox(width: 14),
               Expanded(
@@ -828,18 +593,11 @@ class _HomeScreenState extends State<HomeScreen> {
                   children: [
                     Row(
                       children: [
-                        Icon(
-                          Icons.history,
-                          size: 14,
-                          color: AppTheme.seedPurple,
-                        ),
-                        const SizedBox(width: 4),
                         Text(
                           '继续阅读',
-                          style: TextStyle(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600,
-                            color: AppTheme.seedPurple,
+                          style: theme.textTheme.labelMedium?.copyWith(
+                            color: theme.colorScheme.primary,
+                            fontWeight: FontWeight.w700,
                           ),
                         ),
                       ],
@@ -866,61 +624,29 @@ class _HomeScreenState extends State<HomeScreen> {
                       ),
                     ),
                     if (progressPercent > 0) ...[
-                      const SizedBox(height: 6),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: ClipRRect(
-                              borderRadius: BorderRadius.circular(3),
-                              child: LinearProgressIndicator(
-                                value: progressData!.within,
-                                minHeight: 4,
-                                backgroundColor: AppTheme.seedPurple.withValues(
-                                  alpha: 0.1,
-                                ),
-                                valueColor: const AlwaysStoppedAnimation(
-                                  AppTheme.seedPurple,
-                                ),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Text(
-                            '$progressPercent%',
-                            style: const TextStyle(
-                              fontSize: 10,
-                              fontWeight: FontWeight.w600,
-                              color: AppTheme.seedPurple,
-                            ),
-                          ),
-                        ],
+                      const SizedBox(height: 5),
+                      Text(
+                        '本章进度 $progressPercent%',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.primary,
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
                     ],
                   ],
                 ),
               ),
               const SizedBox(width: 8),
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: AppTheme.seedPurple.withValues(alpha: 0.1),
-                  shape: BoxShape.circle,
-                ),
-                child: _navigatingToReader
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: AppTheme.seedPurple,
-                        ),
-                      )
-                    : const Icon(
-                        Icons.play_arrow_rounded,
-                        size: 20,
-                        color: AppTheme.seedPurple,
-                      ),
-              ),
+              _navigatingToReader
+                  ? const SizedBox(
+                      width: 22,
+                      height: 22,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : Icon(
+                      Icons.arrow_forward_rounded,
+                      color: theme.colorScheme.primary,
+                    ),
             ],
           ),
         ),
@@ -928,25 +654,216 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildHero(ThemeData theme) {
-    final heroBooks = _featured.take(6).toList();
-    if (heroBooks.isEmpty) {
-      return Container(
-        margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-        padding: const EdgeInsets.all(20),
-        decoration: BoxDecoration(
-          gradient: const LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: [Color(0xFF6C5CE7), Color(0xFF8B7CF6), Color(0xFFA29BFE)],
-          ),
-          borderRadius: BorderRadius.circular(12),
+  Widget _buildEditorialHero(ThemeData theme) {
+    final carouselBooks = _featured
+        .take(oohHomeHeroBookLimit)
+        .toList(growable: false);
+    if (carouselBooks.isNotEmpty) {
+      return OohHomeHeroCarousel(
+        books: carouselBooks,
+        coverUrlFor: (book) => book.coverUrl != null
+            ? _api.fullCoverUrl(book.coverUrl)
+            : _api.coverUrl(book.id),
+        synopsisFor: heroSynopsisFor,
+        chapterLabelFor: heroChapterCountLabelFor,
+        onOpen: (book) => Navigator.of(context).push(
+          MaterialPageRoute(builder: (_) => BookDetailScreen(bookId: book.id)),
         ),
-        child: Text(
-          '好故事正在发生',
-          style: theme.textTheme.titleMedium?.copyWith(
-            color: Colors.white,
-            fontWeight: FontWeight.w800,
+      );
+    }
+    final heroBooks = _featured.take(oohHomeHeroBookLimit).toList();
+    if (heroBooks.isEmpty) return const SizedBox.shrink();
+    final book = heroBooks[_heroIndex % heroBooks.length];
+    final coverUrl = book.coverUrl != null
+        ? _api.fullCoverUrl(book.coverUrl)
+        : _api.coverUrl(book.id);
+    final synopsis = heroSynopsisFor(book);
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final horizontal = OohPageMetrics.horizontalPadding(
+          constraints.maxWidth,
+        );
+        final tablet = constraints.maxWidth >= 720;
+        final coverWidth = tablet ? 138.0 : 106.0;
+        final coverHeight = coverWidth * 1.5;
+        return Padding(
+          padding: EdgeInsets.fromLTRB(horizontal, 14, horizontal, 0),
+          child: Semantics(
+            button: true,
+            label: '打开编辑精选《${book.title}》',
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 220),
+              child: OohSurface(
+                key: ValueKey(book.id),
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => BookDetailScreen(bookId: book.id),
+                  ),
+                ),
+                padding: EdgeInsets.zero,
+                child: SizedBox(
+                  height: tablet ? 226 : 196,
+                  child: Stack(
+                    children: [
+                      Positioned.fill(
+                        left: constraints.maxWidth * .46,
+                        child: Opacity(
+                          opacity: theme.brightness == Brightness.dark
+                              ? .13
+                              : .08,
+                          child: OohNetworkImage(
+                            imageUrl: coverUrl,
+                            fit: BoxFit.cover,
+                            alignment: Alignment.topCenter,
+                            error: const SizedBox.shrink(),
+                          ),
+                        ),
+                      ),
+                      Positioned.fill(
+                        child: DecoratedBox(
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              begin: Alignment.centerLeft,
+                              end: Alignment.centerRight,
+                              colors: [
+                                theme.colorScheme.surface,
+                                theme.colorScheme.surface.withValues(
+                                  alpha: .96,
+                                ),
+                                theme.colorScheme.surface.withValues(
+                                  alpha: .68,
+                                ),
+                              ],
+                              stops: const [0, .62, 1],
+                            ),
+                          ),
+                        ),
+                      ),
+                      Padding(
+                        padding: EdgeInsets.all(tablet ? 20 : 16),
+                        child: Row(
+                          children: [
+                            OohBookCover(
+                              imageUrl: coverUrl,
+                              title: book.title,
+                              width: coverWidth,
+                              height: coverHeight,
+                              borderRadius: BorderRadius.circular(9),
+                            ),
+                            SizedBox(width: tablet ? 24 : 17),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    '编辑精选',
+                                    style: theme.textTheme.labelMedium
+                                        ?.copyWith(
+                                          color: theme.colorScheme.primary,
+                                          fontWeight: FontWeight.w800,
+                                        ),
+                                  ),
+                                  SizedBox(height: tablet ? 8 : 6),
+                                  Text(
+                                    book.title,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: theme.textTheme.headlineSmall
+                                        ?.copyWith(
+                                          fontWeight: FontWeight.w800,
+                                          height: 1.16,
+                                          letterSpacing: -.4,
+                                        ),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  Text(
+                                    book.author,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: theme.textTheme.bodySmall,
+                                  ),
+                                  if (tablet) ...[
+                                    const SizedBox(height: 9),
+                                    Text(
+                                      synopsis,
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: theme.textTheme.bodySmall
+                                          ?.copyWith(height: 1.45),
+                                    ),
+                                  ],
+                                  const Spacer(),
+                                  Row(
+                                    children: [
+                                      Expanded(
+                                        child: Text(
+                                          [
+                                            if (book.category != null)
+                                              book.category!,
+                                            heroChapterCountLabelFor(book),
+                                            book.status == 'finished'
+                                                ? '完结'
+                                                : '连载',
+                                          ].join('  '),
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: theme.textTheme.labelSmall,
+                                        ),
+                                      ),
+                                      Icon(
+                                        Icons.arrow_forward_rounded,
+                                        size: 20,
+                                        color: theme.colorScheme.primary,
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildHero(ThemeData theme) {
+    final heroBooks = _featured.take(oohHomeHeroBookLimit).toList();
+    if (heroBooks.isEmpty) {
+      return LayoutBuilder(
+        builder: (context, constraints) => Padding(
+          padding: EdgeInsets.fromLTRB(
+            OohPageMetrics.horizontalPadding(constraints.maxWidth),
+            14,
+            OohPageMetrics.horizontalPadding(constraints.maxWidth),
+            0,
+          ),
+          child: OohSurface(
+            child: Row(
+              children: [
+                Icon(
+                  Icons.auto_stories_outlined,
+                  color: theme.colorScheme.primary,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    '好故事正在整理，稍后下拉刷新即可查看。',
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       );
@@ -956,7 +873,6 @@ class _HomeScreenState extends State<HomeScreen> {
     final coverUrl = book.coverUrl != null
         ? _api.fullCoverUrl(book.coverUrl)
         : _api.coverUrl(book.id);
-    final isDark = theme.brightness == Brightness.dark;
     final statusText = book.status == 'finished' ? '已完结' : '连载中';
     final statusColor = book.status == 'finished'
         ? const Color(0xFF238760)
@@ -973,71 +889,63 @@ class _HomeScreenState extends State<HomeScreen> {
       child: Container(
         margin: const EdgeInsets.fromLTRB(12, 6, 12, 0),
         decoration: BoxDecoration(
-          gradient: isDark
-              ? null
-              : const LinearGradient(
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                  colors: [
-                    Color(0xFFF4FAFF),
-                    Color(0xFFEAF5FF),
-                    Color(0xFFDBEEFF),
-                  ],
-                ),
-          color: isDark ? const Color(0xFF1A1A2E) : null,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: isDark ? Colors.white10 : const Color(0xFFDBEAFA),
-          ),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.06),
-              blurRadius: 12,
-              offset: const Offset(0, 4),
-            ),
-          ],
+          gradient: AppTheme.heroGradient,
+          borderRadius: BorderRadius.circular(AppTheme.cardRadius),
+          border: Border.all(color: Colors.white.withValues(alpha: .14)),
+          boxShadow: [AppTheme.softShadow(theme.brightness)],
         ),
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final coverWidth = constraints.maxWidth < 340 ? 104.0 : 120.0;
+            final coverWidth = heroCoverWidthFor(constraints.maxWidth);
+            final coverHeight = heroCoverHeightFor(constraints.maxWidth);
 
-            return IntrinsicHeight(
+            return SizedBox(
+              height: coverHeight,
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  ClipRRect(
-                    borderRadius: const BorderRadius.only(
-                      topLeft: Radius.circular(12),
-                      bottomLeft: Radius.circular(12),
-                    ),
-                    child: AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 400),
-                      child: Image.network(
-                        coverUrl,
-                        key: ValueKey(book.id),
-                        width: coverWidth,
-                        fit: BoxFit.cover,
-                        errorBuilder: (_, __, ___) => Container(
-                          width: coverWidth,
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              begin: Alignment.topLeft,
-                              end: Alignment.bottomRight,
-                              colors: [
-                                theme.colorScheme.primaryContainer,
-                                theme.colorScheme.tertiaryContainer,
-                              ],
-                            ),
-                          ),
-                          child: Center(
-                            child: Text(
-                              book.title.length > 2
-                                  ? book.title.substring(0, 2)
-                                  : book.title,
-                              style: TextStyle(
-                                fontSize: 16,
-                                fontWeight: FontWeight.w700,
-                                color: theme.colorScheme.onPrimaryContainer,
+                  SizedBox(
+                    width: coverWidth,
+                    height: coverHeight,
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(color: AppTheme.brandNavy),
+                      child: ClipRRect(
+                        borderRadius: const BorderRadius.only(
+                          topLeft: Radius.circular(AppTheme.cardRadius),
+                          bottomLeft: Radius.circular(AppTheme.cardRadius),
+                        ),
+                        child: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 400),
+                          child: OohNetworkImage(
+                            imageUrl: coverUrl,
+                            key: ValueKey(book.id),
+                            width: coverWidth,
+                            height: coverHeight,
+                            fit: BoxFit.cover,
+                            error: Container(
+                              width: coverWidth,
+                              height: coverHeight,
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  begin: Alignment.topLeft,
+                                  end: Alignment.bottomRight,
+                                  colors: [
+                                    theme.colorScheme.primaryContainer,
+                                    theme.colorScheme.tertiaryContainer,
+                                  ],
+                                ),
+                              ),
+                              child: Center(
+                                child: Text(
+                                  book.title.length > 2
+                                      ? book.title.substring(0, 2)
+                                      : book.title,
+                                  style: TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w700,
+                                    color: theme.colorScheme.onPrimaryContainer,
+                                  ),
+                                ),
                               ),
                             ),
                           ),
@@ -1047,7 +955,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   Expanded(
                     child: Padding(
-                      padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+                      padding: const EdgeInsets.fromLTRB(20, 18, 16, 14),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
@@ -1060,19 +968,17 @@ class _HomeScreenState extends State<HomeScreen> {
                                     vertical: 1,
                                   ),
                                   decoration: BoxDecoration(
-                                    color: AppTheme.seedPurple.withValues(
-                                      alpha: 0.12,
-                                    ),
-                                    borderRadius: BorderRadius.circular(4),
+                                    color: Colors.white.withValues(alpha: .14),
+                                    borderRadius: BorderRadius.circular(8),
                                   ),
                                   child: Text(
                                     book.category ?? '小说',
                                     maxLines: 1,
                                     overflow: TextOverflow.ellipsis,
                                     style: const TextStyle(
-                                      fontSize: 9,
+                                      fontSize: 11,
                                       fontWeight: FontWeight.w700,
-                                      color: AppTheme.seedPurple,
+                                      color: Colors.white,
                                     ),
                                   ),
                                 ),
@@ -1103,10 +1009,11 @@ class _HomeScreenState extends State<HomeScreen> {
                             book.title,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-                            style: theme.textTheme.titleSmall?.copyWith(
-                              fontWeight: FontWeight.w700,
-                              fontSize: 15,
-                              letterSpacing: -0.01,
+                            style: theme.textTheme.titleLarge?.copyWith(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w800,
+                              fontSize: 20,
+                              letterSpacing: -.4,
                             ),
                           ),
                           const SizedBox(height: 4),
@@ -1116,14 +1023,12 @@ class _HomeScreenState extends State<HomeScreen> {
                               if (book.wordCount != null)
                                 _formatWordCount(book.wordCount!),
                               heroChapterCountLabelFor(book),
-                            ].join(' · '),
+                            ].join('  |  '),
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
-                              fontSize: 10,
-                              color: theme.colorScheme.onSurface.withValues(
-                                alpha: 0.5,
-                              ),
+                              fontSize: 12,
+                              color: Colors.white.withValues(alpha: .68),
                             ),
                           ),
                           const SizedBox(height: 6),
@@ -1132,11 +1037,9 @@ class _HomeScreenState extends State<HomeScreen> {
                             maxLines: 3,
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
-                              fontSize: 11,
-                              height: 1.4,
-                              color: theme.colorScheme.onSurface.withValues(
-                                alpha: isDark ? 0.72 : 0.66,
-                              ),
+                              fontSize: 13,
+                              height: 1.5,
+                              color: Colors.white.withValues(alpha: .8),
                             ),
                           ),
                           if (heroBooks.length > 1) ...[
@@ -1179,7 +1082,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                             ),
                                             border: Border.all(
                                               color: isActive
-                                                  ? AppTheme.seedPurple
+                                                  ? Colors.white
                                                   : Colors.transparent,
                                               width: 1.5,
                                             ),
@@ -1188,24 +1091,23 @@ class _HomeScreenState extends State<HomeScreen> {
                                             borderRadius: BorderRadius.circular(
                                               2,
                                             ),
-                                            child: Image.network(
-                                              tabCover,
+                                            child: OohNetworkImage(
+                                              imageUrl: tabCover,
                                               fit: BoxFit.cover,
-                                              errorBuilder: (_, __, ___) =>
-                                                  Container(
-                                                    decoration: BoxDecoration(
-                                                      gradient: LinearGradient(
-                                                        colors: [
-                                                          theme
-                                                              .colorScheme
-                                                              .primaryContainer,
-                                                          theme
-                                                              .colorScheme
-                                                              .tertiaryContainer,
-                                                        ],
-                                                      ),
-                                                    ),
+                                              error: Container(
+                                                decoration: BoxDecoration(
+                                                  gradient: LinearGradient(
+                                                    colors: [
+                                                      theme
+                                                          .colorScheme
+                                                          .primaryContainer,
+                                                      theme
+                                                          .colorScheme
+                                                          .tertiaryContainer,
+                                                    ],
                                                   ),
+                                                ),
+                                              ),
                                             ),
                                           ),
                                         ),
@@ -1229,109 +1131,17 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildStats(ThemeData theme, bool isDark) {
-    final bookTotal = _stats['readable_total'] ?? _stats['book_total'] ?? 0;
-    final catTotal = _stats['category_total'] ?? 0;
-    final deconTotal = _stats['deconstruction_total'] ?? 0;
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-      child: Row(
-        children: [
-          _statCard(
-            theme,
-            isDark,
-            _formatNum(bookTotal),
-            '可读作品',
-            Icons.menu_book_rounded,
-            const Color(0xFF6C5CE7),
-          ),
-          const SizedBox(width: 8),
-          _statCard(
-            theme,
-            isDark,
-            _formatNum(catTotal),
-            '题材分类',
-            Icons.category_rounded,
-            const Color(0xFFFD79A8),
-          ),
-          const SizedBox(width: 8),
-          _statCard(
-            theme,
-            isDark,
-            _formatNum(deconTotal),
-            '拆书档案',
-            Icons.analytics_rounded,
-            const Color(0xFF00B894),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _statCard(
-    ThemeData theme,
-    bool isDark,
-    String value,
-    String label,
-    IconData icon,
-    Color accent,
-  ) {
-    final cardColor = isDark ? const Color(0xFF1E1E30) : Colors.white;
-    return Expanded(
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 14),
-        decoration: BoxDecoration(
-          color: cardColor,
-          borderRadius: BorderRadius.circular(14),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.04),
-              blurRadius: 8,
-              offset: const Offset(0, 2),
-            ),
-          ],
-        ),
-        child: Column(
-          children: [
-            Icon(icon, size: 18, color: accent),
-            const SizedBox(height: 6),
-            Text(
-              value,
-              style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.w800,
-                color: accent,
-              ),
-            ),
-            const SizedBox(height: 2),
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 10,
-                color: theme.colorScheme.onSurface.withValues(alpha: 0.5),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  String _formatNum(dynamic n) {
-    final v = (n is int) ? n : int.tryParse(n.toString()) ?? 0;
-    if (v >= 10000) return '${(v / 10000).toStringAsFixed(0)}万';
-    return v.toString();
-  }
-
-  @override
   void _startHeroTimer() {
     _heroTimer?.cancel();
-    final heroBooks = _featured.take(6).toList();
+    if (!mounted || MediaQuery.maybeDisableAnimationsOf(context) == true) {
+      return;
+    }
+    final heroBooks = _featured.take(oohHomeHeroBookLimit).toList();
     if (heroBooks.length <= 1) return;
     _heroTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (mounted)
+      if (mounted) {
         setState(() => _heroIndex = (_heroIndex + 1) % heroBooks.length);
+      }
     });
   }
 
