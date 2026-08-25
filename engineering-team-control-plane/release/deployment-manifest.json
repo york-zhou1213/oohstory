@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "package_version": "1.0.0",
+  "runtime_contract": "preserve listed relative paths",
+  "files": [
+    {"source": "src/learning_control_plane/__init__.py", "runtime": "src/learning_control_plane/__init__.py", "sha256": "76937c01b123cb4ea9e3e9e8b1fa491d1e83a7ea5f951106e1ddffd3a381e5b7"},
+    {"source": "src/learning_control_plane/allocator.py", "runtime": "src/learning_control_plane/allocator.py", "sha256": "de79aef32d872335d60955ebf3e91e07e700b00a3f5d1adfb0bd6b3f7fbb17b3"},
+    {"source": "src/learning_control_plane/audit.py", "runtime": "src/learning_control_plane/audit.py", "sha256": "2b38395630791c6eb8fce1fb06c4f0bb23a2f03c8ec5615e608cbacb7ec6e32d"},
+    {"source": "src/learning_control_plane/cli.py", "runtime": "src/learning_control_plane/cli.py", "sha256": "425cdead7700f6e37807502146a49d98a38ba9a6274fbc7018c79c244f450328"},
+    {"source": "src/learning_control_plane/common.py", "runtime": "src/learning_control_plane/common.py", "sha256": "16700eb8eccf8e1b52d210ac1c2ef2973d216169282170f57e89005c6bbd384f"},
+    {"source": "src/learning_control_plane/deployment.py", "runtime": "src/learning_control_plane/deployment.py", "sha256": "faa3cb69d064139196187686b4dc121c8c3d860bcc61512281c7a8a222009195"},
+    {"source": "src/learning_control_plane/migration.py", "runtime": "src/learning_control_plane/migration.py", "sha256": "9f672db887e880b59da41683fdce71892590131806f28aa426ed2b51270c8bf6"},
+    {"source": "scripts/learning_control_plane.py", "runtime": "scripts/learning_control_plane.py", "sha256": "bf8179ff36b8f75a6b1357c30b909df8f0bb7afc0f1454865ccdb0e8dc831d2f"}
+  ]
+}
