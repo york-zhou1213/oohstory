@@ -95,14 +95,17 @@ def _safe_write_path(path: Path, field: str, *, allow_leaf_symlink: bool = False
 
 
 def _require_distinct_managed_paths(paths: tuple[tuple[Path, str], ...]) -> None:
-    """Reject lexical and hard-link aliases before a recovery mutation."""
+    """Reject overlapping namespaces and hard-link aliases before mutation."""
     names: dict[str, str] = {}
     inodes: dict[tuple[int, int], str] = {}
     for path, field in paths:
         normalized = os.path.normcase(os.path.abspath(path))
-        if normalized in names:
-            raise ControlPlaneError(
-                f"managed adapter paths must be distinct: {names[normalized]} and {field}")
+        for existing, existing_field in names.items():
+            if (normalized == existing
+                    or os.path.commonpath((normalized, existing)) in {normalized, existing}):
+                raise ControlPlaneError(
+                    "managed adapter paths must be distinct: "
+                    f"{existing_field} and {field}")
         names[normalized] = field
         try:
             status = os.stat(path, follow_symlinks=False)
@@ -184,13 +187,22 @@ def _require_regular_leaf(directory_fd: int, name: str, field: str) -> os.stat_r
     return status
 
 
-def _read_bytes_at(directory_fd: int, name: str, field: str) -> bytes:
-    _require_regular_leaf(directory_fd, name, field)
+def _open_regular_leaf_fd(
+        directory_fd: int, name: str, field: str) -> tuple[int, os.stat_result]:
     try:
-        descriptor = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                             dir_fd=directory_fd)
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd)
     except OSError as exc:
         raise ControlPlaneError(f"{field} must be a stable real file") from exc
+    status = os.fstat(descriptor)
+    if not stat.S_ISREG(status.st_mode):
+        os.close(descriptor)
+        raise ControlPlaneError(f"{field} must be a real file")
+    return descriptor, status
+
+
+def _read_bytes_at(directory_fd: int, name: str, field: str) -> bytes:
+    descriptor, _status = _open_regular_leaf_fd(directory_fd, name, field)
     with os.fdopen(descriptor, "rb") as handle:
         return handle.read()
 
@@ -217,6 +229,20 @@ def _read_json_path(path: Path, field: str) -> dict[str, Any]:
 
 def _sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def _sha256_fd(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while block := os.read(descriptor, 1024 * 1024):
+        digest.update(block)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return digest.hexdigest()
+
+
+def _file_identity(status: os.stat_result) -> tuple[int, int, int, int]:
+    return (status.st_dev, status.st_ino, stat.S_IFMT(status.st_mode),
+            stat.S_IMODE(status.st_mode))
 
 
 def _atomic_write_at(directory_fd: int, name: str, content: bytes, *, mode: int,
@@ -915,14 +941,7 @@ def verify_live_consumer(contract_path: Path, manifest_path: Path, source_root: 
         failures.append("active release manifest hash mismatch")
     if metadata["contract_sha256"] != sha256_file(contract.path):
         failures.append("active release contract hash mismatch")
-    if contract.consumer.is_symlink() or not contract.consumer.is_file():
-        failures.append("canonical consumer is missing or unsafe")
-    else:
-        consumer_status = os.stat(contract.consumer, follow_symlinks=False)
-        if sha256_file(contract.consumer) != metadata["adapter_sha256"]:
-            failures.append("canonical consumer does not equal the active reviewed adapter")
-        if stat.S_IMODE(consumer_status.st_mode) != 0o755:
-            failures.append("canonical consumer mode must be 0755")
+    inspection: dict[str, Any] = {}
     legacy = reject_symlink_ancestors(contract.runtime_root / contract.legacy_target)
     legacy_metadata_path = reject_symlink_ancestors(legacy.with_name("legacy-metadata.json"))
     if legacy.is_symlink() or not legacy.is_file() or legacy_metadata_path.is_symlink() or not legacy_metadata_path.is_file():
@@ -937,19 +956,63 @@ def verify_live_consumer(contract_path: Path, manifest_path: Path, source_root: 
               or isinstance(legacy_metadata.get("mode"), bool)
               or not isinstance(legacy_metadata.get("mode"), int)):
             failures.append("legacy compatibility target hash mismatch")
-    inspection: dict[str, Any] = {}
-    if not failures:
-        completed = subprocess.run(
-            [sys.executable, str(contract.consumer), "--adapter-inspect"],
-            check=False, capture_output=True, text=True, timeout=10,
-        )
-        if completed.returncode != 0:
-            failures.append(f"canonical consumer inspection failed: {completed.stderr.strip()}")
-        else:
+    try:
+        with _directory_fd(
+                contract.consumer.parent, "canonical consumer") as consumer_directory_fd:
+            consumer_fd, consumer_status = _open_regular_leaf_fd(
+                consumer_directory_fd, contract.consumer.name, "canonical consumer")
             try:
-                inspection = json.loads(completed.stdout)
-            except json.JSONDecodeError as exc:
-                failures.append(f"canonical consumer inspection returned malformed JSON: {exc}")
+                consumer_identity = _file_identity(consumer_status)
+                if _sha256_fd(consumer_fd) != metadata["adapter_sha256"]:
+                    failures.append(
+                        "canonical consumer does not equal the active reviewed adapter")
+                if stat.S_IMODE(consumer_status.st_mode) != 0o755:
+                    failures.append("canonical consumer mode must be 0755")
+                if not failures:
+                    inspection_bootstrap = (
+                        "import os,sys;"
+                        "fd=int(sys.argv[1]);path=sys.argv[2];"
+                        "source=os.fdopen(fd,'rb',closefd=False).read();"
+                        "sys.argv=[path,*sys.argv[3:]];"
+                        "exec(compile(source,path,'exec'),"
+                        "{'__name__':'__main__','__file__':path})"
+                    )
+                    completed = subprocess.run(
+                        [sys.executable, "-c", inspection_bootstrap,
+                         str(consumer_fd), str(contract.consumer),
+                         "--adapter-inspect"],
+                        check=False, capture_output=True, text=True, timeout=10,
+                        pass_fds=(consumer_fd,),
+                    )
+                    try:
+                        descriptor_status = os.fstat(consumer_fd)
+                        with _directory_fd(
+                                contract.consumer.parent,
+                                "post-inspection canonical consumer") as current_directory_fd:
+                            path_status = os.stat(
+                                contract.consumer.name, dir_fd=current_directory_fd,
+                                follow_symlinks=False)
+                    except (ControlPlaneError, OSError):
+                        failures.append("canonical consumer changed during inspection")
+                    else:
+                        if (consumer_identity != _file_identity(path_status)
+                                or consumer_identity != _file_identity(descriptor_status)):
+                            failures.append("canonical consumer changed during inspection")
+                    if completed.returncode != 0:
+                        failures.append(
+                            "canonical consumer inspection failed: "
+                            f"{completed.stderr.strip()}")
+                    else:
+                        try:
+                            inspection = json.loads(completed.stdout)
+                        except json.JSONDecodeError as exc:
+                            failures.append(
+                                "canonical consumer inspection returned malformed JSON: "
+                                f"{exc}")
+            finally:
+                os.close(consumer_fd)
+    except ControlPlaneError:
+        failures.append("canonical consumer is missing or unsafe")
     expected = {
         "active_target": active["target"],
         "release_entrypoint": str(active["entrypoint"]),

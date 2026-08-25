@@ -237,7 +237,7 @@ class ReleaseAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ControlPlaneError, "unsafe target"):
             rollback_release(self.contract, activation)
 
-    def test_adapter_receipt_rejects_managed_path_and_inode_aliases_without_side_effects(self) -> None:
+    def test_adapter_receipt_rejects_managed_namespace_overlap_without_side_effects(self) -> None:
         _source, _manifest, release, _activation = self.prepare_release(
             "release-a", "a" * 40, "release-a")
         adapter = release / "scripts" / "learning_loop_adapter.py"
@@ -253,6 +253,15 @@ class ReleaseAdapterTests(unittest.TestCase):
                     install_adapter(self.contract, adapter, receipt)
                 self.assertEqual(self.consumer.read_bytes(), original_consumer)
                 self.assertTrue(all(not path.exists() for path in managed_outputs))
+
+        legacy = managed_outputs[0]
+        for receipt in (legacy.parent, legacy / "receipt.json"):
+            with self.subTest(receipt=receipt):
+                with self.assertRaisesRegex(ControlPlaneError, "managed adapter paths must be distinct"):
+                    install_adapter(self.contract, adapter, receipt)
+                self.assertEqual(self.consumer.read_bytes(), original_consumer)
+                self.assertTrue(all(not path.exists() for path in managed_outputs))
+                self.assertFalse((self.runtime / "compat").exists())
 
         inode_receipt = self.base / "adapter-inode-alias.json"
         runtime_contract = self.runtime / "runtime-contract.json"
@@ -281,6 +290,53 @@ class ReleaseAdapterTests(unittest.TestCase):
         verified = verify_live_consumer(self.contract, manifest, source)
         self.assertFalse(verified["ok"])
         self.assertIn("canonical consumer mode must be 0755", verified["failures"])
+
+    def test_live_verification_rechecks_consumer_identity_and_mode_after_inspection(self) -> None:
+        source, manifest, release, _activation = self.prepare_release(
+            "release-a", "a" * 40, "release-a")
+        install_adapter(
+            self.contract, release / "scripts" / "learning_loop_adapter.py",
+            self.base / "adapter-race-mode.json")
+        original_run = subprocess.run
+
+        def chmod_before_inspection(*args, **kwargs):
+            self.consumer.chmod(0o644)
+            return original_run(*args, **kwargs)
+
+        with mock.patch.object(
+                release_adapter_module.subprocess, "run",
+                side_effect=chmod_before_inspection):
+            verified = verify_live_consumer(self.contract, manifest, source)
+
+        self.assertFalse(verified["ok"])
+        self.assertIn(
+            "canonical consumer changed during inspection", verified["failures"])
+        self.assertEqual(stat.S_IMODE(self.consumer.stat().st_mode), 0o644)
+
+    def test_live_verification_rechecks_canonical_path_identity_after_inspection(self) -> None:
+        source, manifest, release, _activation = self.prepare_release(
+            "release-a", "a" * 40, "release-a")
+        install_adapter(
+            self.contract, release / "scripts" / "learning_loop_adapter.py",
+            self.base / "adapter-race-path.json")
+        displaced = self.consumer.with_name("learning_loop.displaced.py")
+        original_run = subprocess.run
+
+        def replace_before_inspection(*args, **kwargs):
+            self.consumer.rename(displaced)
+            shutil.copyfile(displaced, self.consumer)
+            self.consumer.chmod(0o755)
+            return original_run(*args, **kwargs)
+
+        with mock.patch.object(
+                release_adapter_module.subprocess, "run",
+                side_effect=replace_before_inspection):
+            verified = verify_live_consumer(self.contract, manifest, source)
+
+        self.assertFalse(verified["ok"])
+        self.assertIn(
+            "canonical consumer changed during inspection", verified["failures"])
+        self.assertNotEqual(self.consumer.stat().st_ino, displaced.stat().st_ino)
 
     def test_contract_rejects_command_or_canonical_path_drift(self) -> None:
         payload = json.loads(self.contract.read_text(encoding="utf-8"))
