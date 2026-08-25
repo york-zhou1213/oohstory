@@ -1,6 +1,7 @@
 """Versioned compatibility-adapter activation and rollback controls."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -133,6 +134,18 @@ def _directory_fd(path: Path, field: str, *, create: bool = False) -> Iterator[i
     try:
         yield descriptor
     finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _runtime_transition_lock(contract: RuntimeContract) -> Iterator[None]:
+    """Serialize every selector and adapter transition on the stable runtime parent."""
+    descriptor = _open_directory_fd(contract.runtime_root.parent, "runtime transition lock")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
 
 
@@ -403,6 +416,14 @@ def activate_release(contract_path: Path, manifest_path: Path, source_root: Path
                      release_root: Path, source_revision: str, receipt_path: Path) -> dict[str, Any]:
     """Verify a versioned release, then atomically switch the active selector."""
     contract = load_runtime_contract(contract_path)
+    with _runtime_transition_lock(contract):
+        return _activate_release_locked(
+            contract, manifest_path, source_root, release_root, source_revision, receipt_path)
+
+
+def _activate_release_locked(contract: RuntimeContract, manifest_path: Path, source_root: Path,
+                             release_root: Path, source_revision: str,
+                             receipt_path: Path) -> dict[str, Any]:
     if not _is_revision(source_revision):
         raise ControlPlaneError("source_revision must be a lowercase 40-character Git SHA")
     expected_parent = reject_symlink_ancestors(contract.runtime_root / contract.releases_dir)
@@ -470,6 +491,11 @@ def activate_release(contract_path: Path, manifest_path: Path, source_root: Path
 def rollback_release(contract_path: Path, receipt_path: Path) -> dict[str, Any]:
     """Restore the exact predecessor recorded by a successful activation."""
     contract = load_runtime_contract(contract_path)
+    with _runtime_transition_lock(contract):
+        return _rollback_release_locked(contract, receipt_path)
+
+
+def _rollback_release_locked(contract: RuntimeContract, receipt_path: Path) -> dict[str, Any]:
     receipt_path = reject_symlink_ancestors(receipt_path)
     if receipt_path.is_symlink() or not receipt_path.is_file():
         raise ControlPlaneError("activation receipt must be a real file")
@@ -524,115 +550,8 @@ def rollback_release(contract_path: Path, receipt_path: Path) -> dict[str, Any]:
     return {"ok": True, "idempotent": False, "active_target": previous}
 
 
-def install_adapter(contract_path: Path, adapter_source: Path, receipt_path: Path) -> dict[str, Any]:
-    """Atomically replace the canonical consumer after preserving its exact legacy bytes."""
-    contract = load_runtime_contract(contract_path)
-    active = resolve_active_release(contract)
-    adapter_source = reject_symlink_ancestors(adapter_source)
-    if (adapter_source.is_symlink() or not adapter_source.is_file()
-            or adapter_source.resolve(strict=True) != active["adapter"].resolve(strict=True)):
-        raise ControlPlaneError("adapter source must come from the exact active release")
-    consumer = _safe_write_path(contract.consumer, "canonical consumer")
-    receipt_path = _safe_write_path(receipt_path, "adapter receipt")
-    if consumer.is_symlink() or not consumer.is_file():
-        raise ControlPlaneError("canonical consumer must be a real file")
-    if receipt_path.exists() or receipt_path.is_symlink():
-        raise ControlPlaneError("adapter receipt path must not already exist")
-    legacy = _safe_write_path(
-        contract.runtime_root / contract.legacy_target, "legacy compatibility target")
-    legacy_metadata = _safe_write_path(
-        legacy.with_name("legacy-metadata.json"), "legacy compatibility metadata")
-    runtime_contract = _safe_write_path(
-        contract.runtime_root / "runtime-contract.json", "runtime contract copy")
-    if any(path.exists() or path.is_symlink()
-           for path in (legacy, legacy_metadata, runtime_contract)):
-        raise ControlPlaneError("legacy compatibility state already exists; use release switching for upgrades")
-    adapter_bytes = _read_bytes_path(adapter_source, "adapter source")
-    contract_bytes = _read_bytes_path(contract.path, "runtime contract")
-    if _sha256_bytes(adapter_bytes) != active["metadata"]["adapter_sha256"]:
-        raise ControlPlaneError("adapter source hash does not match the active release")
-    with (_directory_fd(consumer.parent, "canonical consumer") as consumer_fd,
-          _directory_fd(legacy.parent, "legacy compatibility target", create=True) as legacy_fd,
-          _directory_fd(contract.runtime_root, "runtime contract copy") as runtime_fd,
-          _directory_fd(receipt_path.parent, "adapter receipt", create=True) as receipt_fd):
-        if any(_leaf_stat(directory_fd, name) is not None for directory_fd, name in (
-            (legacy_fd, legacy.name),
-            (legacy_fd, legacy_metadata.name),
-            (runtime_fd, runtime_contract.name),
-        )):
-            raise ControlPlaneError(
-                "legacy compatibility state already exists; use release switching for upgrades")
-        if _leaf_stat(receipt_fd, receipt_path.name) is not None:
-            raise ControlPlaneError("adapter receipt path must not already exist")
-        consumer_status = _require_regular_leaf(
-            consumer_fd, consumer.name, "canonical consumer")
-        original = _read_bytes_at(consumer_fd, consumer.name, "canonical consumer")
-        original_mode = consumer_status.st_mode & 0o777
-        before_sha256 = _sha256_bytes(original)
-        receipt = {
-            "schema_version": 1,
-            "operation": "install-adapter",
-            "contract_sha256": _sha256_bytes(contract_bytes),
-            "before_sha256": before_sha256,
-            "before_mode": original_mode,
-            "after_sha256": _sha256_bytes(adapter_bytes),
-            "active_target": active["target"],
-        }
-        _atomic_write_at(
-            legacy_fd, legacy.name, original, mode=original_mode,
-            field="legacy compatibility target", replace=False)
-        _atomic_json_at(
-            legacy_fd, legacy_metadata.name,
-            {"schema_version": 1, "sha256": before_sha256, "mode": original_mode},
-            field="legacy compatibility metadata")
-        _atomic_write_at(
-            runtime_fd, runtime_contract.name, contract_bytes, mode=0o644,
-            field="runtime contract copy", replace=False)
-        if (_sha256_bytes(_read_bytes_path(legacy, "legacy compatibility target"))
-                != before_sha256
-                or _sha256_bytes(_read_bytes_path(runtime_contract, "runtime contract copy"))
-                != receipt["contract_sha256"]):
-            raise ControlPlaneError("compatibility path changed during adapter installation")
-        _atomic_json_at(
-            receipt_fd, receipt_path.name, receipt, field="adapter receipt")
-        _atomic_write_at(
-            consumer_fd, consumer.name, adapter_bytes, mode=0o755,
-            field="canonical consumer", replace=True)
-        if _sha256_bytes(_read_bytes_at(
-                consumer_fd, consumer.name, "canonical consumer")) != receipt["after_sha256"]:
-            raise ControlPlaneError(
-                "canonical consumer adapter hash mismatch; use exact rollback receipt")
-        persisted_metadata = _read_json_at(
-            legacy_fd, legacy_metadata.name, "legacy compatibility metadata")
-        if (set(persisted_metadata) != LEGACY_METADATA_FIELDS
-                or persisted_metadata.get("schema_version") != 1
-                or persisted_metadata.get("sha256") != receipt["before_sha256"]
-                or persisted_metadata.get("mode") != receipt["before_mode"]
-                or _sha256_bytes(_read_bytes_at(
-                    runtime_fd, runtime_contract.name, "runtime contract copy"))
-                != receipt["contract_sha256"]):
-            raise ControlPlaneError("post-install compatibility state mismatch")
-    if (_sha256_bytes(_read_bytes_path(legacy, "legacy compatibility target"))
-            != receipt["before_sha256"]
-            or _sha256_bytes(_read_bytes_path(runtime_contract, "runtime contract copy"))
-            != receipt["contract_sha256"]
-            or _sha256_bytes(_read_bytes_path(consumer, "canonical consumer"))
-            != receipt["after_sha256"]
-            or _read_json_path(receipt_path, "adapter receipt") != receipt):
-        raise ControlPlaneError("post-install path binding mismatch")
-    if resolve_active_release(contract)["target"] != receipt["active_target"]:
-        raise ControlPlaneError("active release changed during adapter installation")
-    return {"ok": True, "consumer": str(consumer), "active_target": active["target"],
-            "receipt": str(receipt_path), "legacy_sha256": receipt["before_sha256"]}
-
-
-def rollback_adapter(contract_path: Path, receipt_path: Path) -> dict[str, Any]:
-    """Atomically restore the exact pre-adapter canonical consumer."""
-    contract = load_runtime_contract(contract_path)
-    receipt_path = reject_symlink_ancestors(receipt_path)
-    if receipt_path.is_symlink() or not receipt_path.is_file():
-        raise ControlPlaneError("adapter receipt must be a real file")
-    receipt = read_json(receipt_path)
+def _validate_adapter_receipt(
+        contract: RuntimeContract, receipt: dict[str, Any]) -> tuple[int, str]:
     _require_exact_fields(receipt, ADAPTER_RECEIPT_FIELDS, "adapter receipt")
     if (type(receipt.get("schema_version")) is not int or receipt["schema_version"] != 1
             or receipt.get("operation") != "install-adapter"):
@@ -650,8 +569,205 @@ def rollback_adapter(contract_path: Path, receipt_path: Path) -> dict[str, Any]:
     active = _resolve_release_target(contract, active_target, "adapter receipt active_target")
     if active["metadata"]["adapter_sha256"] != receipt["after_sha256"]:
         raise ControlPlaneError("adapter receipt does not match active release metadata")
-    current_target = _read_active_link(contract, allow_absent=True)
-    if current_target != active_target:
+    assert active_target is not None
+    return before_mode, active_target
+
+
+def _validate_legacy_metadata(metadata: dict[str, Any], receipt: dict[str, Any]) -> None:
+    _require_exact_fields(metadata, LEGACY_METADATA_FIELDS, "legacy compatibility metadata")
+    if (type(metadata.get("schema_version")) is not int or metadata["schema_version"] != 1
+            or metadata.get("sha256") != receipt["before_sha256"]
+            or metadata.get("mode") != receipt["before_mode"]):
+        raise ControlPlaneError("legacy compatibility metadata drifted")
+
+
+def install_adapter(contract_path: Path, adapter_source: Path, receipt_path: Path) -> dict[str, Any]:
+    """Install or resume the adapter from its immutable recovery receipt."""
+    contract = load_runtime_contract(contract_path)
+    with _runtime_transition_lock(contract):
+        return _install_adapter_locked(contract, adapter_source, receipt_path)
+
+
+def _install_adapter_locked(
+        contract: RuntimeContract, adapter_source: Path, receipt_path: Path) -> dict[str, Any]:
+    active = resolve_active_release(contract)
+    adapter_source = reject_symlink_ancestors(adapter_source)
+    if (adapter_source.is_symlink() or not adapter_source.is_file()
+            or adapter_source.resolve(strict=True) != active["adapter"].resolve(strict=True)):
+        raise ControlPlaneError("adapter source must come from the exact active release")
+    consumer = _safe_write_path(contract.consumer, "canonical consumer")
+    receipt_path = _safe_write_path(receipt_path, "adapter receipt")
+    if consumer.is_symlink() or not consumer.is_file():
+        raise ControlPlaneError("canonical consumer must be a real file")
+    legacy = _safe_write_path(
+        contract.runtime_root / contract.legacy_target, "legacy compatibility target")
+    legacy_metadata = _safe_write_path(
+        legacy.with_name("legacy-metadata.json"), "legacy compatibility metadata")
+    runtime_contract = _safe_write_path(
+        contract.runtime_root / "runtime-contract.json", "runtime contract copy")
+    adapter_bytes = _read_bytes_path(adapter_source, "adapter source")
+    contract_bytes = _read_bytes_path(contract.path, "runtime contract")
+    adapter_sha256 = _sha256_bytes(adapter_bytes)
+    contract_sha256 = _sha256_bytes(contract_bytes)
+    if adapter_sha256 != active["metadata"]["adapter_sha256"]:
+        raise ControlPlaneError("adapter source hash does not match the active release")
+    if receipt_path.exists() or receipt_path.is_symlink():
+        try:
+            with _directory_fd(receipt_path.parent, "adapter receipt") as receipt_fd:
+                existing_receipt = _read_json_at(
+                    receipt_fd, receipt_path.name, "adapter receipt")
+                _before_mode, receipt_target = _validate_adapter_receipt(
+                    contract, existing_receipt)
+            if (receipt_target != active["target"]
+                    or existing_receipt["after_sha256"] != adapter_sha256
+                    or existing_receipt["contract_sha256"] != contract_sha256):
+                raise ControlPlaneError("adapter receipt does not match this installation")
+        except ControlPlaneError as exc:
+            raise ControlPlaneError(
+                "adapter receipt path must not already exist unless it matches "
+                "a recoverable installation") from exc
+    with (_directory_fd(consumer.parent, "canonical consumer") as consumer_fd,
+          _directory_fd(legacy.parent, "legacy compatibility target", create=True) as legacy_fd,
+          _directory_fd(contract.runtime_root, "runtime contract copy") as runtime_fd,
+          _directory_fd(receipt_path.parent, "adapter receipt", create=True) as receipt_fd):
+        consumer_status = _require_regular_leaf(
+            consumer_fd, consumer.name, "canonical consumer")
+        consumer_bytes = _read_bytes_at(consumer_fd, consumer.name, "canonical consumer")
+        consumer_sha256 = _sha256_bytes(consumer_bytes)
+        receipt_status = _leaf_stat(receipt_fd, receipt_path.name)
+        if receipt_status is None:
+            if any(_leaf_stat(directory_fd, name) is not None for directory_fd, name in (
+                (legacy_fd, legacy.name),
+                (legacy_fd, legacy_metadata.name),
+                (runtime_fd, runtime_contract.name),
+            )):
+                raise ControlPlaneError(
+                    "legacy compatibility state already exists without this recovery receipt")
+            receipt = {
+                "schema_version": 1,
+                "operation": "install-adapter",
+                "contract_sha256": contract_sha256,
+                "before_sha256": consumer_sha256,
+                "before_mode": consumer_status.st_mode & 0o777,
+                "after_sha256": adapter_sha256,
+                "active_target": active["target"],
+            }
+            _atomic_json_at(receipt_fd, receipt_path.name, receipt, field="adapter receipt")
+        else:
+            try:
+                receipt = _read_json_at(receipt_fd, receipt_path.name, "adapter receipt")
+                before_mode, receipt_target = _validate_adapter_receipt(contract, receipt)
+            except ControlPlaneError as exc:
+                raise ControlPlaneError(
+                    "adapter receipt path must not already exist unless it matches "
+                    "a recoverable installation") from exc
+            if (receipt_target != active["target"]
+                    or receipt["after_sha256"] != adapter_sha256
+                    or receipt["contract_sha256"] != contract_sha256):
+                raise ControlPlaneError("adapter receipt does not match this installation")
+            if consumer_sha256 not in {receipt["before_sha256"], receipt["after_sha256"]}:
+                raise ControlPlaneError("canonical consumer drifted during adapter recovery")
+            if (consumer_sha256 == receipt["before_sha256"]
+                    and consumer_status.st_mode & 0o777 != before_mode):
+                raise ControlPlaneError("canonical consumer mode drifted during adapter recovery")
+
+        legacy_status = _leaf_stat(legacy_fd, legacy.name)
+        if legacy_status is None:
+            if consumer_sha256 != receipt["before_sha256"]:
+                raise ControlPlaneError(
+                    "legacy compatibility target is missing after consumer publication")
+            _atomic_write_at(
+                legacy_fd, legacy.name, consumer_bytes, mode=receipt["before_mode"],
+                field="legacy compatibility target", replace=False)
+        else:
+            legacy_bytes = _read_bytes_at(
+                legacy_fd, legacy.name, "legacy compatibility target")
+            if (_sha256_bytes(legacy_bytes) != receipt["before_sha256"]
+                    or legacy_status.st_mode & 0o777 != receipt["before_mode"]):
+                raise ControlPlaneError("legacy compatibility target drifted")
+
+        if _leaf_stat(legacy_fd, legacy_metadata.name) is None:
+            _atomic_json_at(
+                legacy_fd, legacy_metadata.name,
+                {"schema_version": 1, "sha256": receipt["before_sha256"],
+                 "mode": receipt["before_mode"]},
+                field="legacy compatibility metadata")
+        else:
+            _validate_legacy_metadata(
+                _read_json_at(
+                    legacy_fd, legacy_metadata.name, "legacy compatibility metadata"),
+                receipt)
+
+        if _leaf_stat(runtime_fd, runtime_contract.name) is None:
+            _atomic_write_at(
+                runtime_fd, runtime_contract.name, contract_bytes, mode=0o644,
+                field="runtime contract copy", replace=False)
+        elif (_sha256_bytes(_read_bytes_at(
+                runtime_fd, runtime_contract.name, "runtime contract copy"))
+                != receipt["contract_sha256"]):
+            raise ControlPlaneError("runtime contract copy drifted")
+
+        if (_sha256_bytes(_read_bytes_path(legacy, "legacy compatibility target"))
+                != receipt["before_sha256"]
+                or _sha256_bytes(_read_bytes_path(runtime_contract, "runtime contract copy"))
+                != receipt["contract_sha256"]
+                or _read_json_path(receipt_path, "adapter receipt") != receipt):
+            raise ControlPlaneError("compatibility path changed during adapter installation")
+        _validate_legacy_metadata(
+            _read_json_path(legacy_metadata, "legacy compatibility metadata"), receipt)
+
+        current = _sha256_bytes(_read_bytes_at(
+            consumer_fd, consumer.name, "canonical consumer"))
+        if current == receipt["before_sha256"]:
+            _atomic_write_at(
+                consumer_fd, consumer.name, adapter_bytes, mode=0o755,
+                field="canonical consumer", replace=True)
+        elif current != receipt["after_sha256"]:
+            raise ControlPlaneError("canonical consumer drifted during adapter installation")
+
+        if (_sha256_bytes(_read_bytes_at(
+                consumer_fd, consumer.name, "canonical consumer")) != receipt["after_sha256"]
+                or _sha256_bytes(_read_bytes_at(
+                    legacy_fd, legacy.name, "legacy compatibility target"))
+                != receipt["before_sha256"]
+                or _sha256_bytes(_read_bytes_at(
+                    runtime_fd, runtime_contract.name, "runtime contract copy"))
+                != receipt["contract_sha256"]
+                or _read_json_at(receipt_fd, receipt_path.name, "adapter receipt") != receipt):
+            raise ControlPlaneError("post-install path binding mismatch")
+        _validate_legacy_metadata(
+            _read_json_at(
+                legacy_fd, legacy_metadata.name, "legacy compatibility metadata"),
+            receipt)
+    if (_sha256_bytes(_read_bytes_path(legacy, "legacy compatibility target"))
+            != receipt["before_sha256"]
+            or _sha256_bytes(_read_bytes_path(runtime_contract, "runtime contract copy"))
+            != receipt["contract_sha256"]
+            or _sha256_bytes(_read_bytes_path(consumer, "canonical consumer"))
+            != receipt["after_sha256"]
+            or _read_json_path(receipt_path, "adapter receipt") != receipt):
+        raise ControlPlaneError("post-install path binding mismatch")
+    if resolve_active_release(contract)["target"] != receipt["active_target"]:
+        raise ControlPlaneError("active release changed during adapter installation")
+    return {"ok": True, "consumer": str(consumer), "active_target": active["target"],
+            "receipt": str(receipt_path), "legacy_sha256": receipt["before_sha256"]}
+
+
+def rollback_adapter(contract_path: Path, receipt_path: Path) -> dict[str, Any]:
+    """Restore or resume restoration of the exact pre-adapter consumer."""
+    contract = load_runtime_contract(contract_path)
+    with _runtime_transition_lock(contract):
+        return _rollback_adapter_locked(contract, receipt_path)
+
+
+def _rollback_adapter_locked(contract: RuntimeContract, receipt_path: Path) -> dict[str, Any]:
+    receipt_path = reject_symlink_ancestors(receipt_path)
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise ControlPlaneError("adapter receipt must be a real file")
+    with _directory_fd(receipt_path.parent, "adapter receipt") as receipt_fd:
+        receipt = _read_json_at(receipt_fd, receipt_path.name, "adapter receipt")
+    before_mode, active_target = _validate_adapter_receipt(contract, receipt)
+    if _read_active_link(contract, allow_absent=True) != active_target:
         raise ControlPlaneError("active release selector does not match adapter receipt")
     consumer = _safe_write_path(contract.consumer, "canonical consumer")
     if consumer.is_symlink() or not consumer.is_file():
@@ -662,57 +778,66 @@ def rollback_adapter(contract_path: Path, receipt_path: Path) -> dict[str, Any]:
         legacy.with_name("legacy-metadata.json"), "legacy compatibility metadata")
     runtime_contract = _safe_write_path(
         contract.runtime_root / "runtime-contract.json", "runtime contract copy")
-    auxiliary = (legacy, legacy_metadata, runtime_contract)
     with (_directory_fd(consumer.parent, "canonical consumer") as consumer_fd,
-          _directory_fd(legacy.parent, "legacy compatibility target") as legacy_fd,
+          _directory_fd(legacy.parent, "legacy compatibility target", create=True) as legacy_fd,
           _directory_fd(contract.runtime_root, "runtime contract copy") as runtime_fd):
         consumer_status = _require_regular_leaf(
             consumer_fd, consumer.name, "canonical consumer")
-        present = [
-            _leaf_stat(legacy_fd, legacy.name) is not None,
-            _leaf_stat(legacy_fd, legacy_metadata.name) is not None,
-            _leaf_stat(runtime_fd, runtime_contract.name) is not None,
-        ]
         current = _sha256_bytes(_read_bytes_at(
             consumer_fd, consumer.name, "canonical consumer"))
-        if not any(present):
-            if current != receipt["before_sha256"]:
-                raise ControlPlaneError("legacy compatibility state is missing before exact rollback")
-            if consumer_status.st_mode & 0o777 != before_mode:
-                raise ControlPlaneError("restored canonical consumer mode drifted")
-            return {"ok": True, "idempotent": True, "consumer": str(consumer)}
-        if not all(present):
-            raise ControlPlaneError("legacy compatibility state is incomplete")
-        legacy_bytes = _read_bytes_at(
-            legacy_fd, legacy.name, "legacy compatibility target")
-        if _sha256_bytes(legacy_bytes) != receipt["before_sha256"]:
-            raise ControlPlaneError("legacy compatibility target drifted")
-        metadata = _read_json_at(
-            legacy_fd, legacy_metadata.name, "legacy compatibility metadata")
-        _require_exact_fields(metadata, LEGACY_METADATA_FIELDS, "legacy compatibility metadata")
-        if (type(metadata.get("schema_version")) is not int or metadata["schema_version"] != 1
-                or metadata.get("sha256") != receipt["before_sha256"]
-                or metadata.get("mode") != before_mode):
-            raise ControlPlaneError("legacy compatibility metadata drifted")
-        if (_sha256_bytes(_read_bytes_at(
+        if current not in {receipt["before_sha256"], receipt["after_sha256"]}:
+            raise ControlPlaneError("canonical consumer drifted; refusing non-exact rollback")
+        if (current == receipt["before_sha256"]
+                and consumer_status.st_mode & 0o777 != before_mode):
+            raise ControlPlaneError("restored canonical consumer mode drifted")
+
+        legacy_present = _leaf_stat(legacy_fd, legacy.name) is not None
+        metadata_present = _leaf_stat(legacy_fd, legacy_metadata.name) is not None
+        contract_present = _leaf_stat(runtime_fd, runtime_contract.name) is not None
+        initially_complete = not any((legacy_present, metadata_present, contract_present))
+        legacy_bytes: bytes | None = None
+        if legacy_present:
+            legacy_status = _require_regular_leaf(
+                legacy_fd, legacy.name, "legacy compatibility target")
+            legacy_bytes = _read_bytes_at(
+                legacy_fd, legacy.name, "legacy compatibility target")
+            if (_sha256_bytes(legacy_bytes) != receipt["before_sha256"]
+                    or legacy_status.st_mode & 0o777 != before_mode):
+                raise ControlPlaneError("legacy compatibility target drifted")
+        elif current == receipt["after_sha256"]:
+            raise ControlPlaneError(
+                "legacy compatibility target is missing before exact rollback")
+        if metadata_present:
+            if not legacy_present:
+                raise ControlPlaneError("legacy compatibility recovery state is invalid")
+            _validate_legacy_metadata(
+                _read_json_at(
+                    legacy_fd, legacy_metadata.name, "legacy compatibility metadata"),
+                receipt)
+        if contract_present and (_sha256_bytes(_read_bytes_at(
                 runtime_fd, runtime_contract.name, "runtime contract copy"))
                 != receipt["contract_sha256"]):
             raise ControlPlaneError("runtime contract copy drifted")
-        if current != receipt["after_sha256"]:
-            raise ControlPlaneError("canonical consumer drifted; refusing non-exact rollback")
-        _atomic_write_at(
-            consumer_fd, consumer.name, legacy_bytes, mode=before_mode,
-            field="canonical consumer", replace=True)
+
+        if current == receipt["after_sha256"]:
+            assert legacy_bytes is not None
+            _atomic_write_at(
+                consumer_fd, consumer.name, legacy_bytes, mode=before_mode,
+                field="canonical consumer", replace=True)
         restored_status = _require_regular_leaf(
             consumer_fd, consumer.name, "canonical consumer")
         if (_sha256_bytes(_read_bytes_at(
                 consumer_fd, consumer.name, "canonical consumer")) != receipt["before_sha256"]
                 or restored_status.st_mode & 0o777 != before_mode):
             raise ControlPlaneError("post-rollback canonical consumer mismatch")
-        _unlink_at(
-            legacy_fd, legacy_metadata.name, "legacy compatibility metadata")
-        _unlink_at(legacy_fd, legacy.name, "legacy compatibility target")
-        _unlink_at(runtime_fd, runtime_contract.name, "runtime contract copy")
+
+        if contract_present:
+            _unlink_at(runtime_fd, runtime_contract.name, "runtime contract copy")
+        if metadata_present:
+            _unlink_at(
+                legacy_fd, legacy_metadata.name, "legacy compatibility metadata")
+        if legacy_present:
+            _unlink_at(legacy_fd, legacy.name, "legacy compatibility target")
         if any((
             _leaf_stat(legacy_fd, legacy.name),
             _leaf_stat(legacy_fd, legacy_metadata.name),
@@ -729,7 +854,7 @@ def rollback_adapter(contract_path: Path, receipt_path: Path) -> dict[str, Any]:
             raise ControlPlaneError("post-rollback compatibility cleanup mismatch")
     if _read_active_link(contract, allow_absent=True) != active_target:
         raise ControlPlaneError("active release changed during adapter rollback")
-    return {"ok": True, "idempotent": False, "consumer": str(consumer)}
+    return {"ok": True, "idempotent": initially_complete, "consumer": str(consumer)}
 
 
 def verify_live_consumer(contract_path: Path, manifest_path: Path, source_root: Path) -> dict[str, Any]:

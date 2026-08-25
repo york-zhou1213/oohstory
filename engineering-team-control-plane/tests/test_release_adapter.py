@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -97,6 +98,61 @@ class ReleaseAdapterTests(unittest.TestCase):
     @staticmethod
     def write_json(path: Path, payload: dict) -> None:
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    def assert_install_reenters_after(self, field: str, *, json_boundary: bool = False) -> None:
+        source, manifest, release, _activation = self.prepare_release(
+            "release-a", "a" * 40, "release-a")
+        receipt = self.base / f"adapter-{field.replace(' ', '-')}.json"
+        helper_name = "_atomic_json_at" if json_boundary else "_atomic_write_at"
+        original = getattr(release_adapter_module, helper_name)
+        failed = False
+
+        def fail_after(*args, **kwargs):
+            nonlocal failed
+            result = original(*args, **kwargs)
+            if not failed and kwargs.get("field") == field:
+                failed = True
+                raise OSError(f"injected failure after {field}")
+            return result
+
+        with mock.patch.object(release_adapter_module, helper_name, side_effect=fail_after):
+            with self.assertRaisesRegex(OSError, "injected failure"):
+                install_adapter(
+                    self.contract, release / "scripts" / "learning_loop_adapter.py", receipt)
+        self.assertTrue(failed)
+        recovered = install_adapter(
+            self.contract, release / "scripts" / "learning_loop_adapter.py", receipt)
+        self.assertTrue(recovered["ok"])
+        self.assertTrue(verify_live_consumer(self.contract, manifest, source)["ok"])
+
+    def assert_rollback_reenters_after(self, field: str, *, unlink_boundary: bool) -> None:
+        _source, _manifest, release, _activation = self.prepare_release(
+            "release-a", "a" * 40, "release-a")
+        receipt = self.base / f"adapter-{field.replace(' ', '-')}.json"
+        adapter = release / "scripts" / "learning_loop_adapter.py"
+        original_consumer = self.consumer.read_bytes()
+        install_adapter(self.contract, adapter, receipt)
+        helper_name = "_unlink_at" if unlink_boundary else "_atomic_write_at"
+        original = getattr(release_adapter_module, helper_name)
+        failed = False
+
+        def fail_after(*args, **kwargs):
+            nonlocal failed
+            result = original(*args, **kwargs)
+            observed_field = args[2] if unlink_boundary else kwargs.get("field")
+            if not failed and observed_field == field:
+                failed = True
+                raise OSError(f"injected failure after {field}")
+            return result
+
+        with mock.patch.object(release_adapter_module, helper_name, side_effect=fail_after):
+            with self.assertRaisesRegex(OSError, "injected failure"):
+                rollback_adapter(self.contract, receipt)
+        self.assertTrue(failed)
+        self.assertTrue(rollback_adapter(self.contract, receipt)["ok"])
+        self.assertEqual(self.consumer.read_bytes(), original_consumer)
+        redeploy_receipt = self.base / f"redeploy-{field.replace(' ', '-')}.json"
+        self.assertTrue(install_adapter(self.contract, adapter, redeploy_receipt)["ok"])
 
     def test_adapter_preserves_legacy_commands_and_routes_audits_to_active_release(self) -> None:
         source, manifest, release, activation = self.prepare_release("release-a", "a" * 40, "release-a")
@@ -399,6 +455,123 @@ class ReleaseAdapterTests(unittest.TestCase):
         self.assertEqual(self.consumer.read_bytes(), original_consumer)
         for path, content in outside_files.items():
             self.assertEqual(path.read_bytes(), content)
+
+    def test_selector_transition_lock_serializes_competing_activation(self) -> None:
+        self.prepare_release("release-a", "a" * 40, "release-a")
+        _source_b, _manifest_b, _release_b, activation_b = self.prepare_release(
+            "release-b", "b" * 40, "release-b")
+        source_c, manifest_c, release_c = self.stage_release("release-c", "release-c")
+        activation_c = self.base / "activate-release-c.json"
+        attempted = threading.Event()
+        completed = threading.Event()
+        failures = []
+        worker = None
+        original_link = release_adapter_module._atomic_link_at
+
+        def activate_c() -> None:
+            attempted.set()
+            try:
+                activate_release(
+                    self.contract, manifest_c, source_c, release_c, "c" * 40, activation_c)
+            except Exception as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+            finally:
+                completed.set()
+
+        def compete_before_publish(directory_fd, name, target):
+            nonlocal worker
+            if target == "releases/release-a":
+                worker = threading.Thread(target=activate_c)
+                worker.start()
+                self.assertTrue(attempted.wait(1))
+                self.assertFalse(completed.wait(0.05))
+            return original_link(directory_fd, name, target)
+
+        with mock.patch.object(
+                release_adapter_module, "_atomic_link_at", side_effect=compete_before_publish):
+            rolled_back = rollback_release(self.contract, activation_b)
+        self.assertEqual(rolled_back["active_target"], "releases/release-a")
+        self.assertIsNotNone(worker)
+        self.assertTrue(completed.wait(2))
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(
+            (self.runtime / "active").readlink(), Path("releases/release-c"))
+
+    def test_install_reenters_after_receipt_boundary_failure(self) -> None:
+        self.assert_install_reenters_after("adapter receipt", json_boundary=True)
+
+    def test_install_reenters_after_legacy_boundary_failure(self) -> None:
+        self.assert_install_reenters_after("legacy compatibility target")
+
+    def test_install_reenters_after_metadata_boundary_failure(self) -> None:
+        self.assert_install_reenters_after(
+            "legacy compatibility metadata", json_boundary=True)
+
+    def test_install_reenters_after_contract_boundary_failure(self) -> None:
+        self.assert_install_reenters_after("runtime contract copy")
+
+    def test_install_reenters_after_consumer_boundary_failure(self) -> None:
+        self.assert_install_reenters_after("canonical consumer")
+
+    def test_consumer_publish_failure_can_rollback_and_redeploy(self) -> None:
+        _source, _manifest, release, _activation = self.prepare_release(
+            "release-a", "a" * 40, "release-a")
+        adapter = release / "scripts" / "learning_loop_adapter.py"
+        receipt = self.base / "adapter-publish-failure.json"
+        original = release_adapter_module._atomic_write_at
+
+        def fail_before_publish(*args, **kwargs):
+            if kwargs.get("field") == "canonical consumer":
+                raise OSError("injected consumer publication failure")
+            return original(*args, **kwargs)
+
+        with mock.patch.object(
+                release_adapter_module, "_atomic_write_at", side_effect=fail_before_publish):
+            with self.assertRaisesRegex(OSError, "consumer publication failure"):
+                install_adapter(self.contract, adapter, receipt)
+        self.assertTrue(rollback_adapter(self.contract, receipt)["ok"])
+        self.assertTrue(install_adapter(
+            self.contract, adapter, self.base / "adapter-after-publish-failure.json")["ok"])
+
+    def test_rollback_reenters_after_consumer_boundary_failure(self) -> None:
+        self.assert_rollback_reenters_after("canonical consumer", unlink_boundary=False)
+
+    def test_rollback_reenters_after_contract_cleanup_failure(self) -> None:
+        self.assert_rollback_reenters_after("runtime contract copy", unlink_boundary=True)
+
+    def test_rollback_reenters_after_metadata_cleanup_failure(self) -> None:
+        self.assert_rollback_reenters_after(
+            "legacy compatibility metadata", unlink_boundary=True)
+
+    def test_rollback_retry_recovers_when_second_unlink_fails_before_mutation(self) -> None:
+        _source, _manifest, release, _activation = self.prepare_release(
+            "release-a", "a" * 40, "release-a")
+        adapter = release / "scripts" / "learning_loop_adapter.py"
+        receipt = self.base / "adapter-second-unlink.json"
+        install_adapter(self.contract, adapter, receipt)
+        original = release_adapter_module._unlink_at
+        calls = 0
+
+        def fail_second_unlink(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected second unlink failure")
+            return original(*args, **kwargs)
+
+        with mock.patch.object(
+                release_adapter_module, "_unlink_at", side_effect=fail_second_unlink):
+            with self.assertRaisesRegex(OSError, "second unlink failure"):
+                rollback_adapter(self.contract, receipt)
+        self.assertTrue(rollback_adapter(self.contract, receipt)["ok"])
+        self.assertTrue(install_adapter(
+            self.contract, adapter, self.base / "adapter-after-second-unlink.json")["ok"])
+
+    def test_rollback_reenters_after_legacy_cleanup_failure(self) -> None:
+        self.assert_rollback_reenters_after(
+            "legacy compatibility target", unlink_boundary=True)
 
     def test_first_rollback_cleans_compatibility_state_and_allows_redeploy(self) -> None:
         source_a, manifest_a, release_a, activation_a = self.prepare_release(
