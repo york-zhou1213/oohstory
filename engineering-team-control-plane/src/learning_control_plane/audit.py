@@ -9,7 +9,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from .common import (AGENTS, EVENT_HEADER_RE, EVENT_ID_RE, INDEX_NAMES, SHA256_RE, STAGE_RE, TASK_RE,
     ControlPlaneError, iter_event_store_files, iter_real_files, parse_timestamp, read_json,
-    markdown_visible_text, relative_posix, require_real_file, sha256_file,
+    markdown_visible_text, relative_posix, require_real_directory, require_real_file, sha256_file,
     timestamp_calendar_date, validate_root)
 
 TERMINAL_STATES = {"CLOSED", "CANCELLED", "FAILED", "SUPERSEDED", "REJECTED"}
@@ -87,27 +87,43 @@ def validate_receipt_identity(receipt: dict[str, Any], *, task: str, agent: str,
     if receipt.get("task_id") != task or receipt.get("agent") != agent or receipt.get("stage") != stage: raise ControlPlaneError("receipt payload identity does not match its path/requirement")
     if status is not None and receipt.get("status") != status: raise ControlPlaneError(f"receipt status must be {status}")
 
+def _task_buckets(root: Path) -> list[tuple[str, Path]]:
+    require_real_directory(root, PurePosixPath("tasks"))
+    return [(bucket, require_real_directory(root, PurePosixPath("tasks", bucket)))
+        for bucket in ("active", "archive")]
+
+def _task_frontmatter(path: Path, expected_task: str) -> list[str]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise ControlPlaneError(f"task record is not UTF-8: {expected_task}") from exc
+    if not lines or lines[0].strip() != "---":
+        raise ControlPlaneError(f"task record lacks front matter: {expected_task}")
+    try:
+        end = next(index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---")
+    except StopIteration as exc:
+        raise ControlPlaneError(f"task record has unterminated front matter: {expected_task}") from exc
+    frontmatter = lines[1:end]
+    task_ids = [match.group(1).strip() for line in frontmatter
+        if (match := re.fullmatch(r"task-id:\s*(.*?)\s*", line))]
+    if len(task_ids) != 1:
+        raise ControlPlaneError(f"task record requires exactly one frontmatter task-id: {expected_task}")
+    if task_ids[0] != expected_task:
+        raise ControlPlaneError(f"task record frontmatter task-id does not match filename: {expected_task}")
+    return frontmatter
+
 def _authoritative_requirements(root: Path, task: str) -> list[str]:
     records = []
-    for bucket in ("active", "archive"):
-        candidate = root / "tasks" / bucket / f"{task}.md"
+    for bucket, directory in _task_buckets(root):
+        candidate = directory / f"{task}.md"
         if candidate.exists() or candidate.is_symlink():
             records.append(require_real_file(root, PurePosixPath("tasks", bucket, f"{task}.md")))
     if len(records) != 1:
         raise ControlPlaneError(f"task requires exactly one authoritative active/archive record: {task}")
-    try:
-        lines = records[0].read_text(encoding="utf-8").splitlines()
-    except UnicodeDecodeError as exc:
-        raise ControlPlaneError(f"task record is not UTF-8: {task}") from exc
-    if not lines or lines[0].strip() != "---":
-        raise ControlPlaneError(f"task record lacks front matter: {task}")
-    try:
-        end = next(index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---")
-    except StopIteration as exc:
-        raise ControlPlaneError(f"task record has unterminated front matter: {task}") from exc
+    lines = _task_frontmatter(records[0], task)
     requirements, found = [], False
-    index = 1
-    while index < end:
+    index = 0
+    while index < len(lines):
         if lines[index] != "learning-requirements:":
             index += 1
             continue
@@ -115,7 +131,7 @@ def _authoritative_requirements(root: Path, task: str) -> list[str]:
             raise ControlPlaneError("task record repeats learning-requirements")
         found = True
         index += 1
-        while index < end and (not lines[index].strip() or lines[index].startswith((" ", "\t"))):
+        while index < len(lines) and (not lines[index].strip() or lines[index].startswith((" ", "\t"))):
             item = lines[index].strip()
             if item:
                 if not item.startswith("- "):
@@ -190,26 +206,27 @@ def _receipt_files(root: Path) -> list[Path]:
     receipts = root / "team-learnings" / "receipts"
     if not receipts.exists(): return []
     if receipts.is_symlink() or not receipts.is_dir(): raise ControlPlaneError("receipts path must be a real directory")
-    return iter_real_files(receipts, ("*/*.json",))
+    return iter_real_files(receipts, ("**/*",))
 
 def _task_records(root: Path) -> tuple[dict[str, str], list[str]]:
     records, errors = {}, []
-    tasks = root / "tasks"
-    if not tasks.exists(): return records, ["missing tasks directory"]
-    for bucket in ("active", "archive"):
-        directory = tasks / bucket
-        if directory.is_symlink() or not directory.is_dir(): errors.append(f"missing or unsafe tasks/{bucket} directory"); continue
+    try:
+        buckets = _task_buckets(root)
+    except ControlPlaneError as exc:
+        return records, [str(exc)]
+    for bucket, directory in buckets:
         for path in iter_real_files(directory, ("TASK-*.md",)):
             task = path.stem
             if not TASK_RE.fullmatch(task): errors.append(f"invalid task record name: {relative_posix(path, root)}"); continue
             if task in records:
                 errors.append(f"duplicate task record: {task}")
             try:
-                task_text = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                errors.append(f"non-UTF-8 task record: {relative_posix(path, root)}")
+                frontmatter = _task_frontmatter(path, task)
+            except ControlPlaneError as exc:
+                errors.append(f"{relative_posix(path, root)}: {exc}")
                 continue
-            matches = re.findall(r"(?mi)^state:\s*([A-Z_]+)\s*$", task_text)
+            matches = [match.group(1) for line in frontmatter
+                if (match := re.fullmatch(r"state:\s*([A-Z_]+)\s*", line))]
             records[task] = "ARCHIVED" if bucket == "archive" else (matches[-1] if matches else "UNKNOWN")
     return records, errors
 
@@ -288,9 +305,13 @@ def audit_system(root: Path, *, stale_hours: float = 24.0, now: datetime | None 
     now = now.astimezone(timezone.utc)
     task_records, errors = _task_records(root); orphan, stale, malformed = [], [], []; receipts = _receipt_files(root)
     for path in receipts:
-        relative, task, filename = relative_posix(path, root), path.parent.name, path.stem
-        agent, separator, stage = filename.partition("-")
+        relative = relative_posix(path, root)
         try:
+            receipt_relative = path.relative_to(root / "team-learnings" / "receipts")
+            if len(receipt_relative.parts) != 2 or path.suffix != ".json":
+                raise ControlPlaneError("receipt must use canonical TASK-ID/AGENT-STAGE.json depth and filename")
+            task, filename = receipt_relative.parts[0], path.stem
+            agent, separator, stage = filename.partition("-")
             if not separator or agent not in AGENTS or not STAGE_RE.fullmatch(stage) or not TASK_RE.fullmatch(task): raise ControlPlaneError("invalid receipt path identity")
             receipt = read_json(path); validate_receipt_identity(receipt, task=task, agent=agent, stage=stage)
             if receipt.get("schema_version") not in {1, 2}: raise ControlPlaneError("unsupported receipt schema_version")

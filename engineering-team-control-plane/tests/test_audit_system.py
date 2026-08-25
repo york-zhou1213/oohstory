@@ -43,6 +43,11 @@ class AuditSystemTests(unittest.TestCase):
         result = audit_system(self.root)
         self.assertEqual(result["empty_error_agents"], ["john"])
         self.assertFalse(result["ok"])
+    def test_backtick_in_backtick_fence_info_does_not_hide_visible_header(self):
+        path = self.root / "john" / "learnings" / "ERRORS.md"
+        path.write_text("# Errors\n\n```bad`info\n## [ERR-20260825-999] visible\n```\n", encoding="utf-8")
+        result = audit_system(self.root)
+        self.assertNotIn("john", result["empty_error_agents"])
     def test_alphanumeric_ids_and_jsonl_references_are_scanned(self):
         (self.root / "john" / "learnings" / "LEARNINGS.md").write_text("# Learnings\n\n## [LRN-20260825-A01] Alpha\n", encoding="utf-8")
         ledger = self.root / "team-learnings" / "LEARNING_LEDGER.jsonl"
@@ -57,6 +62,29 @@ class AuditSystemTests(unittest.TestCase):
         self.assertTrue(result["malformed_receipts"]); self.assertTrue(result["guard_debt"]); self.assertTrue(result["promotion_debt"]); self.assertTrue(result["missing_lifecycle_files"])
     def test_receipt_path_identity_mismatch_fails(self):
         path, receipt = make_receipt(self.root); receipt["agent"] = "bob"; path.write_text(json.dumps(receipt), encoding="utf-8"); self.assertTrue(audit_system(self.root)["malformed_receipts"])
+    def test_nested_and_noncanonical_receipt_paths_fail(self):
+        nested = self.root / "team-learnings" / "receipts" / "TASK-X" / "nested" / "john-test.json"
+        nested.parent.mkdir(parents=True); nested.write_text("{}\n", encoding="utf-8")
+        wrong_name = self.root / "team-learnings" / "receipts" / "TASK-X" / "john-test.txt"
+        wrong_name.write_text("{}\n", encoding="utf-8")
+        result = audit_system(self.root)
+        self.assertEqual(result["receipt_count"], 2)
+        self.assertEqual(len(result["malformed_receipts"]), 2)
+        self.assertFalse(result["ok"])
+    def test_task_frontmatter_identity_and_registry_symlink_fail(self):
+        add_task(self.root, "TASK-MISMATCH")
+        record = self.root / "tasks" / "active" / "TASK-MISMATCH.md"
+        record.write_text(record.read_text(encoding="utf-8").replace("task-id: TASK-MISMATCH", "task-id: TASK-OTHER"), encoding="utf-8")
+        mismatch = audit_system(self.root)
+        self.assertTrue(any("does not match filename" in value for value in mismatch["errors"]))
+        record.write_text(record.read_text(encoding="utf-8").replace("task-id: TASK-OTHER", "task-id: TASK-MISMATCH\ntask-id: TASK-MISMATCH"), encoding="utf-8")
+        repeated = audit_system(self.root)
+        self.assertTrue(any("exactly one frontmatter task-id" in value for value in repeated["errors"]))
+        tasks = self.root / "tasks"; outside = Path(self.temporary.name) / "outside-tasks"
+        tasks.rename(outside); tasks.symlink_to(outside, target_is_directory=True)
+        linked = audit_system(self.root)
+        self.assertTrue(any("symlink" in value for value in linked["errors"]))
+        self.assertFalse(linked["ok"])
     def test_malformed_shared_jsonl_fails_closed(self):
         (self.root / "team-learnings" / "LEARNING_LEDGER.jsonl").write_text('{"ok":true}\n{\n', encoding="utf-8")
         result = audit_system(self.root)

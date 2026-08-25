@@ -13,7 +13,7 @@ AGENTS = ("ken", "john", "jucy", "bob", "mus")
 EVENT_KINDS = ("ERR", "FR", "LRN", "FEAT")
 EVENT_ID_RE = re.compile(r"(?<![A-Z0-9-])((?:ERR|FR|LRN|FEAT)-\d{8}-[A-Za-z0-9]{3,})(?![A-Z0-9-])")
 EVENT_HEADER_RE = re.compile(r"(?m)^## \[((?:ERR|FR|LRN|FEAT)-\d{8}-[A-Za-z0-9]{3,})\](?:\s|$)")
-FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})")
+FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})([^\r\n]*)")
 TASK_RE = re.compile(r"^TASK-[A-Za-z0-9._-]+$")
 STAGE_RE = re.compile(r"^[a-z][a-z0-9_-]{1,63}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -143,7 +143,7 @@ def markdown_visible_text(text: str) -> str:
     for line in text.splitlines(keepends=True):
         if fence_char is None:
             opening = FENCE_OPEN_RE.match(line)
-            if opening:
+            if opening and not (opening.group(1).startswith("`") and "`" in opening.group(2)):
                 marker = opening.group(1); fence_char, fence_length = marker[0], len(marker)
                 visible.append("".join(char if char in "\r\n" else " " for char in line))
             else:

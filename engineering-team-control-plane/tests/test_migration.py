@@ -92,6 +92,20 @@ class MigrationTests(unittest.TestCase):
         }
         self.assertTrue(plan_migration(self.root, resolutions=resolution)["changes"])
 
+    def test_indented_atx_peer_heading_ends_structural_self_reference(self) -> None:
+        john, _bob = self.add_resolvable_duplicate()
+        john.write_text(
+            "# Learnings\n\n## [LRN-20260825-010] John\n\nDetails.\n\n"
+            "   ## Unrelated\n\nSee LRN-20260825-010.\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ControlPlaneError, "ambiguous duplicate references"):
+            plan_migration(self.root)
+        resolution = {
+            "john/learnings/LEARNINGS.md:9:5:LRN-20260825-010": "bob/learnings/LEARNINGS.md:3"
+        }
+        self.assertTrue(plan_migration(self.root, resolutions=resolution)["changes"])
+
     def test_recursive_role_and_shared_files_are_migration_inputs(self) -> None:
         role = self.root / "john" / "learnings" / "archive" / "old.md"; role.parent.mkdir()
         shared = self.root / "team-learnings" / "archive" / "old.jsonl"; shared.parent.mkdir()

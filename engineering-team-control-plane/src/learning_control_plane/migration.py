@@ -12,7 +12,7 @@ from .common import (EVENT_HEADER_RE, EVENT_ID_RE, ControlPlaneError, atomic_wri
     relative_posix, secure_path, sha256_file, validate_root)
 
 MIGRATION_SCHEMA = 1
-ATX_SECTION_END_RE = re.compile(r"(?m)^#{1,2}\s+")
+ATX_SECTION_END_RE = re.compile(r"(?m)^[ ]{0,3}#{1,2}(?:[ \t]+|$)")
 SETEXT_SECTION_END_RE = re.compile(r"(?m)^[ \t]{0,3}\S[^\n]*\n[ \t]{0,3}(?:=+|-+)[ \t]*(?:\n|$)")
 
 def migration_inputs(root: Path) -> list[Path]:
