@@ -26,7 +26,7 @@ The compatibility adapter keeps `bootstrap`, `preflight`, `close`, `metrics`, an
      --receipt BOUNDED_BACKUP_DIR/release-activation.json
    ```
 
-   Activation writes immutable release metadata and a copy of the exact deployment manifest before replacing `active` with one atomic relative-symlink rename. The receipt records the exact prior target, activated target, source SHA, manifest hash, and contract hash.
+   Activation writes immutable release metadata (including the exact prior target) and a copy of the exact deployment manifest before replacing `active` with one atomic relative-symlink rename. The receipt records the same prior target plus the activated target, source SHA, manifest hash, and contract hash; rollback requires the receipt predecessor to equal the activated release's immutable metadata.
 4. On the first activation only, atomically install the active release's reviewed adapter over the canonical consumer. This captures the previous consumer byte-for-byte at `compat/v1/learning_loop.py` before replacement:
 
    ```sh
@@ -49,8 +49,10 @@ The compatibility adapter keeps `bootstrap`, `preflight`, `close`, `metrics`, an
 
 ## Exact rollback
 
-For a normal version upgrade, run `rollback-release --contract ... --receipt BOUNDED_BACKUP_DIR/release-activation.json`. It changes the selector only when the current target is the exact activated target and atomically restores the recorded predecessor. Drift refuses rollback.
+For a normal version upgrade, run `rollback-release --contract ... --receipt BOUNDED_BACKUP_DIR/release-activation.json`. The receipt is treated as untrusted input: its field set, schema, hashes, revision, target grammar, activated metadata, and predecessor metadata must all validate before mutation. `previous_target` must be either `null` or the canonical `releases/RELEASE_ID` form; absolute paths, `..`, noncanonical spellings, missing releases, symlink ancestors, and metadata drift fail closed. The command changes the selector only when the current target is the exact activated target, atomically restores the recorded predecessor, and then resolves and verifies the real target again.
 
-For the first adapter installation, run `rollback-adapter --contract ... --receipt BOUNDED_BACKUP_DIR/adapter-install.json` first, then `rollback-release`. Adapter rollback restores the byte-exact legacy consumer only when the current consumer still equals the recorded reviewed adapter. A first-release rollback removes the new selector after restoring the legacy consumer; later release rollbacks are atomic selector replacements.
+For the first adapter installation, run `rollback-adapter --contract ... --receipt BOUNDED_BACKUP_DIR/adapter-install.json` first, then `rollback-release`. Adapter rollback validates every receipt field and the preserved legacy metadata, requires the current active selector to equal the receipt's `active_target`, and restores the byte-exact consumer only when the current consumer still equals the reviewed adapter hash. An older adapter receipt cannot restore legacy bytes while a later release is active. After post-verifying the restored hash and mode, a successful adapter rollback removes `compat/v1/learning_loop.py`, `compat/v1/legacy-metadata.json`, and the staged `runtime-contract.json`; a second identical rollback is idempotent, and a later install uses a fresh adapter receipt. This makes `activate → install → rollback-adapter → rollback-release → activate → install` a supported recovery sequence instead of leaving a permanent reinstall blocker.
+
+Every adapter-controlled write checks the destination and every existing ancestor immediately before mutation. This applies to the release directory, deployed manifest, release metadata, active selector, canonical consumer, compatibility target and metadata, runtime-contract copy, and both receipt paths. A symlink at any forbidden leaf or ancestor fails before writes outside the contracted tree.
 
 Rollback never mutates receipts, learning data, memory, or task records. If an ID migration was separately authorized and applied, use its exact backup manifest as documented in `MIGRATION.md`; never delete data to make an audit green.

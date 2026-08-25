@@ -14,7 +14,7 @@ Run from this directory with `python3 scripts/learning_control_plane.py`:
 - `activate-release --contract CONTRACT --manifest MANIFEST --source-root SOURCE --release-root RELEASE --source-revision SHA --receipt RECEIPT` verifies a versioned release and atomically changes the active selector while recording the exact predecessor.
 - `install-adapter --contract CONTRACT --adapter-source ACTIVE_ADAPTER --receipt RECEIPT` byte-preserves the legacy canonical consumer, then atomically installs the reviewed compatibility adapter.
 - `verify-live-consumer --contract CONTRACT --manifest MANIFEST --source-root SOURCE` proves the canonical consumer preserves legacy lifecycle commands and resolves audit commands to the exact active reviewed release.
-- `rollback-release` and `rollback-adapter` accept their exact activation receipts and refuse drifted targets.
+- `rollback-release` and `rollback-adapter` require exact-field receipts, validate every referenced release and metadata hash, bind rollback to the current selector, reject path/symlink drift, and post-verify the restored state. A successful first adapter rollback removes its compatibility staging files so a fresh-receipt reinstall is supported.
 
 ## Tests
 
