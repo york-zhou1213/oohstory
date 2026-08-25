@@ -11,6 +11,10 @@ Run from this directory with `python3 scripts/learning_control_plane.py`:
 - `allocate-id --team-root ROOT --kind ERR --owner john [--date YYYYMMDD]` recursively scans all five role stores plus the shared store and persists a reservation while holding an advisory full-store lock. A returned ID cannot be returned by a concurrent caller even before its Markdown header is written.
 - `migrate-ids --team-root ROOT` performs a dry run. `--write --backup-dir NEW_EMPTY_DIR` applies the exact plan after a bounded verified backup. `--rollback MANIFEST` restores only files whose hashes still equal the migration's before/after states.
 - `verify-deployment --manifest MANIFEST --source-root SOURCE --runtime-root RUNTIME` requires both source and runtime SHA-256 values to equal the committed manifest and rejects unmanifested importable/executable files anywhere in the runtime tree.
+- `activate-release --contract CONTRACT --manifest MANIFEST --source-root SOURCE --release-root RELEASE --source-revision SHA --receipt RECEIPT` verifies a versioned release and atomically changes the active selector while recording the exact predecessor.
+- `install-adapter --contract CONTRACT --adapter-source ACTIVE_ADAPTER --receipt RECEIPT` byte-preserves the legacy canonical consumer, then atomically installs the reviewed compatibility adapter.
+- `verify-live-consumer --contract CONTRACT --manifest MANIFEST --source-root SOURCE` proves the canonical consumer preserves legacy lifecycle commands and resolves audit commands to the exact active reviewed release.
+- `rollback-release` and `rollback-adapter` accept their exact activation receipts and refuse drifted targets.
 
 ## Tests
 
@@ -29,3 +33,4 @@ See [docs/EVIDENCE_SCHEMA.md](docs/EVIDENCE_SCHEMA.md), [docs/MIGRATION.md](docs
 - The migration recognizes event references matching `ERR|FR|LRN|FEAT-YYYYMMDD-SUFFIX`, where the alphanumeric suffix is at least three characters. Text that cites an event through another encoding is not inferred.
 - An ambiguous plain reference to a duplicated historical ID requires an explicit occurrence-to-definition resolution. The tool intentionally refuses to guess.
 - Task state is read from `tasks/active` and `tasks/archive`; custom task registries require an adapter before activation.
+- Runtime adapter v1 intentionally preserves five legacy commands and routes only `audit-task` and `audit-system`; adding or moving a command requires a new reviewed contract version.

@@ -10,6 +10,8 @@ from .audit import audit_system, audit_task
 from .common import DEFAULT_ROOT, ControlPlaneError
 from .deployment import verify_deployment
 from .migration import apply_migration, load_resolutions, plan_migration, rollback_migration
+from .release_adapter import (activate_release, install_adapter, rollback_adapter,
+                              rollback_release, verify_live_consumer)
 
 def _emit(value: Any) -> None: print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
 def _root(args: argparse.Namespace) -> Path: return Path(args.team_root)
@@ -29,6 +31,17 @@ def command_migrate(args):
         resolution_sha256=resolution_sha)); return 0
 def command_verify_deployment(args):
     result = verify_deployment(Path(args.manifest), Path(args.source_root), Path(args.runtime_root)); _emit(result); return 0 if result["ok"] else 2
+def command_activate_release(args):
+    _emit(activate_release(Path(args.contract), Path(args.manifest), Path(args.source_root),
+        Path(args.release_root), args.source_revision, Path(args.receipt))); return 0
+def command_install_adapter(args):
+    _emit(install_adapter(Path(args.contract), Path(args.adapter_source), Path(args.receipt))); return 0
+def command_verify_live_consumer(args):
+    result = verify_live_consumer(Path(args.contract), Path(args.manifest), Path(args.source_root)); _emit(result); return 0 if result["ok"] else 2
+def command_rollback_release(args):
+    _emit(rollback_release(Path(args.contract), Path(args.receipt))); return 0
+def command_rollback_adapter(args):
+    _emit(rollback_adapter(Path(args.contract), Path(args.receipt))); return 0
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__); commands = parser.add_subparsers(dest="command", required=True)
@@ -37,6 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
     item = commands.add_parser("allocate-id"); item.add_argument("--team-root", default=DEFAULT_ROOT); item.add_argument("--kind", choices=("ERR", "FR", "LRN", "FEAT"), required=True); item.add_argument("--owner", choices=("ken", "john", "jucy", "bob", "mus"), required=True); item.add_argument("--date"); item.set_defaults(function=command_allocate)
     item = commands.add_parser("migrate-ids"); item.add_argument("--team-root", default=DEFAULT_ROOT); item.add_argument("--resolution-file"); item.add_argument("--write", action="store_true"); item.add_argument("--backup-dir"); item.add_argument("--max-backup-bytes", type=int, default=10 * 1024 * 1024); item.add_argument("--rollback", metavar="MANIFEST"); item.set_defaults(function=command_migrate)
     item = commands.add_parser("verify-deployment"); item.add_argument("--manifest", required=True); item.add_argument("--source-root", required=True); item.add_argument("--runtime-root", required=True); item.set_defaults(function=command_verify_deployment)
+    item = commands.add_parser("activate-release"); item.add_argument("--contract", required=True); item.add_argument("--manifest", required=True); item.add_argument("--source-root", required=True); item.add_argument("--release-root", required=True); item.add_argument("--source-revision", required=True); item.add_argument("--receipt", required=True); item.set_defaults(function=command_activate_release)
+    item = commands.add_parser("install-adapter"); item.add_argument("--contract", required=True); item.add_argument("--adapter-source", required=True); item.add_argument("--receipt", required=True); item.set_defaults(function=command_install_adapter)
+    item = commands.add_parser("verify-live-consumer"); item.add_argument("--contract", required=True); item.add_argument("--manifest", required=True); item.add_argument("--source-root", required=True); item.set_defaults(function=command_verify_live_consumer)
+    item = commands.add_parser("rollback-release"); item.add_argument("--contract", required=True); item.add_argument("--receipt", required=True); item.set_defaults(function=command_rollback_release)
+    item = commands.add_parser("rollback-adapter"); item.add_argument("--contract", required=True); item.add_argument("--receipt", required=True); item.set_defaults(function=command_rollback_adapter)
     return parser
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)

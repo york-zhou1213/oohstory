@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "adapter_version": 1,
+  "canonical_team_root": "/root/.openclaw/workspaces/engineering-team",
+  "canonical_runtime_root": "/root/.openclaw/workspaces/engineering-team/runtime/learning-control-plane",
+  "canonical_consumer": "/root/.openclaw/workspaces/engineering-team/scripts/learning_loop.py",
+  "releases_dir": "releases",
+  "active_link": "active",
+  "legacy_target": "compat/v1/learning_loop.py",
+  "release_entrypoint": "scripts/learning_control_plane.py",
+  "adapter_source": "scripts/learning_loop_adapter.py",
+  "legacy_commands": ["bootstrap", "preflight", "close", "metrics", "stale"],
+  "release_commands": ["audit-task", "audit-system"]
+}

@@ -88,7 +88,8 @@ class DeploymentTests(unittest.TestCase):
         expected = {
             path.relative_to(PROJECT).as_posix()
             for path in (PROJECT / "src" / "learning_control_plane").glob("*.py")
-        } | {"scripts/learning_control_plane.py"}
+        } | {"scripts/learning_control_plane.py", "scripts/learning_loop_adapter.py",
+             "release/runtime-contract.json"}
         self.assertEqual(covered, expected)
 
 
