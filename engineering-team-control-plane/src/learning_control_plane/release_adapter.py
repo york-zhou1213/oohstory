@@ -94,6 +94,27 @@ def _safe_write_path(path: Path, field: str, *, allow_leaf_symlink: bool = False
     return path
 
 
+def _require_distinct_managed_paths(paths: tuple[tuple[Path, str], ...]) -> None:
+    """Reject lexical and hard-link aliases before a recovery mutation."""
+    names: dict[str, str] = {}
+    inodes: dict[tuple[int, int], str] = {}
+    for path, field in paths:
+        normalized = os.path.normcase(os.path.abspath(path))
+        if normalized in names:
+            raise ControlPlaneError(
+                f"managed adapter paths must be distinct: {names[normalized]} and {field}")
+        names[normalized] = field
+        try:
+            status = os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        identity = (status.st_dev, status.st_ino)
+        if identity in inodes:
+            raise ControlPlaneError(
+                f"managed adapter paths must be distinct: {inodes[identity]} and {field}")
+        inodes[identity] = field
+
+
 def _open_directory_fd(path: Path, field: str, *, create: bool = False) -> int:
     """Open an absolute directory component-by-component without following links."""
     path = Path(os.path.abspath(path))
@@ -605,6 +626,13 @@ def _install_adapter_locked(
         legacy.with_name("legacy-metadata.json"), "legacy compatibility metadata")
     runtime_contract = _safe_write_path(
         contract.runtime_root / "runtime-contract.json", "runtime contract copy")
+    _require_distinct_managed_paths((
+        (receipt_path, "adapter receipt"),
+        (consumer, "canonical consumer"),
+        (legacy, "legacy compatibility target"),
+        (legacy_metadata, "legacy compatibility metadata"),
+        (runtime_contract, "runtime contract copy"),
+    ))
     adapter_bytes = _read_bytes_path(adapter_source, "adapter source")
     contract_bytes = _read_bytes_path(contract.path, "runtime contract")
     adapter_sha256 = _sha256_bytes(adapter_bytes)
@@ -670,6 +698,9 @@ def _install_adapter_locked(
             if (consumer_sha256 == receipt["before_sha256"]
                     and consumer_status.st_mode & 0o777 != before_mode):
                 raise ControlPlaneError("canonical consumer mode drifted during adapter recovery")
+            if (consumer_sha256 == receipt["after_sha256"]
+                    and stat.S_IMODE(consumer_status.st_mode) != 0o755):
+                raise ControlPlaneError("canonical consumer mode drifted during adapter recovery")
 
         legacy_status = _leaf_stat(legacy_fd, legacy.name)
         if legacy_status is None:
@@ -725,8 +756,11 @@ def _install_adapter_locked(
         elif current != receipt["after_sha256"]:
             raise ControlPlaneError("canonical consumer drifted during adapter installation")
 
+        installed_status = _require_regular_leaf(
+            consumer_fd, consumer.name, "canonical consumer")
         if (_sha256_bytes(_read_bytes_at(
                 consumer_fd, consumer.name, "canonical consumer")) != receipt["after_sha256"]
+                or stat.S_IMODE(installed_status.st_mode) != 0o755
                 or _sha256_bytes(_read_bytes_at(
                     legacy_fd, legacy.name, "legacy compatibility target"))
                 != receipt["before_sha256"]
@@ -739,12 +773,14 @@ def _install_adapter_locked(
             _read_json_at(
                 legacy_fd, legacy_metadata.name, "legacy compatibility metadata"),
             receipt)
+    consumer_status = os.stat(consumer, follow_symlinks=False)
     if (_sha256_bytes(_read_bytes_path(legacy, "legacy compatibility target"))
             != receipt["before_sha256"]
             or _sha256_bytes(_read_bytes_path(runtime_contract, "runtime contract copy"))
             != receipt["contract_sha256"]
             or _sha256_bytes(_read_bytes_path(consumer, "canonical consumer"))
             != receipt["after_sha256"]
+            or stat.S_IMODE(consumer_status.st_mode) != 0o755
             or _read_json_path(receipt_path, "adapter receipt") != receipt):
         raise ControlPlaneError("post-install path binding mismatch")
     if resolve_active_release(contract)["target"] != receipt["active_target"]:
@@ -778,6 +814,13 @@ def _rollback_adapter_locked(contract: RuntimeContract, receipt_path: Path) -> d
         legacy.with_name("legacy-metadata.json"), "legacy compatibility metadata")
     runtime_contract = _safe_write_path(
         contract.runtime_root / "runtime-contract.json", "runtime contract copy")
+    _require_distinct_managed_paths((
+        (receipt_path, "adapter receipt"),
+        (consumer, "canonical consumer"),
+        (legacy, "legacy compatibility target"),
+        (legacy_metadata, "legacy compatibility metadata"),
+        (runtime_contract, "runtime contract copy"),
+    ))
     with (_directory_fd(consumer.parent, "canonical consumer") as consumer_fd,
           _directory_fd(legacy.parent, "legacy compatibility target", create=True) as legacy_fd,
           _directory_fd(contract.runtime_root, "runtime contract copy") as runtime_fd):
@@ -790,6 +833,9 @@ def _rollback_adapter_locked(contract: RuntimeContract, receipt_path: Path) -> d
         if (current == receipt["before_sha256"]
                 and consumer_status.st_mode & 0o777 != before_mode):
             raise ControlPlaneError("restored canonical consumer mode drifted")
+        if (current == receipt["after_sha256"]
+                and stat.S_IMODE(consumer_status.st_mode) != 0o755):
+            raise ControlPlaneError("installed canonical consumer mode drifted")
 
         legacy_present = _leaf_stat(legacy_fd, legacy.name) is not None
         metadata_present = _leaf_stat(legacy_fd, legacy_metadata.name) is not None
@@ -871,8 +917,12 @@ def verify_live_consumer(contract_path: Path, manifest_path: Path, source_root: 
         failures.append("active release contract hash mismatch")
     if contract.consumer.is_symlink() or not contract.consumer.is_file():
         failures.append("canonical consumer is missing or unsafe")
-    elif sha256_file(contract.consumer) != metadata["adapter_sha256"]:
-        failures.append("canonical consumer does not equal the active reviewed adapter")
+    else:
+        consumer_status = os.stat(contract.consumer, follow_symlinks=False)
+        if sha256_file(contract.consumer) != metadata["adapter_sha256"]:
+            failures.append("canonical consumer does not equal the active reviewed adapter")
+        if stat.S_IMODE(consumer_status.st_mode) != 0o755:
+            failures.append("canonical consumer mode must be 0755")
     legacy = reject_symlink_ancestors(contract.runtime_root / contract.legacy_target)
     legacy_metadata_path = reject_symlink_ancestors(legacy.with_name("legacy-metadata.json"))
     if legacy.is_symlink() or not legacy.is_file() or legacy_metadata_path.is_symlink() or not legacy_metadata_path.is_file():

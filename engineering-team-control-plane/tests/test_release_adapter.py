@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -235,6 +236,51 @@ class ReleaseAdapterTests(unittest.TestCase):
         (self.runtime / "active").symlink_to("../../escape")
         with self.assertRaisesRegex(ControlPlaneError, "unsafe target"):
             rollback_release(self.contract, activation)
+
+    def test_adapter_receipt_rejects_managed_path_and_inode_aliases_without_side_effects(self) -> None:
+        _source, _manifest, release, _activation = self.prepare_release(
+            "release-a", "a" * 40, "release-a")
+        adapter = release / "scripts" / "learning_loop_adapter.py"
+        original_consumer = self.consumer.read_bytes()
+        managed_outputs = (
+            self.runtime / "compat" / "v1" / "learning_loop.py",
+            self.runtime / "compat" / "v1" / "legacy-metadata.json",
+            self.runtime / "runtime-contract.json",
+        )
+        for receipt in (self.consumer, *managed_outputs):
+            with self.subTest(receipt=receipt):
+                with self.assertRaisesRegex(ControlPlaneError, "managed adapter paths must be distinct"):
+                    install_adapter(self.contract, adapter, receipt)
+                self.assertEqual(self.consumer.read_bytes(), original_consumer)
+                self.assertTrue(all(not path.exists() for path in managed_outputs))
+
+        inode_receipt = self.base / "adapter-inode-alias.json"
+        runtime_contract = self.runtime / "runtime-contract.json"
+        runtime_contract.write_text("{}\n", encoding="utf-8")
+        inode_receipt.hardlink_to(runtime_contract)
+        with self.assertRaisesRegex(ControlPlaneError, "managed adapter paths must be distinct"):
+            install_adapter(self.contract, adapter, inode_receipt)
+        self.assertEqual(self.consumer.read_bytes(), original_consumer)
+        self.assertEqual(runtime_contract.read_text(encoding="utf-8"), "{}\n")
+        self.assertFalse((self.runtime / "compat" / "v1" / "learning_loop.py").exists())
+        self.assertFalse((self.runtime / "compat" / "v1" / "legacy-metadata.json").exists())
+
+    def test_adapter_mode_drift_fails_recovery_rollback_and_live_verification(self) -> None:
+        source, manifest, release, _activation = self.prepare_release(
+            "release-a", "a" * 40, "release-a")
+        adapter = release / "scripts" / "learning_loop_adapter.py"
+        receipt = self.base / "adapter-mode.json"
+        install_adapter(self.contract, adapter, receipt)
+        self.assertEqual(stat.S_IMODE(self.consumer.stat().st_mode), 0o755)
+
+        self.consumer.chmod(0o644)
+        with self.assertRaisesRegex(ControlPlaneError, "mode drifted during adapter recovery"):
+            install_adapter(self.contract, adapter, receipt)
+        with self.assertRaisesRegex(ControlPlaneError, "installed canonical consumer mode drifted"):
+            rollback_adapter(self.contract, receipt)
+        verified = verify_live_consumer(self.contract, manifest, source)
+        self.assertFalse(verified["ok"])
+        self.assertIn("canonical consumer mode must be 0755", verified["failures"])
 
     def test_contract_rejects_command_or_canonical_path_drift(self) -> None:
         payload = json.loads(self.contract.read_text(encoding="utf-8"))
