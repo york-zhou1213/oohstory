@@ -8,11 +8,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 from .common import (AGENTS, EVENT_HEADER_RE, EVENT_ID_RE, INDEX_NAMES, SHA256_RE, STAGE_RE, TASK_RE,
-    ControlPlaneError, iter_event_store_files, iter_real_files, parse_timestamp, read_json,
+    ControlPlaneError, iter_event_store_files, parse_timestamp, read_json,
     markdown_visible_text, relative_posix, require_real_directory, require_real_file, sha256_file,
     timestamp_calendar_date, validate_root)
 
 TERMINAL_STATES = {"CLOSED", "CANCELLED", "FAILED", "SUPERSEDED", "REJECTED"}
+TASK_STATES = {
+    "INTAKE", "SPEC_READY", "ASSIGNED", "IMPLEMENTING", "CODE_REVIEW", "FIX_REQUIRED",
+    "TESTING", "READY_TO_RELEASE", "DEPLOYING", "VERIFIED", "BLOCKED", *TERMINAL_STATES,
+}
 
 def _nonempty_string(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
@@ -92,7 +96,18 @@ def _task_buckets(root: Path) -> list[tuple[str, Path]]:
     return [(bucket, require_real_directory(root, PurePosixPath("tasks", bucket)))
         for bucket in ("active", "archive")]
 
-def _task_frontmatter(path: Path, expected_task: str) -> list[str]:
+def _registry_entries(directory: Path) -> list[Path]:
+    """Enumerate every descendant before callers validate registry shape."""
+    if directory.is_symlink() or not directory.is_dir():
+        raise ControlPlaneError(f"registry path must be a real directory: {directory}")
+    entries, pending = [], [directory]
+    while pending:
+        children = sorted(pending.pop().iterdir())
+        entries.extend(children)
+        pending.extend(reversed([path for path in children if not path.is_symlink() and path.is_dir()]))
+    return sorted(entries)
+
+def _task_frontmatter(path: Path, expected_task: str) -> tuple[list[str], str]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except UnicodeDecodeError as exc:
@@ -110,7 +125,13 @@ def _task_frontmatter(path: Path, expected_task: str) -> list[str]:
         raise ControlPlaneError(f"task record requires exactly one frontmatter task-id: {expected_task}")
     if task_ids[0] != expected_task:
         raise ControlPlaneError(f"task record frontmatter task-id does not match filename: {expected_task}")
-    return frontmatter
+    states = [match.group(1).strip() for line in frontmatter
+        if (match := re.fullmatch(r"state:\s*(.*?)\s*", line))]
+    if len(states) != 1:
+        raise ControlPlaneError(f"task record requires exactly one frontmatter state: {expected_task}")
+    if states[0] not in TASK_STATES:
+        raise ControlPlaneError(f"task record has invalid frontmatter state: {expected_task}")
+    return frontmatter, states[0]
 
 def _authoritative_requirements(root: Path, task: str) -> list[str]:
     records = []
@@ -120,7 +141,7 @@ def _authoritative_requirements(root: Path, task: str) -> list[str]:
             records.append(require_real_file(root, PurePosixPath("tasks", bucket, f"{task}.md")))
     if len(records) != 1:
         raise ControlPlaneError(f"task requires exactly one authoritative active/archive record: {task}")
-    lines = _task_frontmatter(records[0], task)
+    lines, _ = _task_frontmatter(records[0], task)
     requirements, found = [], False
     index = 0
     while index < len(lines):
@@ -184,9 +205,10 @@ def audit_task(root: Path, task: str, requirements: list[str]) -> dict[str, Any]
         try:
             if receipt_directory.is_symlink() or not receipt_directory.is_dir():
                 raise ControlPlaneError("task receipt path must be a real directory")
-            if any(path.is_dir() for path in receipt_directory.iterdir() if not path.is_symlink()):
-                raise ControlPlaneError("nested task receipt directories are forbidden")
-            for path in iter_real_files(receipt_directory, ("*.json",)):
+            for path in _registry_entries(receipt_directory):
+                relative = path.relative_to(receipt_directory)
+                if len(relative.parts) != 1 or path.is_symlink() or not path.is_file() or path.suffix != ".json":
+                    raise ControlPlaneError("task receipt entries must be direct regular AGENT-STAGE.json files")
                 filename = path.stem
                 agent, separator, stage = filename.partition("-")
                 if not separator or agent not in AGENTS or not STAGE_RE.fullmatch(stage):
@@ -202,11 +224,21 @@ def audit_task(root: Path, task: str, requirements: list[str]) -> dict[str, Any]
             failures["task_receipt_inventory"] = [str(exc)]
     return {"schema_version": 1, "task_id": task, "failures": failures, "ok": not failures}
 
-def _receipt_files(root: Path) -> list[Path]:
+def _receipt_entries(root: Path) -> tuple[list[Path], list[str]]:
     receipts = root / "team-learnings" / "receipts"
-    if not receipts.exists(): return []
+    if not receipts.exists(): return [], []
     if receipts.is_symlink() or not receipts.is_dir(): raise ControlPlaneError("receipts path must be a real directory")
-    return iter_real_files(receipts, ("**/*",))
+    records, errors = [], []
+    for path in _registry_entries(receipts):
+        relative = path.relative_to(receipts)
+        if len(relative.parts) == 1:
+            if path.is_symlink() or not path.is_dir() or not TASK_RE.fullmatch(path.name):
+                errors.append(f"{relative_posix(path, root)}: receipt task entry must be a real TASK-ID directory")
+        elif len(relative.parts) == 2:
+            records.append(path)
+        else:
+            errors.append(f"{relative_posix(path, root)}: receipt entry exceeds canonical depth")
+    return records, errors
 
 def _task_records(root: Path) -> tuple[dict[str, str], list[str]]:
     records, errors = {}, []
@@ -215,19 +247,24 @@ def _task_records(root: Path) -> tuple[dict[str, str], list[str]]:
     except ControlPlaneError as exc:
         return records, [str(exc)]
     for bucket, directory in buckets:
-        for path in iter_real_files(directory, ("TASK-*.md",)):
+        for path in _registry_entries(directory):
+            relative = path.relative_to(directory)
+            if len(relative.parts) != 1 or path.is_symlink() or not path.is_file():
+                errors.append(f"invalid task record type or depth: {relative_posix(path, root)}")
+                continue
             task = path.stem
-            if not TASK_RE.fullmatch(task): errors.append(f"invalid task record name: {relative_posix(path, root)}"); continue
+            if path.suffix != ".md" or not path.name.startswith("TASK-") or not TASK_RE.fullmatch(task):
+                errors.append(f"invalid task record name: {relative_posix(path, root)}")
+                continue
             if task in records:
                 errors.append(f"duplicate task record: {task}")
+                continue
             try:
-                frontmatter = _task_frontmatter(path, task)
+                _, state = _task_frontmatter(path, task)
             except ControlPlaneError as exc:
                 errors.append(f"{relative_posix(path, root)}: {exc}")
                 continue
-            matches = [match.group(1) for line in frontmatter
-                if (match := re.fullmatch(r"state:\s*([A-Z_]+)\s*", line))]
-            records[task] = "ARCHIVED" if bucket == "archive" else (matches[-1] if matches else "UNKNOWN")
+            records[task] = "ARCHIVED" if bucket == "archive" else state
     return records, errors
 
 def _scan_event_store(root: Path):
@@ -303,12 +340,18 @@ def audit_system(root: Path, *, stale_hours: float = 24.0, now: datetime | None 
     elif now.tzinfo is None:
         raise ControlPlaneError("now must include a timezone")
     now = now.astimezone(timezone.utc)
-    task_records, errors = _task_records(root); orphan, stale, malformed = [], [], []; receipts = _receipt_files(root)
+    task_records, errors = _task_records(root); orphan, stale, malformed = [], [], []
+    try:
+        receipts, receipt_inventory_errors = _receipt_entries(root)
+        malformed.extend(receipt_inventory_errors)
+    except (ControlPlaneError, OSError) as exc:
+        receipts = []
+        malformed.append(str(exc))
     for path in receipts:
         relative = relative_posix(path, root)
         try:
             receipt_relative = path.relative_to(root / "team-learnings" / "receipts")
-            if len(receipt_relative.parts) != 2 or path.suffix != ".json":
+            if path.is_symlink() or not path.is_file() or len(receipt_relative.parts) != 2 or path.suffix != ".json":
                 raise ControlPlaneError("receipt must use canonical TASK-ID/AGENT-STAGE.json depth and filename")
             task, filename = receipt_relative.parts[0], path.stem
             agent, separator, stage = filename.partition("-")

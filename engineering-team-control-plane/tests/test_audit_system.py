@@ -3,13 +3,22 @@ import json
 import math
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
 from learning_control_plane.audit import audit_system
+from learning_control_plane.cli import main
 from .support import add_task, make_receipt, prepare_root
 class AuditSystemTests(unittest.TestCase):
     def setUp(self): self.temporary = tempfile.TemporaryDirectory(); self.root = prepare_root(Path(self.temporary.name))
     def tearDown(self): self.temporary.cleanup()
+    def assert_system_rejected(self):
+        result = audit_system(self.root)
+        self.assertFalse(result["ok"], result)
+        with redirect_stdout(StringIO()):
+            self.assertEqual(main(["audit-system", "--team-root", str(self.root)]), 2)
+        return result
     def test_clean_store_passes(self):
         result = audit_system(self.root, now=datetime(2026, 8, 25, 12, tzinfo=timezone.utc)); self.assertTrue(result["ok"], result)
     def test_orphan_and_stale_open_receipts(self):
@@ -69,7 +78,7 @@ class AuditSystemTests(unittest.TestCase):
         wrong_name.write_text("{}\n", encoding="utf-8")
         result = audit_system(self.root)
         self.assertEqual(result["receipt_count"], 2)
-        self.assertEqual(len(result["malformed_receipts"]), 2)
+        self.assertEqual(len(result["malformed_receipts"]), 3)
         self.assertFalse(result["ok"])
     def test_task_frontmatter_identity_and_registry_symlink_fail(self):
         add_task(self.root, "TASK-MISMATCH")
@@ -85,6 +94,43 @@ class AuditSystemTests(unittest.TestCase):
         linked = audit_system(self.root)
         self.assertTrue(any("symlink" in value for value in linked["errors"]))
         self.assertFalse(linked["ok"])
+    def test_alias_task_record_fails_closed(self):
+        alias = self.root / "tasks" / "active" / "ALIAS.md"
+        alias.write_text("---\ntask-id: TASK-ALIAS\nstate: CLOSED\n---\n", encoding="utf-8")
+        result = self.assert_system_rejected()
+        self.assertTrue(any("invalid task record name" in value for value in result["errors"]))
+    def test_nested_task_record_fails_closed(self):
+        nested = self.root / "tasks" / "active" / "nested" / "TASK-HIDDEN.md"
+        nested.parent.mkdir()
+        nested.write_text("---\ntask-id: TASK-HIDDEN\nstate: CLOSED\n---\n", encoding="utf-8")
+        result = self.assert_system_rejected()
+        self.assertTrue(any("type or depth" in value for value in result["errors"]))
+    def test_missing_task_state_fails_closed(self):
+        add_task(self.root, "TASK-MISSING-STATE")
+        record = self.root / "tasks" / "active" / "TASK-MISSING-STATE.md"
+        record.write_text(record.read_text(encoding="utf-8").replace("state: IMPLEMENTING\n", ""), encoding="utf-8")
+        result = self.assert_system_rejected()
+        self.assertTrue(any("exactly one frontmatter state" in value for value in result["errors"]))
+    def test_duplicate_task_state_fails_closed(self):
+        add_task(self.root, "TASK-DUPLICATE-STATE")
+        record = self.root / "tasks" / "active" / "TASK-DUPLICATE-STATE.md"
+        record.write_text(record.read_text(encoding="utf-8").replace("state: IMPLEMENTING", "state: IMPLEMENTING\nstate: CLOSED"), encoding="utf-8")
+        result = self.assert_system_rejected()
+        self.assertTrue(any("exactly one frontmatter state" in value for value in result["errors"]))
+    def test_malformed_task_state_fails_closed(self):
+        add_task(self.root, "TASK-BAD-STATE", state="NOT_A_LIFECYCLE_STATE")
+        result = self.assert_system_rejected()
+        self.assertTrue(any("invalid frontmatter state" in value for value in result["errors"]))
+    def test_directory_shaped_receipt_fails_closed(self):
+        receipt = self.root / "team-learnings" / "receipts" / "TASK-DIRECTORY" / "john-test.json"
+        receipt.mkdir(parents=True)
+        result = self.assert_system_rejected()
+        self.assertTrue(any("canonical TASK-ID/AGENT-STAGE.json" in value for value in result["malformed_receipts"]))
+    def test_terminal_task_open_receipt_is_not_hidden(self):
+        add_task(self.root, "TASK-TERMINAL", state="CLOSED")
+        path, _ = make_receipt(self.root, task="TASK-TERMINAL", status="open")
+        result = self.assert_system_rejected()
+        self.assertIn(path.relative_to(self.root).as_posix(), result["stale_open_receipts"])
     def test_malformed_shared_jsonl_fails_closed(self):
         (self.root / "team-learnings" / "LEARNING_LEDGER.jsonl").write_text('{"ok":true}\n{\n', encoding="utf-8")
         result = audit_system(self.root)

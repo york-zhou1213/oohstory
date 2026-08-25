@@ -40,6 +40,19 @@ class AuditTaskTests(unittest.TestCase):
         task.write_text(original.replace("state:", "task-id: TASK-TEST\nstate:"), encoding="utf-8")
         repeated = audit_task(self.root, "TASK-TEST", ["john:implementation"])
         self.assertIn("authoritative_participation", repeated["failures"])
+    def test_authoritative_task_state_must_be_unique_and_valid(self):
+        task = self.root / "tasks" / "active" / "TASK-TEST.md"
+        original = task.read_text(encoding="utf-8")
+        for content in (
+            original.replace("state: IMPLEMENTING\n", ""),
+            original.replace("state: IMPLEMENTING", "state: IMPLEMENTING\nstate: CLOSED"),
+            original.replace("state: IMPLEMENTING", "state: UNKNOWN"),
+        ):
+            with self.subTest(content=content):
+                task.write_text(content, encoding="utf-8")
+                result = audit_task(self.root, "TASK-TEST", ["john:implementation"])
+                self.assertFalse(result["ok"])
+                self.assertIn("authoritative_participation", result["failures"])
     def test_missing_and_open_receipts_fail(self):
         self.assertFalse(audit_task(self.root, "TASK-TEST", ["john:implementation"])["ok"]); make_receipt(self.root, status="open"); self.assertFalse(audit_task(self.root, "TASK-TEST", ["john:implementation"])["ok"])
     def test_empty_memory_and_hash_drift_fail(self):
