@@ -13,6 +13,7 @@ AGENTS = ("ken", "john", "jucy", "bob", "mus")
 EVENT_KINDS = ("ERR", "FR", "LRN", "FEAT")
 EVENT_ID_RE = re.compile(r"(?<![A-Z0-9-])((?:ERR|FR|LRN|FEAT)-\d{8}-[A-Za-z0-9]{3,})(?![A-Z0-9-])")
 EVENT_HEADER_RE = re.compile(r"(?m)^## \[((?:ERR|FR|LRN|FEAT)-\d{8}-[A-Za-z0-9]{3,})\](?:\s|$)")
+FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})")
 TASK_RE = re.compile(r"^TASK-[A-Za-z0-9._-]+$")
 STAGE_RE = re.compile(r"^[a-z][a-z0-9_-]{1,63}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -109,6 +110,11 @@ def require_real_file(root: Path, relative: str | PurePosixPath) -> Path:
     return path
 
 def iter_real_files(directory: Path, patterns: Iterable[str]) -> list[Path]:
+    if directory.is_symlink() or not directory.is_dir():
+        raise ControlPlaneError(f"required directory is missing or unsafe: {directory}")
+    for path in directory.glob("**/*"):
+        if path.is_symlink():
+            raise ControlPlaneError(f"symlink is forbidden: {path}")
     found: set[Path] = set()
     for pattern in patterns:
         for path in directory.glob(pattern):
@@ -121,6 +127,36 @@ def iter_real_files(directory: Path, patterns: Iterable[str]) -> list[Path]:
             if path.is_file():
                 found.add(path)
     return sorted(found)
+
+def iter_event_store_files(root: Path) -> list[Path]:
+    """Enumerate every canonical role/shared learning file exactly once."""
+    files: set[Path] = set()
+    patterns = ("**/*.md", "**/*.json", "**/*.jsonl")
+    for agent in AGENTS:
+        files.update(iter_real_files(require_real_directory(root, PurePosixPath(agent, "learnings")), patterns))
+    files.update(iter_real_files(require_real_directory(root, PurePosixPath("team-learnings")), patterns))
+    return sorted(files)
+
+def markdown_visible_text(text: str) -> str:
+    """Mask fenced code while preserving offsets and line structure."""
+    visible, fence_char, fence_length = [], None, 0
+    for line in text.splitlines(keepends=True):
+        if fence_char is None:
+            opening = FENCE_OPEN_RE.match(line)
+            if opening:
+                marker = opening.group(1); fence_char, fence_length = marker[0], len(marker)
+                visible.append("".join(char if char in "\r\n" else " " for char in line))
+            else:
+                visible.append(line)
+            continue
+        stripped = line.lstrip(" ")
+        marker_length = len(stripped) - len(stripped.lstrip(fence_char))
+        closes = (len(line) - len(stripped) <= 3 and marker_length >= fence_length
+            and not stripped[marker_length:].strip())
+        visible.append("".join(char if char in "\r\n" else " " for char in line))
+        if closes:
+            fence_char, fence_length = None, 0
+    return "".join(visible)
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()

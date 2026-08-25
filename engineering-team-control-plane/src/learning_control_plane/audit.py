@@ -8,8 +8,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 from .common import (AGENTS, EVENT_HEADER_RE, EVENT_ID_RE, INDEX_NAMES, SHA256_RE, STAGE_RE, TASK_RE,
-    ControlPlaneError, iter_real_files, parse_timestamp, read_json, relative_posix, require_real_file,
-    sha256_file, timestamp_calendar_date, validate_root)
+    ControlPlaneError, iter_event_store_files, iter_real_files, parse_timestamp, read_json,
+    markdown_visible_text, relative_posix, require_real_file, sha256_file,
+    timestamp_calendar_date, validate_root)
 
 TERMINAL_STATES = {"CLOSED", "CANCELLED", "FAILED", "SUPERSEDED", "REJECTED"}
 
@@ -86,20 +87,103 @@ def validate_receipt_identity(receipt: dict[str, Any], *, task: str, agent: str,
     if receipt.get("task_id") != task or receipt.get("agent") != agent or receipt.get("stage") != stage: raise ControlPlaneError("receipt payload identity does not match its path/requirement")
     if status is not None and receipt.get("status") != status: raise ControlPlaneError(f"receipt status must be {status}")
 
+def _authoritative_requirements(root: Path, task: str) -> list[str]:
+    records = []
+    for bucket in ("active", "archive"):
+        candidate = root / "tasks" / bucket / f"{task}.md"
+        if candidate.exists() or candidate.is_symlink():
+            records.append(require_real_file(root, PurePosixPath("tasks", bucket, f"{task}.md")))
+    if len(records) != 1:
+        raise ControlPlaneError(f"task requires exactly one authoritative active/archive record: {task}")
+    try:
+        lines = records[0].read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise ControlPlaneError(f"task record is not UTF-8: {task}") from exc
+    if not lines or lines[0].strip() != "---":
+        raise ControlPlaneError(f"task record lacks front matter: {task}")
+    try:
+        end = next(index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---")
+    except StopIteration as exc:
+        raise ControlPlaneError(f"task record has unterminated front matter: {task}") from exc
+    requirements, found = [], False
+    index = 1
+    while index < end:
+        if lines[index] != "learning-requirements:":
+            index += 1
+            continue
+        if found:
+            raise ControlPlaneError("task record repeats learning-requirements")
+        found = True
+        index += 1
+        while index < end and (not lines[index].strip() or lines[index].startswith((" ", "\t"))):
+            item = lines[index].strip()
+            if item:
+                if not item.startswith("- "):
+                    raise ControlPlaneError("learning-requirements entries must use an indented list")
+                requirements.append(item[2:].strip().strip("'\"`"))
+            index += 1
+    if not found or not requirements:
+        raise ControlPlaneError("task record requires non-empty learning-requirements")
+    if len(requirements) != len(set(requirements)):
+        raise ControlPlaneError("task record contains duplicate learning-requirements")
+    for requirement in requirements:
+        agent, separator, stage = requirement.partition(":")
+        if not separator or agent not in AGENTS or not STAGE_RE.fullmatch(stage):
+            raise ControlPlaneError(f"invalid authoritative learning requirement: {requirement}")
+    return requirements
+
 def audit_task(root: Path, task: str, requirements: list[str]) -> dict[str, Any]:
     root = validate_root(root)
     if not TASK_RE.fullmatch(task): raise ControlPlaneError("invalid TASK-ID")
     if not requirements: raise ControlPlaneError("at least one AGENT:STAGE requirement is required")
     failures: dict[str, list[str]] = {}
+    parsed_requirements = []
     for requirement in requirements:
         agent, separator, stage = requirement.partition(":")
         if not separator or agent not in AGENTS or not STAGE_RE.fullmatch(stage): failures[requirement] = ["invalid AGENT:STAGE requirement"]; continue
+        parsed_requirements.append(requirement)
+    if len(parsed_requirements) != len(set(parsed_requirements)):
+        failures["requested_requirements"] = ["duplicate AGENT:STAGE requirement"]
+    try:
+        authoritative = _authoritative_requirements(root, task)
+    except (ControlPlaneError, OSError) as exc:
+        failures["authoritative_participation"] = [str(exc)]
+        authoritative = []
+    missing = sorted(set(authoritative) - set(parsed_requirements))
+    extra = sorted(set(parsed_requirements) - set(authoritative))
+    if missing or extra:
+        failures["requested_requirements"] = [
+            f"requirements do not match authoritative participation; omitted={missing}; extra={extra}"
+        ]
+    for requirement in authoritative:
+        agent, _, stage = requirement.partition(":")
         try:
             path = require_real_file(root, PurePosixPath("team-learnings", "receipts", task, f"{agent}-{stage}.json"))
             receipt = read_json(path)
             validate_receipt_identity(receipt, task=task, agent=agent, stage=stage, status="closed")
             validate_closure_evidence(root, receipt)
         except (ControlPlaneError, OSError) as exc: failures[requirement] = [str(exc)]
+    receipt_directory = root / "team-learnings" / "receipts" / task
+    if receipt_directory.exists() or receipt_directory.is_symlink():
+        try:
+            if receipt_directory.is_symlink() or not receipt_directory.is_dir():
+                raise ControlPlaneError("task receipt path must be a real directory")
+            if any(path.is_dir() for path in receipt_directory.iterdir() if not path.is_symlink()):
+                raise ControlPlaneError("nested task receipt directories are forbidden")
+            for path in iter_real_files(receipt_directory, ("*.json",)):
+                filename = path.stem
+                agent, separator, stage = filename.partition("-")
+                if not separator or agent not in AGENTS or not STAGE_RE.fullmatch(stage):
+                    raise ControlPlaneError(f"invalid receipt path identity: {filename}")
+                receipt = read_json(path)
+                validate_receipt_identity(receipt, task=task, agent=agent, stage=stage)
+                status = receipt.get("status")
+                if status not in {"open", "closed"}:
+                    raise ControlPlaneError(f"receipt status must be open or closed: {filename}")
+                if status == "open":
+                    failures[f"open_receipt:{agent}:{stage}"] = ["every task receipt must be closed"]
+        except (ControlPlaneError, OSError) as exc:
+            failures["task_receipt_inventory"] = [str(exc)]
     return {"schema_version": 1, "task_id": task, "failures": failures, "ok": not failures}
 
 def _receipt_files(root: Path) -> list[Path]:
@@ -130,13 +214,12 @@ def _task_records(root: Path) -> tuple[dict[str, str], list[str]]:
     return records, errors
 
 def _scan_event_store(root: Path):
-    definitions, references, errors, files = defaultdict(list), [], [], []
-    for agent in AGENTS:
-        directory = root / agent / "learnings"
-        if directory.is_symlink() or not directory.is_dir(): errors.append(f"missing or unsafe lifecycle directory: {agent}/learnings"); continue
-        files.extend(iter_real_files(directory, ("*.md",)))
-    files.extend(iter_real_files(root / "team-learnings", ("**/*.md", "**/*.json", "**/*.jsonl")))
-    for path in sorted(set(files)):
+    definitions, references, errors = defaultdict(list), [], []
+    try:
+        files = iter_event_store_files(root)
+    except ControlPlaneError as exc:
+        return definitions, [], [str(exc)]
+    for path in files:
         relative = relative_posix(path, root)
         try: text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError: errors.append(f"non-UTF-8 store file: {relative}"); continue
@@ -151,11 +234,12 @@ def _scan_event_store(root: Path):
             continue
         if path.name == "ID_RESERVATIONS.json":
             continue
+        scan_text = markdown_visible_text(text) if path.suffix == ".md" else text
         header_spans = set()
-        for match in EVENT_HEADER_RE.finditer(text):
-            definitions[match.group(1)].append((relative, text.count("\n", 0, match.start()) + 1)); header_spans.add(match.span(1))
-        for match in EVENT_ID_RE.finditer(text):
-            if match.span(1) not in header_spans: references.append((relative, text.count("\n", 0, match.start()) + 1, match.group(1)))
+        for match in EVENT_HEADER_RE.finditer(scan_text):
+            definitions[match.group(1)].append((relative, scan_text.count("\n", 0, match.start()) + 1)); header_spans.add(match.span(1))
+        for match in EVENT_ID_RE.finditer(scan_text):
+            if match.span(1) not in header_spans: references.append((relative, scan_text.count("\n", 0, match.start()) + 1, match.group(1)))
     return definitions, [f"{p}:{line} -> {eid}" for p, line, eid in references if eid not in definitions], errors
 
 def _lifecycle_debt(root: Path):
@@ -165,7 +249,10 @@ def _lifecycle_debt(root: Path):
             relative = f"{agent}/learnings/{name}"
             try: path = require_real_file(root, relative)
             except ControlPlaneError: missing.append(relative); continue
-            if name == "ERRORS.md" and "## [ERR-" not in path.read_text(encoding="utf-8"): empty_errors.append(agent)
+            if name == "ERRORS.md":
+                text = markdown_visible_text(path.read_text(encoding="utf-8"))
+                if not any(match.group(1).startswith("ERR-") for match in EVENT_HEADER_RE.finditer(text)):
+                    empty_errors.append(agent)
     flow_debt, team_index = [], root / "team-learnings" / "TEAM_LEARNINGS.md"
     if not team_index.is_file() or team_index.is_symlink(): missing.append("team-learnings/TEAM_LEARNINGS.md")
     else:
@@ -224,7 +311,7 @@ def audit_system(root: Path, *, stale_hours: float = 24.0, now: datetime | None 
     missing, empty_agents, empty_flows = _lifecycle_debt(root); guard, promotion, state_errors = _state_debt(root); errors.extend(state_errors)
     categories = {"orphan_open_receipts": sorted(orphan), "stale_open_receipts": sorted(set(stale)), "malformed_receipts": sorted(malformed),
         "duplicate_event_ids": duplicates, "broken_event_references": sorted(broken_refs), "guard_debt": sorted(guard), "promotion_debt": sorted(promotion),
-        "missing_lifecycle_files": sorted(set(missing)), "empty_error_agents": sorted(empty_agents) if len(empty_agents) >= 4 else [],
+        "missing_lifecycle_files": sorted(set(missing)), "empty_error_agents": sorted(empty_agents),
         "empty_flow_sections": sorted(empty_flows), "errors": sorted(set(errors))}
     return {"schema_version": 1, "generated_at": now.isoformat(timespec="seconds"), "receipt_count": len(receipts), **categories,
         "ok": not any(bool(value) for value in categories.values())}

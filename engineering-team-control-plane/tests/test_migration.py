@@ -50,6 +50,57 @@ class MigrationTests(unittest.TestCase):
         plan = plan_migration(self.root, resolutions=resolution)
         self.assertEqual(len(plan["changes"]), 2)
 
+    def test_same_file_reference_requires_resolution_unless_inside_its_definition(self) -> None:
+        john, bob = self.add_resolvable_duplicate()
+        john.write_text(
+            "# Learnings\n\nSee LRN-20260825-010.\n\n## [LRN-20260825-010] John\n\nDetails.\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ControlPlaneError, "ambiguous duplicate references"):
+            plan_migration(self.root)
+        resolution = {
+            "john/learnings/LEARNINGS.md:3:5:LRN-20260825-010": "bob/learnings/LEARNINGS.md:3"
+        }
+        plan = plan_migration(self.root, resolutions=resolution)
+        self.assertIn("john/learnings/LEARNINGS.md", {item["path"] for item in plan["changes"]})
+
+    def test_unrelated_peer_heading_ends_structural_self_reference(self) -> None:
+        john, _bob = self.add_resolvable_duplicate()
+        john.write_text(
+            "# Learnings\n\n## [LRN-20260825-010] John\n\nDetails.\n\n"
+            "## Unrelated\n\nSee LRN-20260825-010.\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ControlPlaneError, "ambiguous duplicate references"):
+            plan_migration(self.root)
+        resolution = {
+            "john/learnings/LEARNINGS.md:9:5:LRN-20260825-010": "bob/learnings/LEARNINGS.md:3"
+        }
+        self.assertTrue(plan_migration(self.root, resolutions=resolution)["changes"])
+
+    def test_setext_peer_heading_ends_structural_self_reference(self) -> None:
+        john, _bob = self.add_resolvable_duplicate()
+        john.write_text(
+            "# Learnings\n\n## [LRN-20260825-010] John\n\nDetails.\n\n"
+            "Unrelated\n---------\n\nSee LRN-20260825-010.\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ControlPlaneError, "ambiguous duplicate references"):
+            plan_migration(self.root)
+        resolution = {
+            "john/learnings/LEARNINGS.md:10:5:LRN-20260825-010": "bob/learnings/LEARNINGS.md:3"
+        }
+        self.assertTrue(plan_migration(self.root, resolutions=resolution)["changes"])
+
+    def test_recursive_role_and_shared_files_are_migration_inputs(self) -> None:
+        role = self.root / "john" / "learnings" / "archive" / "old.md"; role.parent.mkdir()
+        shared = self.root / "team-learnings" / "archive" / "old.jsonl"; shared.parent.mkdir()
+        role.write_text("# Archived\n", encoding="utf-8")
+        shared.write_text('{"status":"archived"}\n', encoding="utf-8")
+        plan = plan_migration(self.root)
+        self.assertIn("john/learnings/archive/old.md", plan["input_hashes"])
+        self.assertIn("team-learnings/archive/old.jsonl", plan["input_hashes"])
+
     def test_write_idempotence_manifest_backup_and_rollback(self) -> None:
         john, _bob = self.add_resolvable_duplicate()
         original = john.read_bytes()

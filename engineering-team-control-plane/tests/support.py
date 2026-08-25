@@ -16,9 +16,14 @@ def prepare_root(base: Path) -> Path:
     (shared / "LEARNING_STATE.json").write_text(json.dumps({"schema_version": 1, "lessons": {}}) + "\n", encoding="utf-8")
     (root / "tasks" / "active").mkdir(parents=True); (root / "tasks" / "archive").mkdir(parents=True)
     return root
-def add_task(root: Path, task: str, *, state: str = "IMPLEMENTING", archived: bool = False) -> None:
+def add_task(root: Path, task: str, *, state: str = "IMPLEMENTING", archived: bool = False,
+             requirements: tuple[str, ...] = ("john:implementation",)) -> None:
     bucket = "archive" if archived else "active"
-    (root / "tasks" / bucket / f"{task}.md").write_text(f"---\ntask-id: {task}\nstate: {state}\n---\n", encoding="utf-8")
+    required = "".join(f"  - {item}\n" for item in requirements)
+    (root / "tasks" / bucket / f"{task}.md").write_text(
+        f"---\ntask-id: {task}\nstate: {state}\nlearning-requirements:\n{required}---\n",
+        encoding="utf-8",
+    )
 def make_receipt(root: Path, *, task: str = "TASK-TEST", agent: str = "john", stage: str = "implementation",
                  status: str = "closed", day: str = "2026-08-25", mode: str = "semantic_recall"):
     memory = root / agent / "memory" / f"{day}.md"; memory.write_text(f"# {agent} memory\n\nTask evidence for {task}.\n", encoding="utf-8")

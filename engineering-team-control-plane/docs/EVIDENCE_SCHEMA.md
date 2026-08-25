@@ -2,6 +2,16 @@
 
 `audit-task` requires receipt `schema_version: 2`. Schema-v1 receipts remain readable by `audit-system`, but cannot silently satisfy the new memory/RAG gate.
 
+The authoritative task record must declare the complete participating stage set in front matter:
+
+```yaml
+learning-requirements:
+  - john:implementation
+  - bob:review
+```
+
+Every `--require` value must exactly match this set. A missing requirement, an extra caller-supplied requirement, a missing/invalid authoritative receipt, or any additional open receipt under the task fails closed. Closed historical/rework receipts may remain for append-only audit history.
+
 ```json
 {
   "schema_version": 2,

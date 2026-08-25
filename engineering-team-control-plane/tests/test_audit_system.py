@@ -20,6 +20,29 @@ class AuditSystemTests(unittest.TestCase):
         (self.root / "john" / "learnings" / "LEARNINGS.md").write_text("# Learnings\n\n## [LRN-20260825-001] A\n", encoding="utf-8")
         (self.root / "bob" / "learnings" / "LEARNINGS.md").write_text("# Learnings\n\n## [LRN-20260825-001] B\n\nSee FEAT-20260825-999.\n", encoding="utf-8")
         result = audit_system(self.root); self.assertIn("LRN-20260825-001", result["duplicate_event_ids"]); self.assertTrue(any("FEAT-20260825-999" in value for value in result["broken_event_references"]))
+    def test_nested_role_and_shared_duplicate_ids_fail(self):
+        nested = self.root / "john" / "learnings" / "archive" / "old.md"; nested.parent.mkdir()
+        shared = self.root / "team-learnings" / "archive" / "old.md"; shared.parent.mkdir()
+        nested.write_text("## [LRN-20260825-777] nested\n", encoding="utf-8")
+        shared.write_text("## [LRN-20260825-777] shared\n", encoding="utf-8")
+        result = audit_system(self.root)
+        self.assertIn("LRN-20260825-777", result["duplicate_event_ids"])
+    def test_each_individual_empty_error_store_fails(self):
+        for agent in ("ken", "john", "jucy", "bob", "mus"):
+            with self.subTest(agent=agent):
+                path = self.root / agent / "learnings" / "ERRORS.md"
+                original = path.read_text(encoding="utf-8")
+                path.write_text("# Errors\n", encoding="utf-8")
+                result = audit_system(self.root)
+                self.assertEqual(result["empty_error_agents"], [agent])
+                self.assertFalse(result["ok"])
+                path.write_text(original, encoding="utf-8")
+    def test_fenced_error_header_does_not_satisfy_role_debt_gate(self):
+        path = self.root / "john" / "learnings" / "ERRORS.md"
+        path.write_text("# Errors\n\n```text\n## [ERR-20260825-999] example\n```\n", encoding="utf-8")
+        result = audit_system(self.root)
+        self.assertEqual(result["empty_error_agents"], ["john"])
+        self.assertFalse(result["ok"])
     def test_alphanumeric_ids_and_jsonl_references_are_scanned(self):
         (self.root / "john" / "learnings" / "LEARNINGS.md").write_text("# Learnings\n\n## [LRN-20260825-A01] Alpha\n", encoding="utf-8")
         ledger = self.root / "team-learnings" / "LEARNING_LEDGER.jsonl"

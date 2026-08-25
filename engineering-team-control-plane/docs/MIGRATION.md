@@ -17,6 +17,8 @@ Migration is dry-run by default and consumes all Markdown, JSON, and JSONL files
 
 Targets are exact definition locators. Unused, stale, or wrong-ID resolutions fail closed.
 
+A duplicate-ID reference is inferred only when its byte position lies inside the Markdown section opened by that exact level-2 definition header and before the next ATX or Setext level-1/2 heading, which proves a structural self-reference. Fenced examples are ignored. Merely sharing a file with one duplicated definition is not evidence; references outside that section require an exact resolution entry.
+
 4. Repeat the dry run with `--resolution-file FILE`.
 5. Apply with `--write --backup-dir /bounded/new-empty-directory --max-backup-bytes N`.
 

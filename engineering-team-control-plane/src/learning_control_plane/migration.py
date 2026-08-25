@@ -7,16 +7,16 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from .common import (AGENTS, EVENT_HEADER_RE, EVENT_ID_RE, ControlPlaneError, atomic_write, iter_real_files,
-    read_json, reject_symlink_ancestors, relative_posix, secure_path, sha256_file, validate_root)
+from .common import (EVENT_HEADER_RE, EVENT_ID_RE, ControlPlaneError, atomic_write,
+    iter_event_store_files, markdown_visible_text, read_json, reject_symlink_ancestors,
+    relative_posix, secure_path, sha256_file, validate_root)
 
 MIGRATION_SCHEMA = 1
+ATX_SECTION_END_RE = re.compile(r"(?m)^#{1,2}\s+")
+SETEXT_SECTION_END_RE = re.compile(r"(?m)^[ \t]{0,3}\S[^\n]*\n[ \t]{0,3}(?:=+|-+)[ \t]*(?:\n|$)")
 
 def migration_inputs(root: Path) -> list[Path]:
-    files: list[Path] = []
-    for agent in AGENTS: files.extend(iter_real_files(root / agent / "learnings", ("**/*.md", "**/*.json", "**/*.jsonl")))
-    files.extend(iter_real_files(root / "team-learnings", ("**/*.md", "**/*.json", "**/*.jsonl")))
-    return sorted(set(files))
+    return iter_event_store_files(root)
 
 def load_resolutions(path: Path | None) -> tuple[dict[str, str], str | None]:
     if path is None: return {}, None
@@ -50,14 +50,23 @@ def plan_migration(root: Path, *, resolutions: dict[str, str] | None = None) -> 
         texts[relative] = text; header_spans = set()
         if path.name == "ID_RESERVATIONS.json":
             continue
-        for match in EVENT_HEADER_RE.finditer(text):
-            line = text.count("\n", 0, match.start()) + 1
-            definitions[match.group(1)].append({"path": relative, "line": line, "start": match.start(1), "end": match.end(1)})
+        scan_text = markdown_visible_text(text) if path.suffix == ".md" else text
+        header_matches = list(EVENT_HEADER_RE.finditer(scan_text))
+        for match in header_matches:
+            line = scan_text.count("\n", 0, match.start()) + 1
+            headings = [candidate for candidate in (
+                ATX_SECTION_END_RE.search(scan_text, match.end(1)),
+                SETEXT_SECTION_END_RE.search(scan_text, match.end(1)),
+            ) if candidate]
+            section_end = min(candidate.start() for candidate in headings) if headings else len(scan_text)
+            definitions[match.group(1)].append({"path": relative, "line": line,
+                "start": match.start(1), "end": match.end(1),
+                "section_start": match.end(1), "section_end": section_end})
             header_spans.add(match.span(1))
-        for match in EVENT_ID_RE.finditer(text):
+        for match in EVENT_ID_RE.finditer(scan_text):
             if match.span(1) not in header_spans:
-                line = text.count("\n", 0, match.start()) + 1
-                column = match.start() - text.rfind("\n", 0, match.start())
+                line = scan_text.count("\n", 0, match.start()) + 1
+                column = match.start() - scan_text.rfind("\n", 0, match.start())
                 references.append({"id": match.group(1), "path": relative, "line": line, "column": column,
                     "start": match.start(1), "end": match.end(1)})
     broken = sorted({_reference_locator(i["path"], i["line"], i["column"], i["id"]) for i in references if i["id"] not in definitions})
@@ -83,9 +92,16 @@ def plan_migration(root: Path, *, resolutions: dict[str, str] | None = None) -> 
         event_id = reference["id"]
         if event_id not in duplicate_ids: continue
         ref_locator = _reference_locator(reference["path"], reference["line"], reference["column"], event_id)
-        candidates = duplicate_ids[event_id]; same_file = [i for i in candidates if i["path"] == reference["path"]]
-        target_locator = _definition_locator(same_file[0]["path"], same_file[0]["line"]) if len(same_file) == 1 else None
-        if target_locator is None and ref_locator in resolutions: target_locator = resolutions[ref_locator]; used_resolutions.add(ref_locator)
+        candidates = duplicate_ids[event_id]
+        if ref_locator in resolutions:
+            target_locator = resolutions[ref_locator]
+            used_resolutions.add(ref_locator)
+        else:
+            structural_self = [item for item in candidates
+                if item["path"] == reference["path"]
+                and item["section_start"] <= reference["start"] < item["section_end"]]
+            target_locator = (_definition_locator(structural_self[0]["path"], structural_self[0]["line"])
+                if len(structural_self) == 1 else None)
         if target_locator not in occurrence_targets: ambiguous.append(ref_locator); continue
         valid_targets = {_definition_locator(i["path"], i["line"]) for i in candidates}
         if target_locator not in valid_targets: raise ControlPlaneError(f"resolution {ref_locator} targets a definition of the wrong ID: {target_locator}")

@@ -6,11 +6,11 @@ This Python-standard-library package makes the engineering team's memory, retrie
 
 Run from this directory with `python3 scripts/learning_control_plane.py`:
 
-- `audit-task --team-root ROOT --task TASK-ID --require john:implementation` validates a closed schema-v2 receipt, same-calendar-day owner memory, exact file/hash/line evidence, and either successful semantic recall or an explicit exact-file fallback.
+- `audit-task --team-root ROOT --task TASK-ID --require john:implementation` requires the supplied stages to exactly match the task record's `learning-requirements`, rejects every open task receipt, and validates each authoritative stage's closed schema-v2 evidence.
 - `audit-system --team-root ROOT [--stale-hours 24]` reports malformed, orphan, and stale open receipts; duplicate event IDs; broken references; and lifecycle, guard, promotion, and knowledge-flow debt.
-- `allocate-id --team-root ROOT --kind ERR --owner john [--date YYYYMMDD]` scans all five role stores and persists a reservation while holding an advisory full-store lock. A returned ID cannot be returned by a concurrent caller even before its Markdown header is written.
+- `allocate-id --team-root ROOT --kind ERR --owner john [--date YYYYMMDD]` recursively scans all five role stores plus the shared store and persists a reservation while holding an advisory full-store lock. A returned ID cannot be returned by a concurrent caller even before its Markdown header is written.
 - `migrate-ids --team-root ROOT` performs a dry run. `--write --backup-dir NEW_EMPTY_DIR` applies the exact plan after a bounded verified backup. `--rollback MANIFEST` restores only files whose hashes still equal the migration's before/after states.
-- `verify-deployment --manifest MANIFEST --source-root SOURCE --runtime-root RUNTIME` requires both source and runtime SHA-256 values to equal the committed manifest.
+- `verify-deployment --manifest MANIFEST --source-root SOURCE --runtime-root RUNTIME` requires both source and runtime SHA-256 values to equal the committed manifest and rejects unmanifested importable/executable files anywhere in the runtime tree.
 
 ## Tests
 

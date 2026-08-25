@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from .common import (AGENTS, EVENT_HEADER_RE, EVENT_ID_RE, EVENT_KINDS, ControlPlaneError,
-                     atomic_json, iter_real_files, read_json, validate_root)
+                     atomic_json, iter_event_store_files, markdown_visible_text, read_json, validate_root)
 
 RESERVATION_SCHEMA = 1
 LOCK_NAME = ".learning-id-allocation.lock"
@@ -15,11 +15,13 @@ RESERVATION_NAME = "ID_RESERVATIONS.json"
 
 def _store_ids(root: Path) -> set[str]:
     found: set[str] = set()
-    for agent in AGENTS:
-        for path in iter_real_files(root / agent / "learnings", ("*.md",)):
-            try: text = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError as exc: raise ControlPlaneError(f"non-UTF-8 learning file: {path}") from exc
-            found.update(match.group(1) for match in EVENT_HEADER_RE.finditer(text))
+    for path in iter_event_store_files(root):
+        if path.name == RESERVATION_NAME:
+            continue
+        try: text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc: raise ControlPlaneError(f"non-UTF-8 learning file: {path}") from exc
+        if path.suffix == ".md": text = markdown_visible_text(text)
+        found.update(match.group(1) for match in EVENT_HEADER_RE.finditer(text))
     return found
 
 def _load_reservations(path: Path) -> dict[str, Any]:

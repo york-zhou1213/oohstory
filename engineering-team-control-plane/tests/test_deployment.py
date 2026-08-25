@@ -54,11 +54,36 @@ class DeploymentTests(unittest.TestCase):
         (self.runtime / "control.py").symlink_to(self.source / "control.py")
         self.assertFalse(verify_deployment(self.manifest, self.source, self.runtime)["ok"])
 
+    def test_unmanifested_importable_or_executable_runtime_file_fails(self) -> None:
+        extra = self.runtime / "src" / "json.py"
+        extra.parent.mkdir()
+        extra.write_text("raise RuntimeError('executed')\n", encoding="utf-8")
+        result = verify_deployment(self.manifest, self.source, self.runtime)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("unmanifested importable/executable" in item for item in result["failures"]))
+        extra.unlink()
+        script = self.runtime / "entry"
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        result = verify_deployment(self.manifest, self.source, self.runtime)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("unmanifested importable/executable" in item for item in result["failures"]))
+
     def test_committed_manifest_covers_runtime_sources_with_exact_hashes(self) -> None:
         manifest = PROJECT / "release" / "deployment-manifest.json"
         payload = json.loads(manifest.read_text(encoding="utf-8"))
-        result = verify_deployment(manifest, PROJECT, PROJECT)
-        self.assertTrue(result["ok"], result)
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary) / "runtime"; runtime.mkdir()
+            for item in payload["files"]:
+                target = runtime / item["runtime"]; target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(PROJECT / item["source"], target)
+            result = verify_deployment(manifest, PROJECT, runtime)
+            self.assertTrue(result["ok"], result)
+            plugin = runtime / "plugins" / "evil.py"; plugin.parent.mkdir(); plugin.write_text("raise RuntimeError\n", encoding="utf-8")
+            self.assertFalse(verify_deployment(manifest, PROJECT, runtime)["ok"])
+            plugin.unlink()
+            cache = runtime / "src" / "learning_control_plane" / "__pycache__" / "evil.pyc"
+            cache.parent.mkdir(); cache.write_bytes(b"untrusted")
+            self.assertFalse(verify_deployment(manifest, PROJECT, runtime)["ok"])
         covered = {item["source"] for item in payload["files"]}
         expected = {
             path.relative_to(PROJECT).as_posix()

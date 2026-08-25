@@ -10,7 +10,27 @@ class AuditTaskTests(unittest.TestCase):
     def tearDown(self): self.temporary.cleanup()
     def test_valid_semantic_and_explicit_fallback_pass(self):
         make_receipt(self.root); self.assertTrue(audit_task(self.root, "TASK-TEST", ["john:implementation"])["ok"])
+        add_task(self.root, "TASK-TEST", requirements=("john:review",))
         make_receipt(self.root, stage="review", mode="exact_file_fallback"); self.assertTrue(audit_task(self.root, "TASK-TEST", ["john:review"])["ok"])
+    def test_authoritative_requirements_reject_caller_omission_and_extra_open_receipt(self):
+        add_task(self.root, "TASK-TEST", requirements=("john:implementation", "bob:review"))
+        make_receipt(self.root)
+        make_receipt(self.root, agent="bob", stage="review")
+        omitted = audit_task(self.root, "TASK-TEST", ["john:implementation"])
+        self.assertFalse(omitted["ok"])
+        self.assertIn("bob:review", omitted["failures"]["requested_requirements"][0])
+        self.assertTrue(audit_task(self.root, "TASK-TEST", ["john:implementation", "bob:review"])["ok"])
+        make_receipt(self.root, agent="mus", stage="test", status="open")
+        result = audit_task(self.root, "TASK-TEST", ["john:implementation", "bob:review"])
+        self.assertFalse(result["ok"])
+        self.assertIn("open_receipt:mus:test", result["failures"])
+    def test_missing_authoritative_participation_record_fails_closed(self):
+        task = self.root / "tasks" / "active" / "TASK-TEST.md"
+        task.write_text("---\ntask-id: TASK-TEST\nstate: IMPLEMENTING\n---\n", encoding="utf-8")
+        make_receipt(self.root)
+        result = audit_task(self.root, "TASK-TEST", ["john:implementation"])
+        self.assertFalse(result["ok"])
+        self.assertIn("authoritative_participation", result["failures"])
     def test_missing_and_open_receipts_fail(self):
         self.assertFalse(audit_task(self.root, "TASK-TEST", ["john:implementation"])["ok"]); make_receipt(self.root, status="open"); self.assertFalse(audit_task(self.root, "TASK-TEST", ["john:implementation"])["ok"])
     def test_empty_memory_and_hash_drift_fail(self):
