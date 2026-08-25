@@ -231,6 +231,15 @@ def _sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _read_bytes_fd(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    try:
+        with os.fdopen(os.dup(descriptor), "rb") as handle:
+            return handle.read()
+    finally:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+
+
 def _sha256_fd(descriptor: int) -> str:
     digest = hashlib.sha256()
     os.lseek(descriptor, 0, os.SEEK_SET)
@@ -963,45 +972,52 @@ def verify_live_consumer(contract_path: Path, manifest_path: Path, source_root: 
                 consumer_directory_fd, contract.consumer.name, "canonical consumer")
             try:
                 consumer_identity = _file_identity(consumer_status)
-                if _sha256_fd(consumer_fd) != metadata["adapter_sha256"]:
+                consumer_snapshot = _read_bytes_fd(consumer_fd)
+                if _sha256_bytes(consumer_snapshot) != metadata["adapter_sha256"]:
                     failures.append(
                         "canonical consumer does not equal the active reviewed adapter")
                 if stat.S_IMODE(consumer_status.st_mode) != 0o755:
                     failures.append("canonical consumer mode must be 0755")
                 if not failures:
                     inspection_bootstrap = (
-                        "import os,sys;"
-                        "fd=int(sys.argv[1]);path=sys.argv[2];"
-                        "source=os.fdopen(fd,'rb',closefd=False).read();"
-                        "sys.argv=[path,*sys.argv[3:]];"
+                        "import sys;"
+                        "path=sys.argv[1];source=sys.stdin.buffer.read();"
+                        "sys.argv=[path,*sys.argv[2:]];"
                         "exec(compile(source,path,'exec'),"
                         "{'__name__':'__main__','__file__':path})"
                     )
                     completed = subprocess.run(
                         [sys.executable, "-c", inspection_bootstrap,
-                         str(consumer_fd), str(contract.consumer),
-                         "--adapter-inspect"],
-                        check=False, capture_output=True, text=True, timeout=10,
-                        pass_fds=(consumer_fd,),
+                         str(contract.consumer), "--adapter-inspect"],
+                        input=consumer_snapshot, check=False, capture_output=True,
+                        timeout=10,
                     )
                     try:
+                        descriptor_sha256 = _sha256_fd(consumer_fd)
                         descriptor_status = os.fstat(consumer_fd)
                         with _directory_fd(
                                 contract.consumer.parent,
                                 "post-inspection canonical consumer") as current_directory_fd:
-                            path_status = os.stat(
-                                contract.consumer.name, dir_fd=current_directory_fd,
-                                follow_symlinks=False)
+                            path_fd, path_status = _open_regular_leaf_fd(
+                                current_directory_fd, contract.consumer.name,
+                                "post-inspection canonical consumer")
+                            try:
+                                path_sha256 = _sha256_fd(path_fd)
+                                path_status = os.fstat(path_fd)
+                            finally:
+                                os.close(path_fd)
                     except (ControlPlaneError, OSError):
                         failures.append("canonical consumer changed during inspection")
                     else:
                         if (consumer_identity != _file_identity(path_status)
-                                or consumer_identity != _file_identity(descriptor_status)):
+                                or consumer_identity != _file_identity(descriptor_status)
+                                or descriptor_sha256 != metadata["adapter_sha256"]
+                                or path_sha256 != metadata["adapter_sha256"]):
                             failures.append("canonical consumer changed during inspection")
                     if completed.returncode != 0:
                         failures.append(
                             "canonical consumer inspection failed: "
-                            f"{completed.stderr.strip()}")
+                            f"{completed.stderr.decode('utf-8', errors='replace').strip()}")
                     else:
                         try:
                             inspection = json.loads(completed.stdout)

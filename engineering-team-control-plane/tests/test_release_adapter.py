@@ -338,6 +338,42 @@ class ReleaseAdapterTests(unittest.TestCase):
             "canonical consumer changed during inspection", verified["failures"])
         self.assertNotEqual(self.consumer.stat().st_ino, displaced.stat().st_ino)
 
+    def test_live_verification_rejects_same_inode_rewrite_after_snapshot(self) -> None:
+        source, manifest, release, _activation = self.prepare_release(
+            "release-a", "a" * 40, "release-a")
+        install_adapter(
+            self.contract, release / "scripts" / "learning_loop_adapter.py",
+            self.base / "adapter-race-bytes.json")
+        forged_inspection = self.run_consumer("--adapter-inspect").stdout
+        original_status = self.consumer.stat()
+        original_run = subprocess.run
+
+        def rewrite_before_inspection(*args, **kwargs):
+            self.consumer.write_text(
+                f"print({forged_inspection!r}, end='')\n", encoding="utf-8")
+            return original_run(*args, **kwargs)
+
+        with mock.patch.object(
+                release_adapter_module.subprocess, "run",
+                side_effect=rewrite_before_inspection):
+            verified = verify_live_consumer(self.contract, manifest, source)
+
+        rewritten_status = self.consumer.stat()
+        self.assertEqual(
+            (rewritten_status.st_dev, rewritten_status.st_ino,
+             stat.S_IFMT(rewritten_status.st_mode), stat.S_IMODE(rewritten_status.st_mode)),
+            (original_status.st_dev, original_status.st_ino,
+             stat.S_IFMT(original_status.st_mode), stat.S_IMODE(original_status.st_mode)),
+        )
+        self.assertFalse(verified["ok"])
+        self.assertIn(
+            "canonical consumer changed during inspection", verified["failures"])
+        self.assertNotEqual(
+            hashlib.sha256(self.consumer.read_bytes()).hexdigest(),
+            hashlib.sha256(
+                (release / "scripts" / "learning_loop_adapter.py").read_bytes()).hexdigest(),
+        )
+
     def test_contract_rejects_command_or_canonical_path_drift(self) -> None:
         payload = json.loads(self.contract.read_text(encoding="utf-8"))
         payload["release_commands"] = ["audit-task"]
