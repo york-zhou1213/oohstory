@@ -1,18 +1,21 @@
 """Versioned compatibility-adapter activation and rollback controls."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import secrets
+import stat
 import subprocess
 import sys
-import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Iterator
 
-from .common import (ControlPlaneError, SHA256_RE, atomic_json, atomic_write, read_json,
-                     reject_symlink_ancestors, sha256_file)
+from .common import (ControlPlaneError, SHA256_RE, read_json, reject_symlink_ancestors,
+                     sha256_file)
 from .deployment import verify_deployment
 
 
@@ -88,6 +91,187 @@ def _safe_write_path(path: Path, field: str, *, allow_leaf_symlink: bool = False
     if path.is_symlink() and not allow_leaf_symlink:
         raise ControlPlaneError(f"{field} must not be a symlink")
     return path
+
+
+def _open_directory_fd(path: Path, field: str, *, create: bool = False) -> int:
+    """Open an absolute directory component-by-component without following links."""
+    path = Path(os.path.abspath(path))
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open(path.anchor, flags)
+    traversed = Path(path.anchor)
+    try:
+        for part in path.parts[1:]:
+            traversed /= part
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise ControlPlaneError(f"{field} directory is missing: {traversed}") from None
+                try:
+                    os.mkdir(part, mode=0o755, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                try:
+                    child = os.open(part, flags, dir_fd=descriptor)
+                except OSError as exc:
+                    raise ControlPlaneError(
+                        f"{field} has an unsafe directory component: {traversed}") from exc
+            except OSError as exc:
+                raise ControlPlaneError(
+                    f"{field} has an unsafe directory component: {traversed}") from exc
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+@contextmanager
+def _directory_fd(path: Path, field: str, *, create: bool = False) -> Iterator[int]:
+    descriptor = _open_directory_fd(path, field, create=create)
+    try:
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _leaf_stat(directory_fd: int, name: str) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _require_regular_leaf(directory_fd: int, name: str, field: str) -> os.stat_result:
+    status = _leaf_stat(directory_fd, name)
+    if status is None or not stat.S_ISREG(status.st_mode):
+        raise ControlPlaneError(f"{field} must be a real file")
+    return status
+
+
+def _read_bytes_at(directory_fd: int, name: str, field: str) -> bytes:
+    _require_regular_leaf(directory_fd, name, field)
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                             dir_fd=directory_fd)
+    except OSError as exc:
+        raise ControlPlaneError(f"{field} must be a stable real file") from exc
+    with os.fdopen(descriptor, "rb") as handle:
+        return handle.read()
+
+
+def _read_bytes_path(path: Path, field: str) -> bytes:
+    with _directory_fd(path.parent, field) as directory_fd:
+        return _read_bytes_at(directory_fd, path.name, field)
+
+
+def _read_json_at(directory_fd: int, name: str, field: str) -> dict[str, Any]:
+    try:
+        value = json.loads(_read_bytes_at(directory_fd, name, field).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ControlPlaneError(f"malformed JSON: {field}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ControlPlaneError(f"JSON object required: {field}")
+    return value
+
+
+def _read_json_path(path: Path, field: str) -> dict[str, Any]:
+    with _directory_fd(path.parent, field) as directory_fd:
+        return _read_json_at(directory_fd, path.name, field)
+
+
+def _sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _atomic_write_at(directory_fd: int, name: str, content: bytes, *, mode: int,
+                     field: str, replace: bool) -> None:
+    """Write and publish a leaf relative to an already validated directory FD."""
+    current = _leaf_stat(directory_fd, name)
+    if current is not None:
+        if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
+            raise ControlPlaneError(f"{field} must not be a symlink or special file")
+        if not replace:
+            raise ControlPlaneError(f"{field} path must not already exist")
+    temporary = f".{name}.{os.getpid()}.{secrets.token_hex(8)}"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        mode,
+        dir_fd=directory_fd,
+    )
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.close(descriptor)
+        descriptor = -1
+        if replace:
+            os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        else:
+            try:
+                os.link(temporary, name, src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd, follow_symlinks=False)
+            except FileExistsError as exc:
+                raise ControlPlaneError(f"{field} path must not already exist") from exc
+            os.unlink(temporary, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_json_at(directory_fd: int, name: str, value: Any, *, field: str,
+                    replace: bool = False) -> None:
+    content = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
+    _atomic_write_at(directory_fd, name, content, mode=0o600, field=field, replace=replace)
+
+
+def _unlink_at(directory_fd: int, name: str, field: str, *, allow_symlink: bool = False) -> None:
+    current = _leaf_stat(directory_fd, name)
+    if current is None:
+        raise ControlPlaneError(f"{field} is missing")
+    if stat.S_ISLNK(current.st_mode):
+        if not allow_symlink:
+            raise ControlPlaneError(f"{field} must not be a symlink")
+    elif not stat.S_ISREG(current.st_mode):
+        raise ControlPlaneError(f"{field} must be a real file")
+    os.unlink(name, dir_fd=directory_fd)
+    os.fsync(directory_fd)
+
+
+def _readlink_at(directory_fd: int, name: str, field: str, *, allow_absent: bool = False) -> str | None:
+    current = _leaf_stat(directory_fd, name)
+    if current is None:
+        if allow_absent:
+            return None
+        raise ControlPlaneError(f"{field} is missing")
+    if not stat.S_ISLNK(current.st_mode):
+        raise ControlPlaneError(f"{field} must be a symlink")
+    return os.readlink(name, dir_fd=directory_fd)
+
+
+def _atomic_link_at(directory_fd: int, name: str, target: str) -> None:
+    current = _leaf_stat(directory_fd, name)
+    if current is not None and not stat.S_ISLNK(current.st_mode):
+        raise ControlPlaneError("active release selector must not replace a real path")
+    temporary = f".{name}.{os.getpid()}.{secrets.token_hex(8)}"
+    try:
+        os.symlink(target, temporary, dir_fd=directory_fd)
+        os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
 
 
 def _release_target(contract: RuntimeContract, value: Any, field: str,
@@ -190,13 +374,11 @@ def _read_active_link(contract: RuntimeContract, *, allow_absent: bool = False) 
     active = _safe_write_path(
         contract.runtime_root / contract.active_link, "active release selector",
         allow_leaf_symlink=True)
-    if not active.exists() and not active.is_symlink():
-        if allow_absent:
-            return None
-        raise ControlPlaneError("active release link is missing")
-    if not active.is_symlink():
-        raise ControlPlaneError("active release selector must be a symlink")
-    target = os.readlink(active)
+    with _directory_fd(active.parent, "active release selector") as directory_fd:
+        target = _readlink_at(
+            directory_fd, active.name, "active release selector", allow_absent=allow_absent)
+    if target is None:
+        return None
     try:
         target, _ = _release_target(contract, target, "active release selector target")
     except ControlPlaneError as exc:
@@ -213,26 +395,8 @@ def resolve_active_release(contract: RuntimeContract) -> dict[str, Any]:
 
 def _atomic_link(link: Path, target: str) -> None:
     link = _safe_write_path(link, "active release selector", allow_leaf_symlink=True)
-    if link.exists() and not link.is_symlink():
-        raise ControlPlaneError("active release selector must not replace a real path")
-    link.parent.mkdir(parents=True, exist_ok=True)
-    reject_symlink_ancestors(link.parent)
-    temporary_dir = Path(tempfile.mkdtemp(prefix=f".{link.name}.", dir=link.parent))
-    temporary = temporary_dir / "selector"
-    try:
-        os.symlink(target, temporary)
-        os.replace(temporary, link)
-        directory_fd = os.open(link.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        temporary_dir.rmdir()
+    with _directory_fd(link.parent, "active release selector", create=True) as directory_fd:
+        _atomic_link_at(directory_fd, link.name, target)
 
 
 def activate_release(contract_path: Path, manifest_path: Path, source_root: Path,
@@ -272,8 +436,15 @@ def activate_release(contract_path: Path, manifest_path: Path, source_root: Path
         "adapter_sha256": sha256_file(release_root / contract.adapter_source),
         "previous_target": previous,
     }
-    atomic_write(deployed_manifest_path, manifest_path.read_bytes(), mode=0o444)
-    atomic_json(metadata_path, metadata)
+    with _directory_fd(release_root, "release metadata") as release_fd:
+        _atomic_write_at(
+            release_fd, deployed_manifest_path.name, manifest_path.read_bytes(), mode=0o444,
+            field="deployed manifest", replace=False)
+        _atomic_json_at(
+            release_fd, metadata_path.name, metadata, field="release metadata")
+    if (sha256_file(deployed_manifest_path) != metadata["manifest_sha256"]
+            or _read_json_path(metadata_path, "release metadata") != metadata):
+        raise ControlPlaneError("release metadata path changed during activation")
     activated = f"{contract.releases_dir}/{release_root.name}"
     receipt = {
         "schema_version": 1,
@@ -284,7 +455,10 @@ def activate_release(contract_path: Path, manifest_path: Path, source_root: Path
         "previous_target": previous,
         "activated_target": activated,
     }
-    atomic_json(receipt_path, receipt)
+    with _directory_fd(receipt_path.parent, "activation receipt", create=True) as receipt_fd:
+        _atomic_json_at(receipt_fd, receipt_path.name, receipt, field="activation receipt")
+    if _read_json_path(receipt_path, "activation receipt") != receipt:
+        raise ControlPlaneError("activation receipt path changed during activation")
     _atomic_link(contract.runtime_root / contract.active_link, activated)
     resolved = resolve_active_release(contract)
     if resolved["target"] != activated:
@@ -333,15 +507,15 @@ def rollback_release(contract_path: Path, receipt_path: Path) -> dict[str, Any]:
     active = _safe_write_path(
         contract.runtime_root / contract.active_link, "active release selector",
         allow_leaf_symlink=True)
-    if previous is None:
-        active.unlink()
-        directory_fd = os.open(active.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    else:
-        _atomic_link(active, previous)
+    with _directory_fd(active.parent, "active release selector") as active_fd:
+        observed_current = _readlink_at(active_fd, active.name, "active release selector")
+        if observed_current != current:
+            raise ControlPlaneError("active release changed during rollback")
+        if previous is None:
+            _unlink_at(
+                active_fd, active.name, "active release selector", allow_symlink=True)
+        else:
+            _atomic_link_at(active_fd, active.name, previous)
     observed = _read_active_link(contract, allow_absent=True)
     if observed != previous:
         raise ControlPlaneError("post-rollback active release selector mismatch")
@@ -373,35 +547,81 @@ def install_adapter(contract_path: Path, adapter_source: Path, receipt_path: Pat
     if any(path.exists() or path.is_symlink()
            for path in (legacy, legacy_metadata, runtime_contract)):
         raise ControlPlaneError("legacy compatibility state already exists; use release switching for upgrades")
-    legacy.parent.mkdir(parents=True, exist_ok=True)
-    reject_symlink_ancestors(legacy.parent)
-    original = consumer.read_bytes()
-    original_mode = consumer.stat().st_mode & 0o777
-    atomic_write(legacy, original, mode=original_mode)
-    atomic_json(legacy_metadata, {"schema_version": 1, "sha256": sha256_file(legacy), "mode": original_mode})
-    atomic_write(runtime_contract, contract.path.read_bytes(), mode=0o644)
-    receipt = {
-        "schema_version": 1,
-        "operation": "install-adapter",
-        "contract_sha256": sha256_file(contract.path),
-        "before_sha256": sha256_file(legacy),
-        "before_mode": original_mode,
-        "after_sha256": sha256_file(adapter_source),
-        "active_target": active["target"],
-    }
-    atomic_json(receipt_path, receipt)
-    atomic_write(consumer, adapter_source.read_bytes(), mode=0o755)
-    if sha256_file(consumer) != receipt["after_sha256"]:
-        raise ControlPlaneError("canonical consumer adapter hash mismatch; use exact rollback receipt")
+    adapter_bytes = _read_bytes_path(adapter_source, "adapter source")
+    contract_bytes = _read_bytes_path(contract.path, "runtime contract")
+    if _sha256_bytes(adapter_bytes) != active["metadata"]["adapter_sha256"]:
+        raise ControlPlaneError("adapter source hash does not match the active release")
+    with (_directory_fd(consumer.parent, "canonical consumer") as consumer_fd,
+          _directory_fd(legacy.parent, "legacy compatibility target", create=True) as legacy_fd,
+          _directory_fd(contract.runtime_root, "runtime contract copy") as runtime_fd,
+          _directory_fd(receipt_path.parent, "adapter receipt", create=True) as receipt_fd):
+        if any(_leaf_stat(directory_fd, name) is not None for directory_fd, name in (
+            (legacy_fd, legacy.name),
+            (legacy_fd, legacy_metadata.name),
+            (runtime_fd, runtime_contract.name),
+        )):
+            raise ControlPlaneError(
+                "legacy compatibility state already exists; use release switching for upgrades")
+        if _leaf_stat(receipt_fd, receipt_path.name) is not None:
+            raise ControlPlaneError("adapter receipt path must not already exist")
+        consumer_status = _require_regular_leaf(
+            consumer_fd, consumer.name, "canonical consumer")
+        original = _read_bytes_at(consumer_fd, consumer.name, "canonical consumer")
+        original_mode = consumer_status.st_mode & 0o777
+        before_sha256 = _sha256_bytes(original)
+        receipt = {
+            "schema_version": 1,
+            "operation": "install-adapter",
+            "contract_sha256": _sha256_bytes(contract_bytes),
+            "before_sha256": before_sha256,
+            "before_mode": original_mode,
+            "after_sha256": _sha256_bytes(adapter_bytes),
+            "active_target": active["target"],
+        }
+        _atomic_write_at(
+            legacy_fd, legacy.name, original, mode=original_mode,
+            field="legacy compatibility target", replace=False)
+        _atomic_json_at(
+            legacy_fd, legacy_metadata.name,
+            {"schema_version": 1, "sha256": before_sha256, "mode": original_mode},
+            field="legacy compatibility metadata")
+        _atomic_write_at(
+            runtime_fd, runtime_contract.name, contract_bytes, mode=0o644,
+            field="runtime contract copy", replace=False)
+        if (_sha256_bytes(_read_bytes_path(legacy, "legacy compatibility target"))
+                != before_sha256
+                or _sha256_bytes(_read_bytes_path(runtime_contract, "runtime contract copy"))
+                != receipt["contract_sha256"]):
+            raise ControlPlaneError("compatibility path changed during adapter installation")
+        _atomic_json_at(
+            receipt_fd, receipt_path.name, receipt, field="adapter receipt")
+        _atomic_write_at(
+            consumer_fd, consumer.name, adapter_bytes, mode=0o755,
+            field="canonical consumer", replace=True)
+        if _sha256_bytes(_read_bytes_at(
+                consumer_fd, consumer.name, "canonical consumer")) != receipt["after_sha256"]:
+            raise ControlPlaneError(
+                "canonical consumer adapter hash mismatch; use exact rollback receipt")
+        persisted_metadata = _read_json_at(
+            legacy_fd, legacy_metadata.name, "legacy compatibility metadata")
+        if (set(persisted_metadata) != LEGACY_METADATA_FIELDS
+                or persisted_metadata.get("schema_version") != 1
+                or persisted_metadata.get("sha256") != receipt["before_sha256"]
+                or persisted_metadata.get("mode") != receipt["before_mode"]
+                or _sha256_bytes(_read_bytes_at(
+                    runtime_fd, runtime_contract.name, "runtime contract copy"))
+                != receipt["contract_sha256"]):
+            raise ControlPlaneError("post-install compatibility state mismatch")
+    if (_sha256_bytes(_read_bytes_path(legacy, "legacy compatibility target"))
+            != receipt["before_sha256"]
+            or _sha256_bytes(_read_bytes_path(runtime_contract, "runtime contract copy"))
+            != receipt["contract_sha256"]
+            or _sha256_bytes(_read_bytes_path(consumer, "canonical consumer"))
+            != receipt["after_sha256"]
+            or _read_json_path(receipt_path, "adapter receipt") != receipt):
+        raise ControlPlaneError("post-install path binding mismatch")
     if resolve_active_release(contract)["target"] != receipt["active_target"]:
         raise ControlPlaneError("active release changed during adapter installation")
-    persisted_metadata = read_json(legacy_metadata)
-    if (set(persisted_metadata) != LEGACY_METADATA_FIELDS
-            or persisted_metadata.get("schema_version") != 1
-            or persisted_metadata.get("sha256") != receipt["before_sha256"]
-            or persisted_metadata.get("mode") != receipt["before_mode"]
-            or sha256_file(runtime_contract) != receipt["contract_sha256"]):
-        raise ControlPlaneError("post-install compatibility state mismatch")
     return {"ok": True, "consumer": str(consumer), "active_target": active["target"],
             "receipt": str(receipt_path), "legacy_sha256": receipt["before_sha256"]}
 
@@ -443,45 +663,70 @@ def rollback_adapter(contract_path: Path, receipt_path: Path) -> dict[str, Any]:
     runtime_contract = _safe_write_path(
         contract.runtime_root / "runtime-contract.json", "runtime contract copy")
     auxiliary = (legacy, legacy_metadata, runtime_contract)
-    present = [path.exists() or path.is_symlink() for path in auxiliary]
-    current = sha256_file(consumer)
-    if not any(present):
-        if current != receipt["before_sha256"]:
-            raise ControlPlaneError("legacy compatibility state is missing before exact rollback")
-        if consumer.stat().st_mode & 0o777 != before_mode:
-            raise ControlPlaneError("restored canonical consumer mode drifted")
-        return {"ok": True, "idempotent": True, "consumer": str(consumer)}
-    if not all(present):
-        raise ControlPlaneError("legacy compatibility state is incomplete")
-    if legacy.is_symlink() or not legacy.is_file() or sha256_file(legacy) != receipt["before_sha256"]:
-        raise ControlPlaneError("legacy compatibility target drifted")
-    if legacy_metadata.is_symlink() or not legacy_metadata.is_file():
-        raise ControlPlaneError("legacy compatibility metadata is missing or unsafe")
-    metadata = read_json(legacy_metadata)
-    _require_exact_fields(metadata, LEGACY_METADATA_FIELDS, "legacy compatibility metadata")
-    if (type(metadata.get("schema_version")) is not int or metadata["schema_version"] != 1
-            or metadata.get("sha256") != receipt["before_sha256"]
-            or metadata.get("mode") != before_mode):
-        raise ControlPlaneError("legacy compatibility metadata drifted")
-    if runtime_contract.is_symlink() or not runtime_contract.is_file():
-        raise ControlPlaneError("runtime contract copy is missing or unsafe")
-    if sha256_file(runtime_contract) != receipt["contract_sha256"]:
-        raise ControlPlaneError("runtime contract copy drifted")
-    if current != receipt["after_sha256"]:
-        raise ControlPlaneError("canonical consumer drifted; refusing non-exact rollback")
-    atomic_write(consumer, legacy.read_bytes(), mode=before_mode)
-    if sha256_file(consumer) != receipt["before_sha256"] or consumer.stat().st_mode & 0o777 != before_mode:
-        raise ControlPlaneError("post-rollback canonical consumer mismatch")
-    for path in (legacy_metadata, legacy, runtime_contract):
-        path.unlink()
-    for directory in {legacy.parent, runtime_contract.parent}:
-        directory_fd = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    if any(path.exists() or path.is_symlink() for path in auxiliary):
-        raise ControlPlaneError("post-rollback compatibility cleanup mismatch")
+    with (_directory_fd(consumer.parent, "canonical consumer") as consumer_fd,
+          _directory_fd(legacy.parent, "legacy compatibility target") as legacy_fd,
+          _directory_fd(contract.runtime_root, "runtime contract copy") as runtime_fd):
+        consumer_status = _require_regular_leaf(
+            consumer_fd, consumer.name, "canonical consumer")
+        present = [
+            _leaf_stat(legacy_fd, legacy.name) is not None,
+            _leaf_stat(legacy_fd, legacy_metadata.name) is not None,
+            _leaf_stat(runtime_fd, runtime_contract.name) is not None,
+        ]
+        current = _sha256_bytes(_read_bytes_at(
+            consumer_fd, consumer.name, "canonical consumer"))
+        if not any(present):
+            if current != receipt["before_sha256"]:
+                raise ControlPlaneError("legacy compatibility state is missing before exact rollback")
+            if consumer_status.st_mode & 0o777 != before_mode:
+                raise ControlPlaneError("restored canonical consumer mode drifted")
+            return {"ok": True, "idempotent": True, "consumer": str(consumer)}
+        if not all(present):
+            raise ControlPlaneError("legacy compatibility state is incomplete")
+        legacy_bytes = _read_bytes_at(
+            legacy_fd, legacy.name, "legacy compatibility target")
+        if _sha256_bytes(legacy_bytes) != receipt["before_sha256"]:
+            raise ControlPlaneError("legacy compatibility target drifted")
+        metadata = _read_json_at(
+            legacy_fd, legacy_metadata.name, "legacy compatibility metadata")
+        _require_exact_fields(metadata, LEGACY_METADATA_FIELDS, "legacy compatibility metadata")
+        if (type(metadata.get("schema_version")) is not int or metadata["schema_version"] != 1
+                or metadata.get("sha256") != receipt["before_sha256"]
+                or metadata.get("mode") != before_mode):
+            raise ControlPlaneError("legacy compatibility metadata drifted")
+        if (_sha256_bytes(_read_bytes_at(
+                runtime_fd, runtime_contract.name, "runtime contract copy"))
+                != receipt["contract_sha256"]):
+            raise ControlPlaneError("runtime contract copy drifted")
+        if current != receipt["after_sha256"]:
+            raise ControlPlaneError("canonical consumer drifted; refusing non-exact rollback")
+        _atomic_write_at(
+            consumer_fd, consumer.name, legacy_bytes, mode=before_mode,
+            field="canonical consumer", replace=True)
+        restored_status = _require_regular_leaf(
+            consumer_fd, consumer.name, "canonical consumer")
+        if (_sha256_bytes(_read_bytes_at(
+                consumer_fd, consumer.name, "canonical consumer")) != receipt["before_sha256"]
+                or restored_status.st_mode & 0o777 != before_mode):
+            raise ControlPlaneError("post-rollback canonical consumer mismatch")
+        _unlink_at(
+            legacy_fd, legacy_metadata.name, "legacy compatibility metadata")
+        _unlink_at(legacy_fd, legacy.name, "legacy compatibility target")
+        _unlink_at(runtime_fd, runtime_contract.name, "runtime contract copy")
+        if any((
+            _leaf_stat(legacy_fd, legacy.name),
+            _leaf_stat(legacy_fd, legacy_metadata.name),
+            _leaf_stat(runtime_fd, runtime_contract.name),
+        )):
+            raise ControlPlaneError("post-rollback compatibility cleanup mismatch")
+    for path, field in (
+        (legacy, "legacy compatibility target"),
+        (legacy_metadata, "legacy compatibility metadata"),
+        (runtime_contract, "runtime contract copy"),
+    ):
+        _safe_write_path(path, field)
+        if path.exists() or path.is_symlink():
+            raise ControlPlaneError("post-rollback compatibility cleanup mismatch")
     if _read_active_link(contract, allow_absent=True) != active_target:
         raise ControlPlaneError("active release changed during adapter rollback")
     return {"ok": True, "idempotent": False, "consumer": str(consumer)}

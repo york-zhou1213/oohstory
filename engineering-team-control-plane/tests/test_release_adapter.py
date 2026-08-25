@@ -8,7 +8,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import learning_control_plane.release_adapter as release_adapter_module
 from learning_control_plane.common import ControlPlaneError
 from learning_control_plane.release_adapter import (
     activate_release,
@@ -319,6 +321,84 @@ class ReleaseAdapterTests(unittest.TestCase):
             install_adapter(self.contract, adapter, receipt_parent / "adapter.json")
         self.assertEqual(self.consumer.read_bytes(), original)
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_adapter_install_check_swap_use_does_not_write_through_symlink(self) -> None:
+        _source, _manifest, release, _activation = self.prepare_release(
+            "release-a", "a" * 40, "release-a")
+        adapter = release / "scripts" / "learning_loop_adapter.py"
+        original_consumer = self.consumer.read_bytes()
+        outside = self.base / "outside-install"
+        outside_legacy = outside / "v1"
+        outside_legacy.mkdir(parents=True)
+        outside_files = {
+            outside_legacy / "learning_loop.py": b"outside-legacy\n",
+            outside_legacy / "legacy-metadata.json": b"outside-metadata\n",
+        }
+        for path, content in outside_files.items():
+            path.write_bytes(content)
+        compat = self.runtime / "compat"
+        displaced = self.runtime / "compat-displaced"
+        original_write = release_adapter_module._atomic_write_at
+        swapped = False
+
+        def swap_before_write(directory_fd, name, content, *, mode, field, replace):
+            nonlocal swapped
+            if not swapped and field == "legacy compatibility target":
+                compat.rename(displaced)
+                compat.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return original_write(
+                directory_fd, name, content, mode=mode, field=field, replace=replace)
+
+        with mock.patch.object(
+                release_adapter_module, "_atomic_write_at", side_effect=swap_before_write):
+            with self.assertRaisesRegex(ControlPlaneError, "unsafe directory component"):
+                install_adapter(self.contract, adapter, self.base / "adapter-race.json")
+
+        self.assertTrue(swapped)
+        self.assertEqual(self.consumer.read_bytes(), original_consumer)
+        for path, content in outside_files.items():
+            self.assertEqual(path.read_bytes(), content)
+
+    def test_adapter_rollback_check_swap_use_does_not_unlink_through_symlink(self) -> None:
+        _source, _manifest, release, _activation = self.prepare_release(
+            "release-a", "a" * 40, "release-a")
+        receipt = self.base / "adapter-race-rollback.json"
+        original_consumer = self.consumer.read_bytes()
+        install_adapter(
+            self.contract, release / "scripts" / "learning_loop_adapter.py", receipt)
+        outside = self.base / "outside-rollback"
+        outside_legacy = outside / "v1"
+        outside_legacy.mkdir(parents=True)
+        outside_files = {
+            outside_legacy / "learning_loop.py": b"outside-legacy\n",
+            outside_legacy / "legacy-metadata.json": b"outside-metadata\n",
+        }
+        for path, content in outside_files.items():
+            path.write_bytes(content)
+        compat = self.runtime / "compat"
+        displaced = self.runtime / "compat-displaced"
+        original_unlink = release_adapter_module._unlink_at
+        swapped = False
+
+        def swap_before_unlink(directory_fd, name, field, *, allow_symlink=False):
+            nonlocal swapped
+            if not swapped and field == "legacy compatibility metadata":
+                compat.rename(displaced)
+                compat.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return original_unlink(
+                directory_fd, name, field, allow_symlink=allow_symlink)
+
+        with mock.patch.object(
+                release_adapter_module, "_unlink_at", side_effect=swap_before_unlink):
+            with self.assertRaisesRegex(ControlPlaneError, "symlink path component"):
+                rollback_adapter(self.contract, receipt)
+
+        self.assertTrue(swapped)
+        self.assertEqual(self.consumer.read_bytes(), original_consumer)
+        for path, content in outside_files.items():
+            self.assertEqual(path.read_bytes(), content)
 
     def test_first_rollback_cleans_compatibility_state_and_allows_redeploy(self) -> None:
         source_a, manifest_a, release_a, activation_a = self.prepare_release(
