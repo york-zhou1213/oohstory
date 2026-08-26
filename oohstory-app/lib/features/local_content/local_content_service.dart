@@ -87,15 +87,32 @@ class LocalPickedFile {
 Future<LocalPickedFile?> pickLocalContentFile({
   required List<String> extensions,
 }) async {
-  final result = await FilePicker.platform.pickFiles(
-    type: FileType.custom,
-    allowedExtensions: extensions,
-    allowMultiple: false,
-    withData: false,
-    withReadStream: true,
+  final normalizedExtensions = extensions
+      .map((extension) => extension.toLowerCase())
+      .toList(growable: false);
+  final imageOnly = setEquals(
+    normalizedExtensions.toSet(),
+    LocalContentService.imageExtensions.toSet(),
   );
+  final useAndroidAny =
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android && !imageOnly;
+  FilePickerResult? result;
+  try {
+    result = await FilePicker.platform.pickFiles(
+      type: useAndroidAny ? FileType.any : FileType.custom,
+      allowedExtensions: useAndroidAny ? null : normalizedExtensions,
+      allowMultiple: false,
+      withData: false,
+      withReadStream: true,
+    );
+  } on Object {
+    throw const LocalContentException('无法打开系统文件选择器，请检查文件访问权限或系统“文件”应用后重试');
+  }
   final file = result?.files.singleOrNull;
   if (file == null) return null;
+  if (!_hasAllowedExtension(file.name, normalizedExtensions)) {
+    throw LocalContentException(_selectionMessageFor(normalizedExtensions));
+  }
   final stream = file.readStream;
   if (stream == null) {
     throw const LocalContentException('无法读取所选文件，请重新选择');
@@ -166,7 +183,7 @@ class LocalContentService {
   Future<LocalContentBook> importBook(LocalPickedFile file) async {
     final extension = _extension(file.name);
     if (!bookExtensions.contains(extension)) {
-      throw const LocalContentException('请选择 MOBI、AZW、AZW3、CBR、CBT 或 CB7 文件');
+      throw LocalContentException(_selectionMessageFor(bookExtensions));
     }
     try {
       final bytes = await file.read(maxBytes: _maxBookBytes);
@@ -198,7 +215,7 @@ class LocalContentService {
 
   Future<LocalDictionary> attachDictionary(LocalPickedFile file) async {
     if (_extension(file.name) != 'mdx') {
-      throw const LocalContentException('请选择本地 MDX 词典文件');
+      throw LocalContentException(_selectionMessageFor(dictionaryExtensions));
     }
     try {
       final bytes = await file.read(maxBytes: _maxDictionaryBytes);
@@ -224,7 +241,7 @@ class LocalContentService {
 
   Future<Uint8List> readOcrImage(LocalPickedFile file) async {
     if (!imageExtensions.contains(_extension(file.name))) {
-      throw const LocalContentException('本地 OCR 仅支持 PNG 图片；JPEG 暂不支持');
+      throw LocalContentException(_selectionMessageFor(imageExtensions));
     }
     try {
       return await file.read(maxBytes: _maxImageBytes);
@@ -285,4 +302,24 @@ class LocalContentService {
     final dot = normalized.lastIndexOf('.');
     return dot <= 0 ? normalized : normalized.substring(0, dot);
   }
+}
+
+bool _hasAllowedExtension(String name, List<String> extensions) {
+  final dot = name.lastIndexOf('.');
+  if (dot < 0 || dot == name.length - 1) return false;
+  return extensions.contains(name.substring(dot + 1).toLowerCase());
+}
+
+String _selectionMessageFor(List<String> extensions) {
+  final allowed = extensions.toSet();
+  if (setEquals(allowed, LocalContentService.bookExtensions.toSet())) {
+    return '请选择 MOBI、AZW、AZW3、CBR、CBT 或 CB7 文件';
+  }
+  if (setEquals(allowed, LocalContentService.dictionaryExtensions.toSet())) {
+    return '请选择本地 MDX 词典文件';
+  }
+  if (setEquals(allowed, LocalContentService.imageExtensions.toSet())) {
+    return '本地 OCR 仅支持 PNG 图片；JPEG 暂不支持';
+  }
+  return '请选择 ${extensions.map((extension) => extension.toUpperCase()).join('、')} 文件';
 }

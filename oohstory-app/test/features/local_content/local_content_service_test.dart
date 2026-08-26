@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:oohstory/adapters/ocr/local_ocr_adapter.dart';
 import 'package:oohstory/core/models.dart';
@@ -39,6 +41,103 @@ void main() {
       expect(
         LocalContentService.bookExtensions,
         containsAll(<String>['cbr', 'cb7']),
+      );
+    });
+
+    test(
+      'Android uses a broad native route for books and MDX but keeps PNG filtered',
+      () async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        addTearDown(() => debugDefaultTargetPlatformOverride = null);
+        addTearDown(() => FilePicker.platform = FilePickerIO());
+
+        for (final policy in <(List<String>, FileType, List<String>?)>[
+          (LocalContentService.bookExtensions, FileType.any, null),
+          (LocalContentService.dictionaryExtensions, FileType.any, null),
+          (
+            LocalContentService.imageExtensions,
+            FileType.custom,
+            <String>['png'],
+          ),
+        ]) {
+          final picker = _RecordingFilePicker();
+          FilePicker.platform = picker;
+
+          expect(await pickLocalContentFile(extensions: policy.$1), isNull);
+          expect(picker.type, policy.$2);
+          expect(picker.allowedExtensions, policy.$3);
+          expect(picker.allowMultiple, isFalse);
+          expect(picker.withReadStream, isTrue);
+        }
+      },
+    );
+
+    test(
+      'picker validates exact case-insensitive suffixes before reading',
+      () async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        addTearDown(() => debugDefaultTargetPlatformOverride = null);
+        addTearDown(() => FilePicker.platform = FilePickerIO());
+
+        FilePicker.platform = _RecordingFilePicker(
+          result: FilePickerResult(<PlatformFile>[
+            PlatformFile(
+              name: 'BOOK.MOBI',
+              size: 3,
+              readStream: Stream<List<int>>.value(const <int>[1, 2, 3]),
+            ),
+          ]),
+        );
+        final valid = await pickLocalContentFile(
+          extensions: LocalContentService.bookExtensions,
+        );
+        expect(valid?.name, 'BOOK.MOBI');
+
+        for (final invalidName in const <String>['book.pdf', 'book']) {
+          FilePicker.platform = _RecordingFilePicker(
+            result: FilePickerResult(<PlatformFile>[
+              PlatformFile(name: invalidName, size: 1),
+            ]),
+          );
+
+          await expectLater(
+            pickLocalContentFile(
+              extensions: LocalContentService.bookExtensions,
+            ),
+            throwsA(
+              isA<LocalContentException>().having(
+                (error) => error.message,
+                'message',
+                allOf(contains('MOBI'), isNot(contains('无法读取'))),
+              ),
+            ),
+          );
+        }
+      },
+    );
+
+    test('picker capability errors are not reported as damaged content', () {
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      addTearDown(() => FilePicker.platform = FilePickerIO());
+      FilePicker.platform = _RecordingFilePicker(
+        error: PlatformException(
+          code: 'unsupported_filter',
+          message: 'Allowed file extensions mimes: [] / Unsupported filter',
+        ),
+      );
+
+      expect(
+        pickLocalContentFile(
+          extensions: LocalContentService.dictionaryExtensions,
+        ),
+        throwsA(
+          isA<LocalContentException>().having(
+            (error) => error.message,
+            'message',
+            allOf(contains('系统文件选择器'), isNot(contains('损坏'))),
+          ),
+        ),
       );
     });
 
@@ -303,6 +402,41 @@ void main() {
 LocalContentService _service() => LocalContentService(
   ocrAdapter: LocalOcrAdapter.unavailable(platform: 'web'),
 );
+
+class _RecordingFilePicker extends FilePicker {
+  _RecordingFilePicker({this.result, this.error});
+
+  final FilePickerResult? result;
+  final Object? error;
+  FileType? type;
+  List<String>? allowedExtensions;
+  bool? allowMultiple;
+  bool? withReadStream;
+
+  @override
+  Future<FilePickerResult?> pickFiles({
+    String? dialogTitle,
+    String? initialDirectory,
+    FileType type = FileType.any,
+    List<String>? allowedExtensions,
+    Function(FilePickerStatus)? onFileLoading,
+    bool allowCompression = true,
+    int compressionQuality = 30,
+    bool allowMultiple = false,
+    bool withData = false,
+    bool withReadStream = false,
+    bool lockParentWindow = false,
+    bool readSequential = false,
+  }) async {
+    this.type = type;
+    this.allowedExtensions = allowedExtensions;
+    this.allowMultiple = allowMultiple;
+    this.withReadStream = withReadStream;
+    final failure = error;
+    if (failure != null) throw failure;
+    return result;
+  }
+}
 
 class _BlockingEngine implements LocalOcrEngine {
   final started = Completer<void>();

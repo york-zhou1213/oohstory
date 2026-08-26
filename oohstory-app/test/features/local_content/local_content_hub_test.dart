@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
@@ -131,6 +132,32 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('native picker failures show actionable copy, not corruption', (
+    tester,
+  ) async {
+    addTearDown(() => FilePicker.platform = FilePickerIO());
+    FilePicker.platform = _FailingFilePicker(
+      PlatformException(
+        code: 'unsupported_filter',
+        message: 'Allowed file extensions mimes: [] / Unsupported filter',
+      ),
+    );
+    await tester.pumpWidget(
+      _app(
+        service: _unavailableService(),
+        picker: (extensions) => pickLocalContentFile(extensions: extensions),
+      ),
+    );
+
+    await tester.tap(find.text('导入本地书'));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('系统文件选择器'), findsOneWidget);
+    expect(find.textContaining('损坏'), findsNothing);
+    expect(find.text('导入本地书'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('OCR shows immediate progress and cancels a blocked engine', (
     tester,
   ) async {
@@ -205,6 +232,28 @@ LocalContentService _unavailableService() => LocalContentService(
 );
 
 Future<LocalPickedFile?> _cancelPicker(List<String> _) async => null;
+
+class _FailingFilePicker extends FilePicker {
+  _FailingFilePicker(this.error);
+
+  final Object error;
+
+  @override
+  Future<FilePickerResult?> pickFiles({
+    String? dialogTitle,
+    String? initialDirectory,
+    FileType type = FileType.any,
+    List<String>? allowedExtensions,
+    Function(FilePickerStatus)? onFileLoading,
+    bool allowCompression = true,
+    int compressionQuality = 30,
+    bool allowMultiple = false,
+    bool withData = false,
+    bool withReadStream = false,
+    bool lockParentWindow = false,
+    bool readSequential = false,
+  }) async => throw error;
+}
 
 class _FixturePicker {
   _FixturePicker(this.files);
