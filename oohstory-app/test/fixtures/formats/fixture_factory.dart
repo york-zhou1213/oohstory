@@ -70,6 +70,7 @@ Uint8List rar4Fixture(
   Map<String, int> entries, {
   int? declaredSize,
   bool encrypted = false,
+  int method = 0x30,
 }) {
   final output = BytesBuilder(copy: false)
     ..add(const <int>[0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00])
@@ -84,8 +85,9 @@ Uint8List rar4Fixture(
     _write16Le(header, 5, headerSize);
     _write32Le(header, 7, data.length);
     _write32Le(header, 11, declaredSize ?? data.length);
+    _write32Le(header, 16, _crc32(data));
     header[24] = 20;
-    header[25] = 0x30;
+    header[25] = method;
     _write16Le(header, 26, name.length);
     header.setRange(32, header.length, name);
     _write16Le(header, 0, _crc32(header.sublist(2)) & 0xffff);
@@ -96,6 +98,20 @@ Uint8List rar4Fixture(
   output.add(_rarBlock(type: 0x7b, headerSize: 7));
   return output.takeBytes();
 }
+
+// Produced by RAR 7.00 with: rar a -m0 stored-small.rar small.jpg
+Uint8List realRar5StoredFixture() => base64Decode(
+  'UmFyIRoHAQAzkrXlCgEFBgAFAQGAgACfmtxMJwIDC5oABJoApIMCEW98ooAAAQlz'
+  'bWFsbC5qcGcKAxMUk45qpgWiNXJlYWwgUkFSIHByb2R1Y2VyIGZpeHR1cmUKHXdW'
+  'UQMFBAA=',
+);
+
+// Produced by RAR 7.00 with: rar a -m5 compressed-real.rar page.jpg
+Uint8List realRar5CompressedFixture() => base64Decode(
+  'UmFyIRoHAQDz4YLrCwEFBwAGAQGAgIAAA30WBiYCAwusAAShEKSDAuwJSfGABQEI'
+  'cGFnZS5qcGcKAxPvko5qzfT9JcW2KSVVMvpS/2L+hGFyCCCnRwN/jDF3QTnLOO2U'
+  'MLZq0VcV8d5HmX+syGzQHXdWUQMFBAA=',
+);
 
 Uint8List sevenZipFixture(List<String> names, {bool encodedHeader = false}) {
   final nextHeader = <int>[];

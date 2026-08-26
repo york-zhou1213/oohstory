@@ -18,6 +18,7 @@ import 'services/account_service.dart';
 import 'services/app_update_service.dart';
 import 'services/ooh_origin_transport.dart'
     if (dart.library.js_interop) 'services/ooh_origin_transport_web.dart';
+import 'features/local_content/local_content.dart';
 import 'widgets/app_update_dialog.dart';
 import 'widgets/ooh_primary_navigation_bar.dart';
 
@@ -332,6 +333,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                         _DesktopWorkspaceHeader(
                           title: _labels[_currentIndex],
                           description: _descriptions[_currentIndex],
+                          onOpenLocalContent: _openLocalContent,
                         ),
                         Divider(
                           height: 1,
@@ -359,6 +361,14 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                     leading: Padding(
                       padding: const EdgeInsets.fromLTRB(12, 8, 12, 24),
                       child: const _BrandLockup(compact: true),
+                    ),
+                    trailing: Padding(
+                      padding: const EdgeInsets.only(top: 18),
+                      child: IconButton(
+                        onPressed: _openLocalContent,
+                        tooltip: '打开本地阅读',
+                        icon: const Icon(Icons.folder_open_rounded),
+                      ),
                     ),
                     groupAlignment: -.72,
                     destinations: List.generate(
@@ -395,6 +405,11 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                 border: Border(
                   bottom: BorderSide(color: theme.colorScheme.outlineVariant),
                 ),
+                trailing: IconButton(
+                  onPressed: _openLocalContent,
+                  tooltip: '打开本地阅读',
+                  icon: const Icon(Icons.folder_open_rounded),
+                ),
               )
             : AppBar(
                 toolbarHeight: 64,
@@ -402,6 +417,14 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                 title: _currentIndex == 0
                     ? const _BrandLockup()
                     : Text(_labels[_currentIndex]),
+                actions: [
+                  IconButton(
+                    onPressed: _openLocalContent,
+                    tooltip: '打开本地阅读',
+                    icon: const Icon(Icons.folder_open_rounded),
+                  ),
+                  const SizedBox(width: 8),
+                ],
               );
 
         return Scaffold(
@@ -457,6 +480,18 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     if (index == _currentIndex) return;
     unawaited(HapticFeedback.selectionClick());
     setState(() => _currentIndex = index);
+  }
+
+  void _openLocalContent() {
+    unawaited(HapticFeedback.selectionClick());
+    unawaited(
+      Navigator.of(context).push<void>(
+        MaterialPageRoute<void>(
+          builder: (_) => const LocalContentHubScreen(),
+          settings: const RouteSettings(name: '/local-content'),
+        ),
+      ),
+    );
   }
 }
 
@@ -620,10 +655,12 @@ class _DesktopNavigationDestination extends StatelessWidget {
 class _DesktopWorkspaceHeader extends StatelessWidget {
   final String title;
   final String description;
+  final VoidCallback onOpenLocalContent;
 
   const _DesktopWorkspaceHeader({
     required this.title,
     required this.description,
+    required this.onOpenLocalContent,
   });
 
   @override
@@ -654,6 +691,12 @@ class _DesktopWorkspaceHeader extends StatelessWidget {
               ],
             ),
           ),
+          OutlinedButton.icon(
+            onPressed: onOpenLocalContent,
+            icon: const Icon(Icons.folder_open_rounded),
+            label: const Text('本地阅读'),
+          ),
+          const SizedBox(width: 12),
           _PlatformBadge(label: _platformLabel()),
         ],
       ),
