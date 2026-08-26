@@ -13,6 +13,35 @@ import '../../fixtures/formats/fixture_factory.dart';
 
 void main() {
   group('LocalContentService', () {
+    test('macOS picker entitlements allow user-selected read-only files', () {
+      for (final path in const <String>[
+        'macos/Runner/DebugProfile.entitlements',
+        'macos/Runner/Release.entitlements',
+      ]) {
+        final entitlement = File(path).readAsStringSync();
+        expect(
+          entitlement,
+          contains('com.apple.security.files.user-selected.read-only'),
+          reason: path,
+        );
+        expect(
+          RegExp(
+            r'<key>com\.apple\.security\.files\.user-selected\.read-only</key>\s*<true/>',
+          ).hasMatch(entitlement),
+          isTrue,
+          reason: path,
+        );
+      }
+    });
+
+    test('pickers expose only truthful local formats', () {
+      expect(LocalContentService.imageExtensions, <String>['png']);
+      expect(
+        LocalContentService.bookExtensions,
+        containsAll(<String>['cbr', 'cb7']),
+      );
+    });
+
     test('imports and renders DRM-free Kindle metadata and sections', () async {
       final service = _service();
 
@@ -25,6 +54,29 @@ void main() {
       expect(book.format, 'AZW3');
       expect(book.sections, <String>['Chapter 1', 'Hello reader.']);
     });
+
+    test(
+      'rejects HUFF/CDIC Kindle compression with the narrowed contract',
+      () async {
+        final service = _service();
+
+        await expectLater(
+          service.importBook(
+            LocalPickedFile.fromBytes(
+              'huff.mobi',
+              kindleFixture(compression: 17480),
+            ),
+          ),
+          throwsA(
+            isA<LocalContentException>().having(
+              (error) => error.message,
+              'message',
+              allOf(contains('HUFF/CDIC'), contains('PalmDOC')),
+            ),
+          ),
+        );
+      },
+    );
 
     test(
       'rejects DRM, malformed input and oversized streams clearly',
@@ -126,6 +178,50 @@ void main() {
 
       expect(book.pages.map((page) => page.name), <String>['2.jpg', '10.jpg']);
       expect(book.pages.map((page) => page.bytes.length), <int>[100, 200]);
+    });
+
+    test('accepts real stored RAR5 and rejects real compressed RAR5', () async {
+      final service = _service();
+
+      final stored = await service.importBook(
+        LocalPickedFile.fromBytes('stored.cbr', realRar5StoredFixture()),
+      );
+      expect(stored.pages.single.name, 'small.jpg');
+      expect(stored.pages.single.bytes, isNotEmpty);
+
+      await expectLater(
+        service.importBook(
+          LocalPickedFile.fromBytes(
+            'compressed.cbr',
+            realRar5CompressedFixture(),
+          ),
+        ),
+        throwsA(
+          isA<LocalContentException>().having(
+            (error) => error.message,
+            'message',
+            allOf(contains('压缩 RAR'), contains('存储')),
+          ),
+        ),
+      );
+    });
+
+    test('rejects JPEG before OCR and keeps the picker PNG-only', () async {
+      final service = _service();
+
+      expect(LocalContentService.imageExtensions, <String>['png']);
+      await expectLater(
+        service.readOcrImage(
+          LocalPickedFile.fromBytes('scan.jpg', const <int>[0xff, 0xd8, 0xff]),
+        ),
+        throwsA(
+          isA<LocalContentException>().having(
+            (error) => error.message,
+            'message',
+            allOf(contains('PNG'), contains('JPEG 暂不支持')),
+          ),
+        ),
+      );
     });
 
     test(

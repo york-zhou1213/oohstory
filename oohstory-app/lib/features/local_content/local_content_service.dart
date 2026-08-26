@@ -149,7 +149,7 @@ class LocalContentService {
     'cb7',
   ];
   static const dictionaryExtensions = <String>['mdx'];
-  static const imageExtensions = <String>['png', 'jpg', 'jpeg'];
+  static const imageExtensions = <String>['png'];
 
   static const _maxBookBytes = 64 * 1024 * 1024;
   static const _maxDictionaryBytes = 32 * 1024 * 1024;
@@ -181,12 +181,14 @@ class LocalContentService {
           sections: decoded.document.sections,
         );
       }
-      final decoded = await comicDecoder.decode(Stream<List<int>>.value(bytes));
-      final pages = comicPageExtractor.extract(bytes, decoded.sections);
+      final decoded = await comicDecoder.decodeArchive(
+        Stream<List<int>>.value(bytes),
+      );
+      final pages = comicPageExtractor.fromDecoded(decoded);
       return LocalContentBook.comic(
         title: _displayName(file.name),
         format: extension.toUpperCase(),
-        version: decoded.version,
+        version: decoded.document.version,
         pages: pages,
       );
     } on Object catch (error) {
@@ -222,7 +224,7 @@ class LocalContentService {
 
   Future<Uint8List> readOcrImage(LocalPickedFile file) async {
     if (!imageExtensions.contains(_extension(file.name))) {
-      throw const LocalContentException('本地 OCR 仅支持 PNG 或 JPEG 图片');
+      throw const LocalContentException('本地 OCR 仅支持 PNG 图片；JPEG 暂不支持');
     }
     try {
       return await file.read(maxBytes: _maxImageBytes);
@@ -257,6 +259,12 @@ class LocalContentService {
         }
         if (lower.contains('ocr') || lower.contains('platform')) {
           return '此平台暂不支持本地 OCR，且不会上传到远程服务';
+        }
+        if (lower.contains('kindle compression')) {
+          return '此 Kindle 文件使用 HUFF/CDIC 等暂不支持的压缩；仅支持未压缩或 PalmDOC';
+        }
+        if (lower.contains('compressed rar')) {
+          return '此 CBR 使用暂不支持的压缩 RAR；仅支持 RAR4/RAR5 的“存储”方式';
         }
         return '此文件使用当前本地阅读器不支持的编码或压缩方式';
       }

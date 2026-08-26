@@ -272,8 +272,29 @@ class _LocalContentHubScreenState extends State<LocalContentHubScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('本地阅读'),
+        leadingWidth: 56,
+        leading: Navigator.of(context).canPop()
+            ? IconButton(
+                constraints: const BoxConstraints.tightFor(
+                  width: 48,
+                  height: 48,
+                ),
+                style: IconButton.styleFrom(
+                  minimumSize: const Size.square(48),
+                  fixedSize: const Size.square(48),
+                ),
+                onPressed: () => Navigator.of(context).maybePop(),
+                tooltip: '返回',
+                icon: const Icon(Icons.arrow_back_rounded),
+              )
+            : null,
         actions: [
           IconButton(
+            constraints: const BoxConstraints.tightFor(width: 48, height: 48),
+            style: IconButton.styleFrom(
+              minimumSize: const Size.square(48),
+              fixedSize: const Size.square(48),
+            ),
             onPressed: _busy ? null : _attachDictionary,
             tooltip: _dictionary == null ? '挂载 MDX 词典' : '更换 MDX 词典',
             icon: Icon(
@@ -283,6 +304,11 @@ class _LocalContentHubScreenState extends State<LocalContentHubScreen> {
             ),
           ),
           IconButton(
+            constraints: const BoxConstraints.tightFor(width: 48, height: 48),
+            style: IconButton.styleFrom(
+              minimumSize: const Size.square(48),
+              fixedSize: const Size.square(48),
+            ),
             onPressed: _busy ? null : _runOcr,
             tooltip: _service.isOcrAvailable ? '本地 OCR' : '本地 OCR 不可用',
             icon: const Icon(Icons.document_scanner_outlined),
@@ -362,7 +388,7 @@ class _LocalContentHubScreenState extends State<LocalContentHubScreen> {
                             ),
                             const SizedBox(height: 10),
                             Text(
-                              '打开无 DRM 的 Kindle 与漫画文件，挂载本地 MDX 词典，并在支持的平台离线识图。',
+                              '打开无 DRM 的 Kindle 与漫画文件，挂载本地 MDX 词典，并用 PNG 图片离线识图。',
                               style: theme.textTheme.bodyLarge?.copyWith(
                                 color: Colors.white.withValues(alpha: .82),
                               ),
@@ -386,7 +412,8 @@ class _LocalContentHubScreenState extends State<LocalContentHubScreen> {
                           width: wide ? 284 : constraints.maxWidth,
                           icon: Icons.auto_stories_outlined,
                           title: 'Kindle 与漫画',
-                          description: 'MOBI / AZW / AZW3\nCBR / CBT / CB7',
+                          description:
+                              'Kindle：未压缩 / PalmDOC\nCBR：RAR4/5 存储方式；CBT / CB7',
                           actionLabel: '选择文件',
                           onPressed: _busy ? null : _importBook,
                         ),
@@ -405,7 +432,7 @@ class _LocalContentHubScreenState extends State<LocalContentHubScreen> {
                           icon: Icons.document_scanner_outlined,
                           title: '可取消本地 OCR',
                           description: _service.isOcrAvailable
-                              ? '支持 ${_service.ocrLanguages.join('、')}；图片不上传'
+                              ? '仅 PNG；支持 ${_service.ocrLanguages.join('、')}；图片不上传'
                               : '此平台不可用；没有远程回退',
                           actionLabel: _service.isOcrAvailable
                               ? '识别图片'

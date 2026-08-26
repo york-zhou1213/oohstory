@@ -51,6 +51,31 @@ void main() {
     expect(document.sections, <String>['page3.webp', 'page12.webp']);
   });
 
+  test(
+    'extracts a real RAR5 stored page and rejects compressed RAR5',
+    () async {
+      final archive = await decoder.decodeArchive(
+        Stream<List<int>>.value(realRar5StoredFixture()),
+      );
+
+      expect(archive.document.sections, <String>['small.jpg']);
+      expect(archive.pages.single.bytes, isNotEmpty);
+
+      await expectLater(
+        decoder.decodeArchive(
+          Stream<List<int>>.value(realRar5CompressedFixture()),
+        ),
+        throwsA(
+          isA<CoreException>().having(
+            (error) => error.code,
+            'code',
+            CoreErrorCode.unsupported,
+          ),
+        ),
+      );
+    },
+  );
+
   test('enumerates plain-header CB7 pages in natural order', () async {
     final document = await decoder.decode(
       Stream<List<int>>.value(
@@ -130,6 +155,24 @@ void main() {
     }
   });
 
+  test('rejects CB7 page corruption before returning decoded pages', () async {
+    final fixture = await File(
+      'test/fixtures/formats/cb7-default-header.cb7',
+    ).readAsBytes();
+    fixture[32] ^= 1;
+
+    await expectLater(
+      decoder.decodeArchive(Stream<List<int>>.value(fixture)),
+      throwsA(
+        isA<CoreException>().having(
+          (error) => error.code,
+          'code',
+          CoreErrorCode.validationError,
+        ),
+      ),
+    );
+  });
+
   test('normalizes truncated archive inputs as validation errors', () async {
     final rar4 = rar4Fixture(<String, int>{'page.jpg': 1});
     final rar5 = rar5Fixture(<String, int>{'page.jpg': 1});
@@ -203,10 +246,12 @@ void main() {
           limits: FormatLimits(
             maxEntryBytes: 4096,
             maxExpandedBytes: 4096,
-            maxExpansionRatio: 2,
+            maxExpansionRatio: 1,
           ),
         ),
-        fixture: rar4Fixture(<String, int>{'1.jpg': 1}, declaredSize: 1000),
+        fixture: await File(
+          'test/fixtures/formats/cb7-default-header.cb7',
+        ).readAsBytes(),
       ),
       (
         decoder: const ComicArchiveFormatDecoder(
