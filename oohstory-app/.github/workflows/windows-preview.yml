@@ -1,0 +1,215 @@
+name: windows-preview
+
+"on":
+  push:
+    branches:
+      - task/TASK-20260823-009-jucy
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-preview-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARCHIVE_NAME: OohStory-Windows-x64-preview.zip
+  MANIFEST_NAME: OohStory-Windows-x64-preview.manifest.json
+  WINDOWS_TREE_SHA: cb839a22a2252e32a7f45ca68bd25c79df066c85
+
+jobs:
+  build:
+    name: Native Windows x64 build
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify source and frozen Windows runner
+        run: |
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -ne $env:GITHUB_SHA) { throw "checkout SHA mismatch" }
+          $windowsTree = (git rev-parse HEAD:windows).Trim()
+          if ($windowsTree -ne $env:WINDOWS_TREE_SHA) { throw "frozen Windows tree mismatch" }
+
+      - name: Install Flutter stable
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Record toolchain
+        run: |
+          flutter --version
+          python --version
+
+      - name: Test portable packager
+        run: python packaging/windows/test_package_preview.py -v
+
+      - name: Resolve Flutter packages
+        run: flutter pub get
+
+      - name: Build native Windows release
+        run: flutter build windows --release
+
+      - name: Package and verify unsigned preview
+        run: |
+          python packaging/windows/package_preview.py create `
+            --bundle build/windows/x64/runner/Release `
+            --output-dir dist/windows-preview `
+            --source-commit $env:GITHUB_SHA `
+            --workflow-run-id $env:GITHUB_RUN_ID `
+            --windows-tree $env:WINDOWS_TREE_SHA
+          python packaging/windows/package_preview.py verify `
+            --archive "dist/windows-preview/$env:ARCHIVE_NAME" `
+            --manifest "dist/windows-preview/$env:MANIFEST_NAME" `
+            --source-commit $env:GITHUB_SHA `
+            --workflow-run-id $env:GITHUB_RUN_ID `
+            --windows-tree $env:WINDOWS_TREE_SHA
+
+      - name: Upload candidate for clean-runner smoke test
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-preview-candidate-${{ github.run_id }}
+          path: |
+            dist/windows-preview/${{ env.ARCHIVE_NAME }}
+            dist/windows-preview/${{ env.MANIFEST_NAME }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  smoke:
+    name: Clean-runner launch and first screen
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out exact verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-preview-candidate-${{ github.run_id }}
+          path: candidate
+
+      - name: Verify archive before extraction
+        run: |
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -ne $env:GITHUB_SHA) { throw "verifier SHA mismatch" }
+          $windowsTree = (git rev-parse HEAD:windows).Trim()
+          if ($windowsTree -ne $env:WINDOWS_TREE_SHA) { throw "frozen Windows tree mismatch" }
+          python packaging/windows/package_preview.py verify `
+            --archive "candidate/$env:ARCHIVE_NAME" `
+            --manifest "candidate/$env:MANIFEST_NAME" `
+            --source-commit $env:GITHUB_SHA `
+            --workflow-run-id $env:GITHUB_RUN_ID `
+            --windows-tree $env:WINDOWS_TREE_SHA
+
+      - name: Launch for 15 seconds and capture the first screen
+        run: |
+          $extractRoot = Join-Path $env:RUNNER_TEMP 'oohstory-preview-smoke'
+          $evidenceRoot = Join-Path $env:RUNNER_TEMP 'oohstory-preview-evidence'
+          New-Item -ItemType Directory -Force -Path $extractRoot, $evidenceRoot | Out-Null
+          Expand-Archive -LiteralPath "candidate/$env:ARCHIVE_NAME" -DestinationPath $extractRoot
+          $appRoot = Join-Path $extractRoot 'OohStory-Windows-x64-preview'
+          $executable = Join-Path $appRoot 'OohStory.exe'
+          if (!(Test-Path -LiteralPath $executable -PathType Leaf)) { throw "portable executable missing after extraction" }
+
+          $process = Start-Process -FilePath $executable -WorkingDirectory $appRoot -PassThru
+          $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+          $windowHandle = [IntPtr]::Zero
+          while ($stopwatch.Elapsed.TotalSeconds -lt 15) {
+            Start-Sleep -Milliseconds 500
+            $process.Refresh()
+            if ($process.HasExited) { throw "OohStory exited before 15 seconds" }
+            if ($process.MainWindowHandle -ne [IntPtr]::Zero) { $windowHandle = $process.MainWindowHandle }
+          }
+          if ($windowHandle -eq [IntPtr]::Zero) { throw "OohStory did not expose a native window" }
+
+          Add-Type -AssemblyName System.Drawing
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class NativeWindowCapture {
+            [StructLayout(LayoutKind.Sequential)]
+            public struct Rect { public int Left; public int Top; public int Right; public int Bottom; }
+            [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr handle, out Rect rect);
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr handle);
+            [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr handle, int command);
+          }
+          '@
+          [NativeWindowCapture]::ShowWindow($windowHandle, 9) | Out-Null
+          [NativeWindowCapture]::SetForegroundWindow($windowHandle) | Out-Null
+          Start-Sleep -Seconds 2
+          $rect = [NativeWindowCapture+Rect]::new()
+          if (![NativeWindowCapture]::GetWindowRect($windowHandle, [ref]$rect)) { throw "cannot read OohStory window bounds" }
+          $width = $rect.Right - $rect.Left
+          $height = $rect.Bottom - $rect.Top
+          if ($width -lt 320 -or $height -lt 240) { throw "OohStory window bounds are invalid" }
+          $bitmap = New-Object -TypeName System.Drawing.Bitmap -ArgumentList $width, $height
+          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+          try {
+            $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
+            $screenshot = Join-Path $evidenceRoot 'first-screen.png'
+            $bitmap.Save($screenshot, [System.Drawing.Imaging.ImageFormat]::Png)
+          } finally {
+            $graphics.Dispose()
+            $bitmap.Dispose()
+          }
+          if ((Get-Item -LiteralPath $screenshot).Length -eq 0) { throw "first-screen evidence is empty" }
+
+          $closeRequested = $process.CloseMainWindow()
+          if (!$closeRequested -or !$process.WaitForExit(10000)) {
+            if (!$process.HasExited) { $process.Kill() }
+            throw "OohStory did not terminate gracefully"
+          }
+
+          $manifest = Get-Content -Raw -LiteralPath "candidate/$env:MANIFEST_NAME" | ConvertFrom-Json
+          $evidence = [ordered]@{
+            schema_version = 1
+            source_commit = $env:GITHUB_SHA
+            workflow_run_id = $env:GITHUB_RUN_ID
+            archive_sha256 = $manifest.archive.sha256
+            executable_sha256 = $manifest.executable.sha256
+            survived_seconds = 15
+            native_window = [ordered]@{ width = $width; height = $height }
+            screenshot_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $screenshot).Hash.ToLowerInvariant()
+            graceful_termination = $true
+          }
+          $evidence | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $evidenceRoot 'launch-evidence.json')
+          Copy-Item -LiteralPath "candidate/$env:ARCHIVE_NAME", "candidate/$env:MANIFEST_NAME" -Destination $evidenceRoot
+
+      - name: Upload verified unsigned Windows preview
+        id: final_artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: OohStory-Windows-x64-preview
+          path: ${{ runner.temp }}/oohstory-preview-evidence/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Record artifact identity
+        run: |
+          @"
+          Artifact ID: ${{ steps.final_artifact.outputs.artifact-id }}
+          Artifact URL: ${{ steps.final_artifact.outputs.artifact-url }}
+          Artifact digest: ${{ steps.final_artifact.outputs.artifact-digest }}
+          Source commit: $env:GITHUB_SHA
+          Workflow run ID: $env:GITHUB_RUN_ID
+          "@ | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
