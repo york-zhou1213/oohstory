@@ -8,7 +8,7 @@ Only Ken may activate this control plane after Bob approves and Mus tests the ex
 - versioned releases: `runtime/learning-control-plane/releases/RELEASE_ID`
 - atomic selector: `runtime/learning-control-plane/active`
 
-The compatibility adapter keeps `bootstrap`, `preflight`, `close`, `metrics`, and `stale` on the exact preserved legacy script. It sends only `audit-task` and `audit-system` to `active/scripts/learning_control_plane.py`. Unknown commands fail closed.
+The compatibility adapter keeps `bootstrap`, `preflight`, `close`, `metrics`, and `stale` on the exact preserved legacy script. After a successful, fully identified legacy `close`, it invokes the active release's internal `upgrade-receipt` operation and returns the resulting schema-v2 receipt. It sends user-facing `audit-task` and `audit-system` directly to `active/scripts/learning_control_plane.py`. Unknown commands fail closed.
 
 ## Stage and activate
 
@@ -45,7 +45,20 @@ The compatibility adapter keeps `bootstrap`, `preflight`, `close`, `metrics`, an
      --source-root APPROVED_CLEAN_CHECKOUT/engineering-team-control-plane
    ```
 
-6. Run `bootstrap --help` and a read-only legacy probe through the canonical consumer, then run `audit-task` and `audit-system` through the same consumer. Data writes, ID migration, service activation, signing, and production mutation remain separately authorized operations.
+6. In a disposable real team root, run the exact canonical sequence through the
+   installed consumer: `preflight`, write the owner-day memory, `close`, then
+   `audit-task` with the complete non-empty `learning-requirements` set from the
+   authoritative task record. Require the emitted receipt to be schema v2 and the
+   audit result to be `ok: true`. Also run `bootstrap --help`, a read-only legacy
+   probe, and `audit-system` through the same consumer.
+7. Before activation against an existing store, run the explicit historical
+   receipt disposition dry run documented in `MIGRATION.md`. Any schema-v1 receipt
+   without a retain/upgrade decision blocks the write. Apply only under Ken's
+   separate migration authority with its new backup directory and verified
+   rollback manifest.
+
+Data writes, ID migration, receipt disposition, service activation, signing, and
+production mutation remain separately authorized operations.
 
 ## Exact rollback
 
@@ -55,4 +68,7 @@ For the first adapter installation, run `rollback-adapter --contract ... --recei
 
 Every adapter-controlled mutation opens each destination directory component with `O_NOFOLLOW`, holds that directory descriptor through validation and use, and performs temporary-file creation, replace, and unlink by relative descriptor operations. This applies to the release directory, deployed manifest, release metadata, active selector, canonical consumer, compatibility target and metadata, runtime-contract copy, and both receipt paths. A forbidden leaf or ancestor swap fails closed or remains bound to the already validated directory; post-mutation path checks prevent a raced namespace replacement from returning success.
 
-Rollback never mutates receipts, learning data, memory, or task records. If an ID migration was separately authorized and applied, use its exact backup manifest as documented in `MIGRATION.md`; never delete data to make an audit green.
+Adapter/release rollback never mutates receipts, learning data, memory, or task
+records. If an ID migration or receipt disposition was separately authorized and
+applied, use its exact backup manifest as documented in `MIGRATION.md`; never
+delete data to make an audit green.

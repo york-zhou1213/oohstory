@@ -7,9 +7,12 @@ import unittest
 from pathlib import Path
 
 from learning_control_plane.common import ControlPlaneError, sha256_file
-from learning_control_plane.migration import apply_migration, plan_migration, rollback_migration
+from learning_control_plane.audit import audit_task
+from learning_control_plane.migration import (apply_migration,
+    apply_receipt_disposition, plan_migration, plan_receipt_disposition,
+    rollback_migration, rollback_receipt_disposition, upgrade_current_receipt)
 
-from .support import prepare_root
+from .support import add_task, make_receipt, prepare_root
 
 
 class MigrationTests(unittest.TestCase):
@@ -27,6 +30,154 @@ class MigrationTests(unittest.TestCase):
         john.write_text("# Learnings\n\n## [LRN-20260825-010] John\n\nSelf LRN-20260825-010.\n", encoding="utf-8")
         bob.write_text("# Learnings\n\n## [LRN-20260825-010] Bob\n\nSelf LRN-20260825-010.\n", encoding="utf-8")
         return john, bob
+
+    def add_schema_v1_receipt(self, task: str = "TASK-RECEIPT"):
+        add_task(self.root, task)
+        path, receipt = make_receipt(self.root, task=task)
+        evidence = receipt.pop("closure_evidence")
+        receipt["schema_version"] = 1
+        receipt["query"] = f"{task} backend implementation"
+        receipt["consulted_lessons"] = []
+        path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        return path, receipt, evidence
+
+    def test_current_close_receipt_upgrades_idempotently_and_audits(self) -> None:
+        path, _receipt, _evidence = self.add_schema_v1_receipt()
+        first = upgrade_current_receipt(
+            self.root, task="TASK-RECEIPT", agent="john", stage="implementation")
+        self.assertTrue(first["written"])
+        upgraded = json.loads(path.read_text())
+        self.assertEqual(upgraded["schema_version"], 2)
+        retrieval = upgraded["closure_evidence"]["retrieval_evidence"]
+        self.assertEqual(retrieval["mode"], "exact_file_fallback")
+        self.assertEqual(retrieval["semantic_recall"]["status"], "unavailable")
+        self.assertTrue(audit_task(
+            self.root, "TASK-RECEIPT", ["john:implementation"])["ok"])
+        second = upgrade_current_receipt(
+            self.root, task="TASK-RECEIPT", agent="john", stage="implementation")
+        self.assertTrue(second["idempotent"])
+
+    def test_current_close_upgrade_rejects_symlinked_owner_memory(self) -> None:
+        path, receipt, _evidence = self.add_schema_v1_receipt()
+        day = receipt["closed_at"][:10]
+        memory = self.root / "john" / "memory" / f"{day}.md"
+        outside = self.base / "outside-memory.md"
+        outside.write_text("# Outside\n", encoding="utf-8")
+        memory.unlink()
+        memory.symlink_to(outside)
+        before = path.read_bytes()
+        with self.assertRaisesRegex(ControlPlaneError, "symlink"):
+            upgrade_current_receipt(
+                self.root, task="TASK-RECEIPT", agent="john", stage="implementation")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_receipt_disposition_requires_exact_schema_v1_inventory(self) -> None:
+        path, _receipt, _evidence = self.add_schema_v1_receipt()
+        relative = path.relative_to(self.root).as_posix()
+        with self.assertRaisesRegex(ControlPlaneError, "exactly cover"):
+            plan_receipt_disposition(self.root, dispositions={})
+        with self.assertRaisesRegex(ControlPlaneError, "exactly cover"):
+            plan_receipt_disposition(self.root, dispositions={
+                relative: {"action": "retain", "reason": "historical non-authoritative receipt"},
+                "team-learnings/receipts/TASK-EXTRA/john-test.json": {
+                    "action": "retain", "reason": "not present"},
+            })
+
+    def test_receipt_disposition_refuses_to_upgrade_open_receipt(self) -> None:
+        path, receipt, evidence = self.add_schema_v1_receipt()
+        receipt["status"] = "open"
+        path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        relative = path.relative_to(self.root).as_posix()
+        with self.assertRaisesRegex(ControlPlaneError, "status must be closed"):
+            plan_receipt_disposition(self.root, dispositions={
+                relative: {"action": "upgrade", "closure_evidence": evidence},
+            })
+
+    def test_retained_receipt_gets_manifest_without_mutation(self) -> None:
+        path, _receipt, _evidence = self.add_schema_v1_receipt()
+        relative = path.relative_to(self.root).as_posix()
+        plan = plan_receipt_disposition(self.root, dispositions={
+            relative: {"action": "retain", "reason": "historical non-authoritative receipt"},
+        })
+        before = path.read_bytes()
+        backup = self.base / "receipt-retain"
+        result = apply_receipt_disposition(
+            self.root, plan, backup_dir=backup, max_backup_bytes=100_000,
+            disposition_sha256="a" * 64)
+        self.assertFalse(result["written"])
+        self.assertEqual(path.read_bytes(), before)
+        manifest = json.loads((backup / "manifest.json").read_text())
+        self.assertEqual(manifest["dispositions"][0]["action"], "retain")
+        self.assertTrue(rollback_receipt_disposition(
+            backup / "manifest.json", expected_root=self.root)["idempotent"])
+
+    def test_explicit_receipt_upgrade_is_manifest_backed_and_reversible(self) -> None:
+        path, _receipt, evidence = self.add_schema_v1_receipt()
+        relative = path.relative_to(self.root).as_posix()
+        before = path.read_bytes()
+        plan = plan_receipt_disposition(self.root, dispositions={
+            relative: {"action": "upgrade", "closure_evidence": evidence},
+        })
+        backup = self.base / "receipt-upgrade"
+        result = apply_receipt_disposition(
+            self.root, plan, backup_dir=backup, max_backup_bytes=100_000,
+            disposition_sha256="b" * 64)
+        self.assertTrue(result["written"])
+        self.assertEqual(json.loads(path.read_text())["schema_version"], 2)
+        self.assertTrue(audit_task(
+            self.root, "TASK-RECEIPT", ["john:implementation"])["ok"])
+        rolled_back = rollback_receipt_disposition(
+            backup / "manifest.json", expected_root=self.root)
+        self.assertTrue(rolled_back["rolled_back"])
+        self.assertEqual(path.read_bytes(), before)
+        self.assertTrue(rollback_receipt_disposition(
+            backup / "manifest.json", expected_root=self.root)["idempotent"])
+
+    def test_task_participation_and_receipt_upgrade_apply_as_one_reversible_plan(self) -> None:
+        path, _receipt, evidence = self.add_schema_v1_receipt()
+        task_path = self.root / "tasks" / "active" / "TASK-RECEIPT.md"
+        task_path.write_text(
+            "---\ntask-id: TASK-RECEIPT\nstate: IMPLEMENTING\n---\n",
+            encoding="utf-8")
+        receipt_before, task_before = path.read_bytes(), task_path.read_bytes()
+        relative = path.relative_to(self.root).as_posix()
+        plan = plan_receipt_disposition(
+            self.root,
+            dispositions={relative: {
+                "action": "upgrade", "closure_evidence": evidence}},
+            task_requirements={"TASK-RECEIPT": ["john:implementation"]},
+        )
+        self.assertEqual(len(plan["changes"]), 2)
+        backup = self.base / "task-and-receipt"
+        apply_receipt_disposition(
+            self.root, plan, backup_dir=backup, max_backup_bytes=100_000,
+            disposition_sha256="c" * 64)
+        self.assertTrue(audit_task(
+            self.root, "TASK-RECEIPT", ["john:implementation"])["ok"])
+        manifest = json.loads((backup / "manifest.json").read_text())
+        self.assertEqual(
+            manifest["tasks"][0]["learning_requirements"],
+            ["john:implementation"])
+        self.assertTrue(rollback_receipt_disposition(
+            backup / "manifest.json", expected_root=self.root)["rolled_back"])
+        self.assertEqual(path.read_bytes(), receipt_before)
+        self.assertEqual(task_path.read_bytes(), task_before)
+
+    def test_receipt_disposition_rollback_rejects_tampered_backup(self) -> None:
+        path, _receipt, evidence = self.add_schema_v1_receipt()
+        relative = path.relative_to(self.root).as_posix()
+        plan = plan_receipt_disposition(self.root, dispositions={
+            relative: {"action": "upgrade", "closure_evidence": evidence},
+        })
+        backup = self.base / "receipt-tamper"
+        apply_receipt_disposition(
+            self.root, plan, backup_dir=backup, max_backup_bytes=100_000,
+            disposition_sha256="d" * 64)
+        backup_path = backup / "files" / relative
+        backup_path.write_text("tampered\n", encoding="utf-8")
+        with self.assertRaisesRegex(ControlPlaneError, "backup hash"):
+            rollback_receipt_disposition(
+                backup / "manifest.json", expected_root=self.root)
 
     def test_dry_run_hashes_every_input_without_writes(self) -> None:
         john, bob = self.add_resolvable_duplicate()

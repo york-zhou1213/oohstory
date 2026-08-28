@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
@@ -136,12 +137,70 @@ def _state() -> dict[str, object]:
         _fail("legacy compatibility target hash mismatch")
     return {
         "active_target": target,
+        "canonical_team_root": str(team_root),
         "release_entrypoint": str(entrypoint),
         "legacy_target": str(legacy),
         "source_revision": metadata["source_revision"],
         "legacy_commands": list(LEGACY_COMMANDS),
         "release_commands": list(RELEASE_COMMANDS),
     }
+
+
+def _option_values(arguments: list[str], name: str) -> list[str]:
+    values: list[str] = []
+    for index, argument in enumerate(arguments):
+        if argument == name:
+            if index + 1 >= len(arguments) or arguments[index + 1].startswith("--"):
+                _fail(f"{name} requires a value")
+            values.append(arguments[index + 1])
+        elif argument.startswith(name + "="):
+            values.append(argument[len(name) + 1:])
+    return values
+
+
+def _close_identity(arguments: list[str], state: dict[str, object]) -> tuple[str, str, str, str] | None:
+    selected = {name: _option_values(arguments, name)
+                for name in ("--team-root", "--task", "--agent", "--stage")}
+    if not any(selected[name] for name in ("--task", "--agent", "--stage")):
+        return None
+    for name in ("--task", "--agent", "--stage"):
+        if len(selected[name]) != 1:
+            _fail(f"close requires exactly one {name}")
+    if len(selected["--team-root"]) > 1:
+        _fail("close permits at most one --team-root")
+    team_root = (selected["--team-root"][0] if selected["--team-root"]
+                 else str(state["canonical_team_root"]))
+    return team_root, selected["--task"][0], selected["--agent"][0], selected["--stage"][0]
+
+
+def _write_stream(stream, content: bytes) -> None:
+    if content:
+        stream.buffer.write(content)
+        stream.buffer.flush()
+
+
+def _close_with_upgrade(state: dict[str, object], arguments: list[str],
+                        identity: tuple[str, str, str, str]) -> int:
+    legacy = subprocess.run(
+        [sys.executable, str(state["legacy_target"]), *arguments],
+        check=False, capture_output=True,
+    )
+    _write_stream(sys.stderr, legacy.stderr)
+    if legacy.returncode != 0:
+        _write_stream(sys.stdout, legacy.stdout)
+        return legacy.returncode
+    team_root, task, agent, stage = identity
+    upgraded = subprocess.run(
+        [sys.executable, str(state["release_entrypoint"]), "upgrade-receipt",
+         "--team-root", team_root, "--task", task, "--agent", agent,
+         "--stage", stage],
+        check=False, capture_output=True,
+    )
+    if upgraded.returncode != 0:
+        _write_stream(sys.stdout, legacy.stdout)
+    _write_stream(sys.stdout, upgraded.stdout)
+    _write_stream(sys.stderr, upgraded.stderr)
+    return upgraded.returncode
 
 
 def main() -> int:
@@ -158,6 +217,10 @@ def main() -> int:
         target = str(state["release_entrypoint"])
     else:
         _fail(f"unsupported command: {command}")
+    if command == "close":
+        identity = _close_identity(sys.argv[2:], state)
+        if identity is not None:
+            return _close_with_upgrade(state, sys.argv[1:], identity)
     os.execv(sys.executable, [sys.executable, target, *sys.argv[1:]])
     return 2
 

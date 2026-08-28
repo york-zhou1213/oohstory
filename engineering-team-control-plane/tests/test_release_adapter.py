@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -22,6 +23,7 @@ from learning_control_plane.release_adapter import (
     rollback_release,
     verify_live_consumer,
 )
+from .support import add_task, prepare_root
 
 
 PROJECT = Path(__file__).parents[1]
@@ -93,6 +95,12 @@ class ReleaseAdapterTests(unittest.TestCase):
     def run_consumer(self, command: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(self.consumer), command],
+            check=False, capture_output=True, text=True, timeout=10,
+        )
+
+    def run_consumer_args(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(self.consumer), *arguments],
             check=False, capture_output=True, text=True, timeout=10,
         )
 
@@ -179,6 +187,91 @@ class ReleaseAdapterTests(unittest.TestCase):
         self.assertEqual(self.consumer.read_bytes(), original)
         self.assertFalse(rollback_release(self.contract, activation)["idempotent"])
         self.assertFalse((self.runtime / "active").exists())
+
+    def test_real_release_upgrades_legacy_close_and_passes_authoritative_audit(self) -> None:
+        prepare_root(self.base)
+        add_task(self.team, "TASK-E2E", requirements=("john:implementation",))
+        self.consumer.write_text(
+            """#!/usr/bin/env python3
+import argparse
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("command", choices=("preflight", "close"))
+parser.add_argument("--team-root", required=True)
+parser.add_argument("--task", required=True)
+parser.add_argument("--agent", required=True)
+parser.add_argument("--stage", required=True)
+parser.add_argument("--query")
+parser.add_argument("--consult", action="append")
+parser.add_argument("--outcome")
+parser.add_argument("--summary")
+args = parser.parse_args()
+path = Path(args.team_root) / "team-learnings" / "receipts" / args.task / f"{args.agent}-{args.stage}.json"
+path.parent.mkdir(parents=True, exist_ok=True)
+if args.command == "preflight":
+    receipt = {"schema_version": 1, "task_id": args.task, "agent": args.agent,
+        "stage": args.stage, "status": "open",
+        "opened_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "query": args.query, "consulted_lessons": args.consult or []}
+else:
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    if receipt.get("status") != "closed":
+        receipt.update({"status": "closed",
+            "closed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "outcome": args.outcome, "summary": args.summary})
+path.write_text(json.dumps(receipt, indent=2) + "\\n", encoding="utf-8")
+print(json.dumps(receipt))
+""",
+            encoding="utf-8",
+        )
+        self.consumer.chmod(0o755)
+
+        manifest = PROJECT / "release" / "deployment-manifest.json"
+        release = self.runtime / "releases" / "release-real"
+        for item in json.loads(manifest.read_text(encoding="utf-8"))["files"]:
+            target = release / item["runtime"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(PROJECT / item["source"], target)
+        activation = self.base / "activate-real.json"
+        activate_release(
+            self.contract, manifest, PROJECT, release, "c" * 40, activation)
+        install_adapter(
+            self.contract, release / "scripts" / "learning_loop_adapter.py",
+            self.base / "adapter-real.json")
+
+        preflight = self.run_consumer_args(
+            "preflight", "--team-root", str(self.team), "--task", "TASK-E2E",
+            "--agent", "john", "--stage", "implementation", "--query",
+            "TASK-E2E backend implementation", "--consult",
+            "john/learnings/LEARNINGS.md")
+        self.assertEqual(preflight.returncode, 0, preflight.stderr)
+        close_arguments = (
+            "close", "--team-root", str(self.team), "--task", "TASK-E2E",
+            "--agent", "john", "--stage", "implementation", "--outcome",
+            "no_new_learning", "--summary", "fixture closure")
+        missing_memory = self.run_consumer_args(*close_arguments)
+        self.assertEqual(missing_memory.returncode, 2)
+        legacy_receipt = (self.team / "team-learnings" / "receipts" /
+                          "TASK-E2E" / "john-implementation.json")
+        self.assertEqual(json.loads(legacy_receipt.read_text())["schema_version"], 1)
+        day = datetime.now(timezone.utc).date().isoformat()
+        (self.team / "john" / "memory" / f"{day}.md").write_text(
+            "# Daily memory\n\nTASK-E2E exact retrieval evidence.\n", encoding="utf-8")
+        close = self.run_consumer_args(*close_arguments)
+        self.assertEqual(close.returncode, 0, close.stderr)
+        receipt = json.loads(close.stdout)
+        self.assertEqual(receipt["schema_version"], 2)
+        self.assertTrue(receipt["closure_evidence"]["retrieval_evidence"]["exact_retrieval"])
+
+        audited = self.run_consumer_args(
+            "audit-task", "--team-root", str(self.team), "--task", "TASK-E2E",
+            "--require", "john:implementation")
+        self.assertEqual(audited.returncode, 0, audited.stderr)
+        self.assertTrue(json.loads(audited.stdout)["ok"])
+        self.assertTrue(verify_live_consumer(self.contract, manifest, PROJECT)["ok"])
 
     def test_release_switch_and_exact_rollback_change_only_audit_target(self) -> None:
         source_a, manifest_a, release_a, _ = self.prepare_release("release-a", "a" * 40, "release-a")
