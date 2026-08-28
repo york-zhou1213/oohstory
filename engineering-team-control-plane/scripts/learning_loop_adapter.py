@@ -179,6 +179,12 @@ def _write_stream(stream, content: bytes) -> None:
         stream.buffer.flush()
 
 
+def _release_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    return environment
+
+
 def _close_with_upgrade(state: dict[str, object], arguments: list[str],
                         identity: tuple[str, str, str, str]) -> int:
     legacy = subprocess.run(
@@ -194,7 +200,7 @@ def _close_with_upgrade(state: dict[str, object], arguments: list[str],
         [sys.executable, str(state["release_entrypoint"]), "upgrade-receipt",
          "--team-root", team_root, "--task", task, "--agent", agent,
          "--stage", stage],
-        check=False, capture_output=True,
+        check=False, capture_output=True, env=_release_environment(),
     )
     if upgraded.returncode != 0:
         _write_stream(sys.stdout, legacy.stdout)
@@ -221,6 +227,9 @@ def main() -> int:
         identity = _close_identity(sys.argv[2:], state)
         if identity is not None:
             return _close_with_upgrade(state, sys.argv[1:], identity)
+    if command in RELEASE_COMMANDS:
+        os.execve(sys.executable, [sys.executable, target, *sys.argv[1:]],
+                  _release_environment())
     os.execv(sys.executable, [sys.executable, target, *sys.argv[1:]])
     return 2
 

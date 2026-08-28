@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import stat
 import subprocess
@@ -99,9 +100,13 @@ class ReleaseAdapterTests(unittest.TestCase):
         )
 
     def run_consumer_args(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment.pop("PYTHONDONTWRITEBYTECODE", None)
+        environment.pop("PYTHONPYCACHEPREFIX", None)
         return subprocess.run(
             [sys.executable, str(self.consumer), *arguments],
             check=False, capture_output=True, text=True, timeout=10,
+            env=environment,
         )
 
     @staticmethod
@@ -254,6 +259,7 @@ print(json.dumps(receipt))
             "no_new_learning", "--summary", "fixture closure")
         missing_memory = self.run_consumer_args(*close_arguments)
         self.assertEqual(missing_memory.returncode, 2)
+        self.assertFalse(list(release.rglob("__pycache__")))
         legacy_receipt = (self.team / "team-learnings" / "receipts" /
                           "TASK-E2E" / "john-implementation.json")
         self.assertEqual(json.loads(legacy_receipt.read_text())["schema_version"], 1)
@@ -265,12 +271,20 @@ print(json.dumps(receipt))
         receipt = json.loads(close.stdout)
         self.assertEqual(receipt["schema_version"], 2)
         self.assertTrue(receipt["closure_evidence"]["retrieval_evidence"]["exact_retrieval"])
+        self.assertFalse(list(release.rglob("__pycache__")))
 
         audited = self.run_consumer_args(
             "audit-task", "--team-root", str(self.team), "--task", "TASK-E2E",
             "--require", "john:implementation")
         self.assertEqual(audited.returncode, 0, audited.stderr)
         self.assertTrue(json.loads(audited.stdout)["ok"])
+        self.assertTrue(verify_live_consumer(self.contract, manifest, PROJECT)["ok"])
+        audited_again = self.run_consumer_args(
+            "audit-task", "--team-root", str(self.team), "--task", "TASK-E2E",
+            "--require", "john:implementation")
+        self.assertEqual(audited_again.returncode, 0, audited_again.stderr)
+        self.assertTrue(json.loads(audited_again.stdout)["ok"])
+        self.assertFalse(list(release.rglob("__pycache__")))
         self.assertTrue(verify_live_consumer(self.contract, manifest, PROJECT)["ok"])
 
     def test_release_switch_and_exact_rollback_change_only_audit_target(self) -> None:

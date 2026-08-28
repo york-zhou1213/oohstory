@@ -12,7 +12,7 @@
     {"source": "src/learning_control_plane/migration.py", "runtime": "src/learning_control_plane/migration.py", "sha256": "d452588e9f5ebc8405312faf7d7fa94fd8912ac7f059142f47f3d7ac9f4936f3"},
     {"source": "src/learning_control_plane/release_adapter.py", "runtime": "src/learning_control_plane/release_adapter.py", "sha256": "7a5461d9a180c9c435fd08bd626421e2ff1294b226a31970234b6775f0ca8ec5"},
     {"source": "scripts/learning_control_plane.py", "runtime": "scripts/learning_control_plane.py", "sha256": "bf8179ff36b8f75a6b1357c30b909df8f0bb7afc0f1454865ccdb0e8dc831d2f"},
-    {"source": "scripts/learning_loop_adapter.py", "runtime": "scripts/learning_loop_adapter.py", "sha256": "f44e59e51a2fee49a08f9cbd45656d51da6fab9f6a04045713000fbe2c0f0f3c"},
+    {"source": "scripts/learning_loop_adapter.py", "runtime": "scripts/learning_loop_adapter.py", "sha256": "de3c78c3f40e1202fb7f47a486126258b319219f005764758181f2905c85a66c"},
     {"source": "release/runtime-contract.json", "runtime": "release/runtime-contract.json", "sha256": "88c04f7c0930831cf433e089694a480a1a866fa1006645a349755fa92c63db90"}
   ]
 }

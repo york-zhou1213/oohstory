@@ -8,7 +8,7 @@ Only Ken may activate this control plane after Bob approves and Mus tests the ex
 - versioned releases: `runtime/learning-control-plane/releases/RELEASE_ID`
 - atomic selector: `runtime/learning-control-plane/active`
 
-The compatibility adapter keeps `bootstrap`, `preflight`, `close`, `metrics`, and `stale` on the exact preserved legacy script. After a successful, fully identified legacy `close`, it invokes the active release's internal `upgrade-receipt` operation and returns the resulting schema-v2 receipt. It sends user-facing `audit-task` and `audit-system` directly to `active/scripts/learning_control_plane.py`. Unknown commands fail closed.
+The compatibility adapter keeps `bootstrap`, `preflight`, `close`, `metrics`, and `stale` on the exact preserved legacy script. After a successful, fully identified legacy `close`, it invokes the active release's internal `upgrade-receipt` operation and returns the resulting schema-v2 receipt. It sends user-facing `audit-task` and `audit-system` directly to `active/scripts/learning_control_plane.py`. Every active-release dispatch sets `PYTHONDONTWRITEBYTECODE=1`, including the close upgrade, so a normal command cannot add unmanifested executable bytecode to the verified release. Unknown commands fail closed.
 
 ## Stage and activate
 
