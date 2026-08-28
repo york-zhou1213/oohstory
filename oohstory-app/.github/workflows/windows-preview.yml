@@ -207,6 +207,9 @@ jobs:
           $evidence | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $evidenceRoot 'launch-evidence.json')
           Copy-Item -LiteralPath "candidate/$env:ARCHIVE_NAME", "candidate/$env:MANIFEST_NAME" -Destination $evidenceRoot
 
+          $notice = "archive_sha256=$($manifest.archive.sha256); archive_size=$($manifest.archive.size_bytes); executable_sha256=$($manifest.executable.sha256); screenshot_sha256=$($evidence.screenshot_sha256); survived_seconds=15; graceful_termination=true"
+          Write-Output "::notice title=Verified Windows preview::$notice"
+
       - name: Upload verified unsigned Windows preview
         id: final_artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -219,6 +222,7 @@ jobs:
 
       - name: Record artifact identity
         run: |
+          Write-Output "::notice title=Windows preview artifact::artifact_id=${{ steps.final_artifact.outputs.artifact-id }}; artifact_digest=${{ steps.final_artifact.outputs.artifact-digest }}; source_commit=$env:GITHUB_SHA; workflow_run_id=$env:GITHUB_RUN_ID"
           @"
           Artifact ID: ${{ steps.final_artifact.outputs.artifact-id }}
           Artifact URL: ${{ steps.final_artifact.outputs.artifact-url }}
