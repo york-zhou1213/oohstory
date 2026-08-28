@@ -228,6 +228,8 @@ def verify_preview(
     expected_executable_path = f"{PACKAGE_ROOT}/{PACKAGE_EXECUTABLE}"
     if executable.get("path") != expected_executable_path:
         raise PreviewError("manifest executable path mismatch")
+    if executable != record_by_path.get(expected_executable_path.casefold()):
+        raise PreviewError("manifest executable record mismatch")
 
     required_packaged = {
         expected_executable_path.casefold(),

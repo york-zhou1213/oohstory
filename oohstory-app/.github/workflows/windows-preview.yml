@@ -56,8 +56,15 @@ jobs:
       - name: Test portable packager
         run: python packaging/windows/test_package_preview.py -v
 
-      - name: Resolve Flutter packages
-        run: flutter pub get
+      - name: Resolve Flutter packages from lockfile
+        run: |
+          & flutter pub get --enforce-lockfile
+          if ($LASTEXITCODE -ne 0) { throw "lockfile-enforced dependency resolution failed" }
+          & git diff --quiet --exit-code $env:GITHUB_SHA --
+          if ($LASTEXITCODE -ne 0) {
+            $drift = (& git status --short --untracked-files=no) -join "`n"
+            throw "tracked source drift after dependency resolution`n$drift"
+          }
 
       - name: Build native Windows release
         run: |
@@ -193,12 +200,16 @@ jobs:
           }
 
           $manifest = Get-Content -Raw -LiteralPath "candidate/$env:MANIFEST_NAME" | ConvertFrom-Json
+          $executablePath = 'OohStory-Windows-x64-preview/OohStory.exe'
+          $executableRecords = @($manifest.files | Where-Object { $_.path -ceq $executablePath })
+          if ($executableRecords.Count -ne 1) { throw "manifest must contain exactly one canonical executable record" }
+          $executableRecord = $executableRecords[0]
           $evidence = [ordered]@{
             schema_version = 1
             source_commit = $env:GITHUB_SHA
             workflow_run_id = $env:GITHUB_RUN_ID
             archive_sha256 = $manifest.archive.sha256
-            executable_sha256 = $manifest.executable.sha256
+            executable_sha256 = $executableRecord.sha256
             survived_seconds = 15
             native_window = [ordered]@{ width = $width; height = $height }
             screenshot_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $screenshot).Hash.ToLowerInvariant()
@@ -207,7 +218,7 @@ jobs:
           $evidence | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $evidenceRoot 'launch-evidence.json')
           Copy-Item -LiteralPath "candidate/$env:ARCHIVE_NAME", "candidate/$env:MANIFEST_NAME" -Destination $evidenceRoot
 
-          $notice = "archive_sha256=$($manifest.archive.sha256); archive_size=$($manifest.archive.size_bytes); executable_sha256=$($manifest.executable.sha256); screenshot_sha256=$($evidence.screenshot_sha256); survived_seconds=15; graceful_termination=true"
+          $notice = "archive_sha256=$($manifest.archive.sha256); archive_size=$($manifest.archive.size_bytes); executable_sha256=$($executableRecord.sha256); screenshot_sha256=$($evidence.screenshot_sha256); survived_seconds=15; graceful_termination=true"
           Write-Output "::notice title=Verified Windows preview::$notice"
 
       - name: Upload verified unsigned Windows preview

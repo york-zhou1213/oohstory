@@ -54,6 +54,10 @@ class PackagePreviewTest(unittest.TestCase):
         self.assertEqual(metadata["windows_tree"], WINDOWS_TREE)
         self.assertEqual(metadata["archive"]["sha256"], package_preview.sha256_file(archive))
         self.assertEqual(metadata["executable"]["path"], f"{package_preview.PACKAGE_ROOT}/OohStory.exe")
+        executable_records = [
+            record for record in metadata["files"] if record["path"] == metadata["executable"]["path"]
+        ]
+        self.assertEqual(executable_records, [metadata["executable"]])
         with zipfile.ZipFile(archive) as preview:
             names = preview.namelist()
         self.assertIn(f"{package_preview.PACKAGE_ROOT}/flutter_windows.dll", names)
@@ -77,6 +81,41 @@ class PackagePreviewTest(unittest.TestCase):
             stream.write(b"tamper")
         with self.assertRaisesRegex(package_preview.PreviewError, "archive SHA-256 mismatch"):
             package_preview.verify_preview(archive, manifest, SOURCE_COMMIT, RUN_ID, WINDOWS_TREE)
+
+    def test_tampered_executable_identity_is_rejected(self) -> None:
+        archive, manifest = self._create()
+        metadata = json.loads(manifest.read_text(encoding="utf-8"))
+        mutations = {
+            "sha256": "0" * 64,
+            "size_bytes": metadata["executable"]["size_bytes"] + 1,
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field):
+                tampered = json.loads(json.dumps(metadata))
+                tampered["executable"][field] = value
+                tampered_manifest = self.root / f"tampered-executable-{field}.json"
+                tampered_manifest.write_text(json.dumps(tampered), encoding="utf-8")
+                with self.assertRaisesRegex(
+                    package_preview.PreviewError,
+                    "manifest executable record mismatch",
+                ):
+                    package_preview.verify_preview(
+                        archive,
+                        tampered_manifest,
+                        SOURCE_COMMIT,
+                        RUN_ID,
+                        WINDOWS_TREE,
+                    )
+
+    def test_workflow_enforces_lockfile_and_tracked_source_identity(self) -> None:
+        workflow = (Path(__file__).parents[2] / ".github" / "workflows" / "windows-preview.yml").read_text(
+            encoding="utf-8"
+        )
+        resolve = workflow.index("flutter pub get --enforce-lockfile")
+        tracked_drift = workflow.index("git diff --quiet --exit-code $env:GITHUB_SHA --")
+        build = workflow.index("- name: Build native Windows release")
+        self.assertLess(resolve, tracked_drift)
+        self.assertLess(tracked_drift, build)
 
     def test_unsafe_archive_entry_is_rejected(self) -> None:
         archive, manifest = self._create()
