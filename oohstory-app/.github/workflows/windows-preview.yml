@@ -58,7 +58,20 @@ jobs:
         run: flutter pub get
 
       - name: Build native Windows release
-        run: flutter build windows --release
+        run: |
+          $buildLog = Join-Path $env:RUNNER_TEMP 'flutter-windows-build.log'
+          & flutter build windows --release 2>&1 | Tee-Object -FilePath $buildLog
+          $buildExit = $LASTEXITCODE
+          if ($buildExit -ne 0) {
+            $diagnostics = Get-Content -LiteralPath $buildLog |
+              Where-Object { $_ -match '(?i)(error|exception|failed|cmake)' } |
+              Select-Object -Last 20
+            if (!$diagnostics) { $diagnostics = Get-Content -LiteralPath $buildLog -Tail 20 }
+            $message = ($diagnostics -join "`n").Replace($env:GITHUB_WORKSPACE, '<workspace>')
+            $message = $message.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Flutter Windows build failed::$message"
+            exit $buildExit
+          }
 
       - name: Package and verify unsigned preview
         run: |
