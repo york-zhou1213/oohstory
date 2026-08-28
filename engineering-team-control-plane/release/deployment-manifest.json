@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "package_version": "1.2.0",
+  "runtime_contract": "versioned adapter v1 with canonical consumer binding",
+  "files": [
+    {"source": "src/learning_control_plane/__init__.py", "runtime": "src/learning_control_plane/__init__.py", "sha256": "6f00ab79234b3f648ac188d10c02f7805eb025377af9302b83bd297c546fd087"},
+    {"source": "src/learning_control_plane/allocator.py", "runtime": "src/learning_control_plane/allocator.py", "sha256": "841e545fc036fbed4581def7b932fd51a7a8af09826daadf4cbc2d14c2ed9231"},
+    {"source": "src/learning_control_plane/audit.py", "runtime": "src/learning_control_plane/audit.py", "sha256": "a309a7f5d7dcc151371b9ada721efacdc933fa24b18fb311f3d070d3f72408b1"},
+    {"source": "src/learning_control_plane/cli.py", "runtime": "src/learning_control_plane/cli.py", "sha256": "64d78255e87e78fbdc86f591dfb804d5d98fa94dace26f73365bc6b276bdf032"},
+    {"source": "src/learning_control_plane/common.py", "runtime": "src/learning_control_plane/common.py", "sha256": "7b2f4e9e6ea78f12ae3481a10abc0cb322636356777fcaf3dfb559f91f2aa5d2"},
+    {"source": "src/learning_control_plane/deployment.py", "runtime": "src/learning_control_plane/deployment.py", "sha256": "b42f33bc9115b7ade253fea7e46774d2bec948cebd90da855eb83c3385acf940"},
+    {"source": "src/learning_control_plane/migration.py", "runtime": "src/learning_control_plane/migration.py", "sha256": "d452588e9f5ebc8405312faf7d7fa94fd8912ac7f059142f47f3d7ac9f4936f3"},
+    {"source": "src/learning_control_plane/release_adapter.py", "runtime": "src/learning_control_plane/release_adapter.py", "sha256": "7a5461d9a180c9c435fd08bd626421e2ff1294b226a31970234b6775f0ca8ec5"},
+    {"source": "scripts/learning_control_plane.py", "runtime": "scripts/learning_control_plane.py", "sha256": "bf8179ff36b8f75a6b1357c30b909df8f0bb7afc0f1454865ccdb0e8dc831d2f"},
+    {"source": "scripts/learning_loop_adapter.py", "runtime": "scripts/learning_loop_adapter.py", "sha256": "de3c78c3f40e1202fb7f47a486126258b319219f005764758181f2905c85a66c"},
+    {"source": "release/runtime-contract.json", "runtime": "release/runtime-contract.json", "sha256": "88c04f7c0930831cf433e089694a480a1a866fa1006645a349755fa92c63db90"}
+  ]
+}
