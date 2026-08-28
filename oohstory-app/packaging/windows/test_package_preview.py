@@ -121,6 +121,8 @@ class PackagePreviewTest(unittest.TestCase):
             workflow,
         )
         self.assertIn("18 => 'Visual Studio 18 2026'", workflow)
+        self.assertIn("cache: false", workflow)
+        self.assertNotIn("cache: true", workflow)
         regression = workflow.index("- name: Regress tracked-source drift guard")
         mutation = workflow.index("tracked-source drift guard did not detect mutation")
         resolve = workflow.index("flutter pub get --enforce-lockfile")

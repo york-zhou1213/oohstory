@@ -48,7 +48,8 @@ jobs:
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           channel: stable
-          cache: true
+          # The next step mutates this SDK; persisting it would poison a rerun.
+          cache: false
           flutter-version: ${{ env.FLUTTER_VERSION }}
 
       - name: Backport upstream Visual Studio 2026 generator support
