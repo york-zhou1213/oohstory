@@ -17,6 +17,8 @@ env:
   ARCHIVE_NAME: OohStory-Windows-x64-preview.zip
   # pubspec.lock contains the Flutter 3.32 SDK-pinned package set.
   FLUTTER_VERSION: 3.32.8
+  FLUTTER_TOOL_PATCHED_SHA256: 33cf59e3bbf4a61907b6ca656c19ee40505e6eafdc70a17563c882e5fd0bbe6a
+  FLUTTER_TOOL_SOURCE_SHA256: f7c7f31d28a8ce3894ca16e4d78940710bec0c06c1d40f360d05f1b3c8e1362c
   MANIFEST_NAME: OohStory-Windows-x64-preview.manifest.json
   WINDOWS_TREE_SHA: cb839a22a2252e32a7f45ca68bd25c79df066c85
 
@@ -49,6 +51,49 @@ jobs:
           cache: true
           flutter-version: ${{ env.FLUTTER_VERSION }}
 
+      - name: Backport upstream Visual Studio 2026 generator support
+        run: |
+          $flutterCommand = (Get-Command flutter -ErrorAction Stop).Source
+          $flutterRoot = Split-Path -Parent (Split-Path -Parent $flutterCommand)
+          $toolSource = Join-Path $flutterRoot 'packages/flutter_tools/lib/src/windows/visual_studio.dart'
+          $utf8 = [System.Text.UTF8Encoding]::new($false)
+          $source = [System.IO.File]::ReadAllText($toolSource).Replace("`r`n", "`n")
+          $sha256 = [System.Security.Cryptography.SHA256]::Create()
+          try {
+            $sourceHash = [Convert]::ToHexString($sha256.ComputeHash($utf8.GetBytes($source))).ToLowerInvariant()
+          } finally {
+            $sha256.Dispose()
+          }
+          if ($sourceHash -ne $env:FLUTTER_TOOL_SOURCE_SHA256) {
+            throw "unexpected Flutter tool source identity: $sourceHash"
+          }
+
+          $old = "return switch (_majorVersion) {`n      17 =>"
+          $new = "return switch (_majorVersion) {`n      18 => 'Visual Studio 18 2026',`n      17 =>"
+          $first = $source.IndexOf($old, [StringComparison]::Ordinal)
+          if ($first -lt 0 -or $first -ne $source.LastIndexOf($old, [StringComparison]::Ordinal)) {
+            throw 'Flutter tool patch target must occur exactly once'
+          }
+          $patched = $source.Replace($old, $new)
+          [System.IO.File]::WriteAllText($toolSource, $patched, $utf8)
+
+          $sha256 = [System.Security.Cryptography.SHA256]::Create()
+          try {
+            $patchedHash = [Convert]::ToHexString($sha256.ComputeHash($utf8.GetBytes($patched))).ToLowerInvariant()
+          } finally {
+            $sha256.Dispose()
+          }
+          if ($patchedHash -ne $env:FLUTTER_TOOL_PATCHED_SHA256) {
+            throw "patched Flutter tool identity mismatch: $patchedHash"
+          }
+
+          $cache = Join-Path $flutterRoot 'bin/cache'
+          Remove-Item -Force -ErrorAction SilentlyContinue `
+            (Join-Path $cache 'flutter_tools.snapshot'), `
+            (Join-Path $cache 'flutter_tools.stamp')
+          & flutter --version
+          if ($LASTEXITCODE -ne 0) { throw 'patched Flutter tool rebuild failed' }
+
       - name: Record toolchain
         run: |
           flutter --version
@@ -56,6 +101,23 @@ jobs:
 
       - name: Test portable packager
         run: python packaging/windows/test_package_preview.py -v
+
+      - name: Regress tracked-source drift guard
+        run: |
+          $probePath = 'packaging/windows/test_package_preview.py'
+          $original = [System.IO.File]::ReadAllBytes($probePath)
+          try {
+            $tampered = [byte[]]::new($original.Length + 1)
+            [Array]::Copy($original, $tampered, $original.Length)
+            $tampered[$tampered.Length - 1] = 10
+            [System.IO.File]::WriteAllBytes($probePath, $tampered)
+            & git diff --quiet --exit-code $env:GITHUB_SHA --
+            if ($LASTEXITCODE -eq 0) { throw 'tracked-source drift guard did not detect mutation' }
+          } finally {
+            [System.IO.File]::WriteAllBytes($probePath, $original)
+          }
+          & git diff --quiet --exit-code $env:GITHUB_SHA --
+          if ($LASTEXITCODE -ne 0) { throw 'tracked source was not restored after drift regression' }
 
       - name: Resolve Flutter packages from lockfile
         run: |
@@ -70,7 +132,7 @@ jobs:
       - name: Build native Windows release
         run: |
           $buildLog = Join-Path $env:RUNNER_TEMP 'flutter-windows-build.log'
-          & flutter build windows --release 2>&1 | Tee-Object -FilePath $buildLog
+          & flutter build windows --release --no-pub 2>&1 | Tee-Object -FilePath $buildLog
           $buildExit = $LASTEXITCODE
           if ($buildExit -ne 0) {
             $diagnostics = Get-Content -LiteralPath $buildLog -Tail 40

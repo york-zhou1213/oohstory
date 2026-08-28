@@ -112,11 +112,26 @@ class PackagePreviewTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("FLUTTER_VERSION: 3.32.8", workflow)
+        self.assertIn(
+            "FLUTTER_TOOL_SOURCE_SHA256: f7c7f31d28a8ce3894ca16e4d78940710bec0c06c1d40f360d05f1b3c8e1362c",
+            workflow,
+        )
+        self.assertIn(
+            "FLUTTER_TOOL_PATCHED_SHA256: 33cf59e3bbf4a61907b6ca656c19ee40505e6eafdc70a17563c882e5fd0bbe6a",
+            workflow,
+        )
+        self.assertIn("18 => 'Visual Studio 18 2026'", workflow)
+        regression = workflow.index("- name: Regress tracked-source drift guard")
+        mutation = workflow.index("tracked-source drift guard did not detect mutation")
         resolve = workflow.index("flutter pub get --enforce-lockfile")
-        tracked_drift = workflow.index("git diff --quiet --exit-code $env:GITHUB_SHA --")
+        tracked_drift = workflow.index("git diff --quiet --exit-code $env:GITHUB_SHA --", resolve)
         build = workflow.index("- name: Build native Windows release")
+        no_second_resolution = workflow.index("flutter build windows --release --no-pub")
+        self.assertLess(regression, mutation)
+        self.assertLess(mutation, resolve)
         self.assertLess(resolve, tracked_drift)
         self.assertLess(tracked_drift, build)
+        self.assertGreater(no_second_resolution, build)
 
     def test_unsafe_archive_entry_is_rejected(self) -> None:
         archive, manifest = self._create()
