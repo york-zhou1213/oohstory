@@ -15,6 +15,7 @@ concurrency:
 
 env:
   ARCHIVE_NAME: OohStory-Windows-x64-preview.zip
+  FLUTTER_VERSION: 3.32.8
   MANIFEST_NAME: OohStory-Windows-x64-preview.manifest.json
   WINDOWS_TREE_SHA: cb839a22a2252e32a7f45ca68bd25c79df066c85
 
@@ -45,6 +46,7 @@ jobs:
         with:
           channel: stable
           cache: true
+          flutter-version: ${{ env.FLUTTER_VERSION }}
 
       - name: Record toolchain
         run: |
