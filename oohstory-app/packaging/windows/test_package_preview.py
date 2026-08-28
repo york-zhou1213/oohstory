@@ -111,6 +111,7 @@ class PackagePreviewTest(unittest.TestCase):
         workflow = (Path(__file__).parents[2] / ".github" / "workflows" / "windows-preview.yml").read_text(
             encoding="utf-8"
         )
+        self.assertIn("FLUTTER_VERSION: 3.32.8", workflow)
         resolve = workflow.index("flutter pub get --enforce-lockfile")
         tracked_drift = workflow.index("git diff --quiet --exit-code $env:GITHUB_SHA --")
         build = workflow.index("- name: Build native Windows release")
