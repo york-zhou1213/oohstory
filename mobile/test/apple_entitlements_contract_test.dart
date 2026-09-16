@@ -8,6 +8,7 @@ void main() {
       final project = File(
         'macos/Runner.xcodeproj/project.pbxproj',
       ).readAsStringSync();
+      final podfile = File('macos/Podfile').readAsStringSync();
 
       expect(project, isNot(contains('MACOSX_DEPLOYMENT_TARGET = 10.14;')));
       expect(
@@ -16,6 +17,8 @@ void main() {
             .length,
         greaterThanOrEqualTo(3),
       );
+      expect(podfile, contains("platform :osx, '10.15'"));
+      expect(podfile, isNot(contains("platform :osx, '10.14'")));
     });
 
     for (final path in <String>[
