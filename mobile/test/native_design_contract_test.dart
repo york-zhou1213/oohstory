@@ -130,10 +130,16 @@ void main() {
       'flutter build windows --release',
       'flutter build macos --release',
       'flutter build ios --release --no-codesign',
-      'flutter build apk --debug',
+      'flutter build apk --release --split-per-abi',
+      'flutter build appbundle --release',
     ]) {
       expect(workflow, contains(command));
     }
+    expect(workflow, contains('windows-2022'));
+    expect(workflow, contains('flutter-version: \${{ env.FLUTTER_VERSION }}'));
+    expect(workflow, contains('tool/package_linux_deb.sh'));
+    expect(workflow, contains('Inno Setup 6'));
+    expect(workflow, contains('OOHStory-Linux.spdx.json'));
   });
 
   test('iOS target declares native phone and tablet capabilities', () {

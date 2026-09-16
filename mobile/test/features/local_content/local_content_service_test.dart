@@ -15,7 +15,7 @@ import '../../fixtures/formats/fixture_factory.dart';
 
 void main() {
   group('LocalContentService', () {
-    test('macOS picker entitlements allow user-selected read-only files', () {
+    test('macOS picker entitlements allow user-selected read/write files', () {
       for (final path in const <String>[
         'macos/Runner/DebugProfile.entitlements',
         'macos/Runner/Release.entitlements',
@@ -23,12 +23,12 @@ void main() {
         final entitlement = File(path).readAsStringSync();
         expect(
           entitlement,
-          contains('com.apple.security.files.user-selected.read-only'),
+          contains('com.apple.security.files.user-selected.read-write'),
           reason: path,
         );
         expect(
           RegExp(
-            r'<key>com\.apple\.security\.files\.user-selected\.read-only</key>\s*<true/>',
+            r'<key>com\.apple\.security\.files\.user-selected\.read-write</key>\s*<true/>',
           ).hasMatch(entitlement),
           isTrue,
           reason: path,

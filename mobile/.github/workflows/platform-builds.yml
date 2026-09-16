@@ -3,62 +3,155 @@ name: platform-builds
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+env:
+  FLUTTER_VERSION: 3.32.4
 
 jobs:
   web:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
-      - run: flutter pub get
+      - run: flutter pub get --enforce-lockfile
       - run: flutter build web --release
+      - name: Package Web
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version: //p' pubspec.yaml)"
+          mkdir -p artifacts
+          tar -C build/web -czf "artifacts/OOHStory-v${version}-Web.tar.gz" .
+          sha256sum artifacts/* > artifacts/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oohstory-web
+          path: artifacts/
+          if-no-files-found: error
 
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
       - run: sudo apt-get update -qq
       - run: sudo apt-get install -y ninja-build clang cmake pkg-config libgtk-3-dev libsecret-1-dev
-      - run: flutter pub get
+      - run: flutter pub get --enforce-lockfile
       - run: flutter build linux --release
+      - name: Package Linux bundle and deb
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version: //p' pubspec.yaml)"
+          mkdir -p artifacts
+          tar -C build/linux/x64/release/bundle -czf "artifacts/OOHStory-v${version}-Linux-x64.tar.gz" .
+          chmod +x tool/package_linux_deb.sh
+          tool/package_linux_deb.sh "$version" artifacts
+          sha256sum artifacts/*.tar.gz >> artifacts/SHA256SUMS
+      - uses: anchore/sbom-action@v0
+        with:
+          path: build/linux/x64/release/bundle
+          format: spdx-json
+          output-file: artifacts/OOHStory-Linux.spdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oohstory-linux
+          path: artifacts/
+          if-no-files-found: error
 
   windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
-      - run: flutter pub get
+      - run: flutter pub get --enforce-lockfile
       - run: flutter build windows --release
+      - name: Package Windows portable bundle and installer
+        shell: pwsh
+        run: |
+          $version = ((Select-String -Path pubspec.yaml -Pattern '^version: ').Line -replace '^version: ', '').Trim()
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath "artifacts/OOHStory-v${version}-Windows-x64.zip"
+          choco install innosetup --no-progress -y
+          $env:OOHSTORY_VERSION = $version
+          $env:OOHSTORY_OUTPUT_DIR = (Resolve-Path artifacts).Path
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging/windows/OOHStory.iss
+          Get-ChildItem artifacts -File | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)" | Add-Content artifacts/SHA256SUMS
+          }
+      - uses: anchore/sbom-action@v0
+        with:
+          path: build/windows/x64/runner/Release
+          format: spdx-json
+          output-file: artifacts/OOHStory-Windows.spdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oohstory-windows-unsigned
+          path: artifacts/
+          if-no-files-found: error
 
   apple:
-    runs-on: macos-latest
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
-      - run: flutter pub get
+      - run: flutter pub get --enforce-lockfile
       - run: flutter build macos --release
       - run: flutter build ios --release --no-codesign
+      - name: Package unsigned Apple applications
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version: //p' pubspec.yaml)"
+          mkdir -p artifacts dmg-root
+          ditto -c -k --sequesterRsrc --keepParent build/macos/Build/Products/Release/OOHStory.app "artifacts/OOHStory-v${version}-macOS-unsigned.zip"
+          cp -R build/macos/Build/Products/Release/OOHStory.app dmg-root/
+          ln -s /Applications dmg-root/Applications
+          hdiutil create -volname OOHStory -srcfolder dmg-root -ov -format UDZO "artifacts/OOHStory-v${version}-macOS-unsigned.dmg"
+          ditto -c -k --sequesterRsrc --keepParent build/ios/iphoneos/Runner.app "artifacts/OOHStory-v${version}-iOS-iPadOS-unsigned.zip"
+          shasum -a 256 artifacts/* > artifacts/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oohstory-apple-unsigned
+          path: artifacts/
+          if-no-files-found: error
 
   android:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
-      - run: flutter pub get
-      - run: flutter build apk --debug
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - run: flutter pub get --enforce-lockfile
+      - run: flutter build apk --release --split-per-abi
+      - run: flutter build appbundle --release
+      - name: Package unsigned Android release outputs
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version: //p' pubspec.yaml)"
+          mkdir -p artifacts
+          cp build/app/outputs/flutter-apk/*.apk artifacts/
+          cp build/app/outputs/bundle/release/*.aab "artifacts/OOHStory-v${version}-Android-unsigned.aab"
+          sha256sum artifacts/* > artifacts/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oohstory-android-unsigned
+          path: artifacts/
+          if-no-files-found: error

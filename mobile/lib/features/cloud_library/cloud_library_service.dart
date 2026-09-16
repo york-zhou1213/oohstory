@@ -4,16 +4,37 @@ import '../../core/errors.dart';
 import '../../core/models.dart';
 import '../local_content/local_content_service.dart';
 
+final class CloudUploadResult {
+  const CloudUploadResult.uploaded(this.entry) : queuedKey = null;
+  const CloudUploadResult.queued(this.queuedKey) : entry = null;
+
+  final CloudEntry? entry;
+  final String? queuedKey;
+
+  bool get queued => queuedKey != null;
+}
+
+final class CloudDeleteResult {
+  const CloudDeleteResult.applied() : queuedKey = null;
+  const CloudDeleteResult.queued(this.queuedKey);
+
+  final String? queuedKey;
+
+  bool get queued => queuedKey != null;
+}
+
 final class CloudLibraryService {
   CloudLibraryService({
     required this.adapter,
     LocalContentService? localContentService,
+    this.offlineSynchronizer,
     this.maxDownloadBytes = 64 * 1024 * 1024,
   }) : localContentService =
            localContentService ?? LocalContentService.forCurrentPlatform();
 
   final CloudLibraryAdapter adapter;
   final LocalContentService localContentService;
+  final OfflineCloudSynchronizer? offlineSynchronizer;
   final int maxDownloadBytes;
 
   Future<SyncPage<CloudEntry>> list(String path, {String? cursor}) =>
@@ -43,20 +64,98 @@ final class CloudLibraryService {
       );
     }
     final bytes = await file.read(maxBytes: maxDownloadBytes);
-    final safeName = _safeFileName(file.name);
-    final path = directory.isEmpty ? safeName : '$directory/$safeName';
+    final path = _uploadPath(directory, file.name);
     return adapter.write(path, Stream<List<int>>.value(bytes));
   }
 
-  Future<void> delete(CloudEntry entry) async {
-    if (entry.isDirectory || entry.etag == null || entry.etag!.isEmpty) {
+  /// Reads the picker stream exactly once, then safely stages the same bytes
+  /// if a transient provider failure prevents the immediate create.
+  Future<CloudUploadResult> uploadWithOfflineFallback(
+    String directory,
+    LocalPickedFile file,
+  ) async {
+    if (!_isSupportedBook(file.name)) {
       throw const CoreException(
-        CoreErrorCode.revisionConflict,
-        'Cloud file cannot be deleted without a current ETag',
+        CoreErrorCode.unsupported,
+        'Only supported local reading formats can be uploaded',
       );
     }
+    final bytes = await file.read(maxBytes: maxDownloadBytes);
+    final path = _uploadPath(directory, file.name);
+    try {
+      return CloudUploadResult.uploaded(
+        await adapter.write(path, Stream<List<int>>.value(bytes)),
+      );
+    } on Object catch (error) {
+      if (!canQueueAfter(error)) rethrow;
+      final key = await _requireOfflineSynchronizer().enqueueWrite(
+        path,
+        Stream<List<int>>.value(bytes),
+      );
+      return CloudUploadResult.queued(key);
+    }
+  }
+
+  Future<String> queueUpload(String directory, LocalPickedFile file) async {
+    final synchronizer = _requireOfflineSynchronizer();
+    if (!_isSupportedBook(file.name)) {
+      throw const CoreException(
+        CoreErrorCode.unsupported,
+        'Only supported local reading formats can be queued',
+      );
+    }
+    final bytes = await file.read(maxBytes: maxDownloadBytes);
+    return synchronizer.enqueueWrite(
+      _uploadPath(directory, file.name),
+      Stream<List<int>>.value(bytes),
+    );
+  }
+
+  Future<void> delete(CloudEntry entry) async {
+    _validateDelete(entry);
     await adapter.delete(entry.path, etag: entry.etag);
   }
+
+  Future<CloudDeleteResult> deleteWithOfflineFallback(CloudEntry entry) async {
+    _validateDelete(entry);
+    try {
+      await adapter.delete(entry.path, etag: entry.etag);
+      return const CloudDeleteResult.applied();
+    } on Object catch (error) {
+      if (!canQueueAfter(error)) rethrow;
+      final key = await _requireOfflineSynchronizer().enqueueDelete(
+        entry.path,
+        etag: entry.etag,
+      );
+      return CloudDeleteResult.queued(key);
+    }
+  }
+
+  Future<String> queueDelete(CloudEntry entry) {
+    _validateDelete(entry);
+    return _requireOfflineSynchronizer().enqueueDelete(
+      entry.path,
+      etag: entry.etag,
+    );
+  }
+
+  Future<int> replayPending() => _requireOfflineSynchronizer().replay();
+
+  Future<int> pendingMutationCount() async {
+    final synchronizer = offlineSynchronizer;
+    if (synchronizer == null) return 0;
+    return (await synchronizer.store.pending(synchronizer.scope)).length;
+  }
+
+  bool get hasOfflineQueue => offlineSynchronizer != null;
+
+  bool canQueueAfter(Object error) =>
+      hasOfflineQueue &&
+      error is CoreException &&
+      const <CoreErrorCode>{
+        CoreErrorCode.upstreamError,
+        CoreErrorCode.rateLimitExceeded,
+      }.contains(error.code);
 
   bool canOpen(CloudEntry entry) =>
       !entry.isDirectory && _isSupportedBook(entry.path);
@@ -105,4 +204,29 @@ final class CloudLibraryService {
 
   static String _fileName(String path) =>
       path.split('/').where((part) => part.isNotEmpty).lastOrNull ?? '';
+
+  static String _uploadPath(String directory, String fileName) {
+    final safeName = _safeFileName(fileName);
+    return directory.isEmpty ? safeName : '$directory/$safeName';
+  }
+
+  static void _validateDelete(CloudEntry entry) {
+    if (entry.isDirectory || entry.etag == null || entry.etag!.isEmpty) {
+      throw const CoreException(
+        CoreErrorCode.revisionConflict,
+        'Cloud file cannot be deleted without a current ETag',
+      );
+    }
+  }
+
+  OfflineCloudSynchronizer _requireOfflineSynchronizer() {
+    final synchronizer = offlineSynchronizer;
+    if (synchronizer == null) {
+      throw const CoreException(
+        CoreErrorCode.unsupported,
+        'Persistent offline cloud mutations are unavailable',
+      );
+    }
+    return synchronizer;
+  }
 }

@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:oohstory/adapters/cloud/cloud.dart';
 import 'package:oohstory/adapters/ocr/local_ocr_adapter.dart';
 import 'package:oohstory/adapters/contracts/adapter_contracts.dart';
 import 'package:oohstory/core/core.dart';
@@ -86,6 +87,49 @@ void main() {
     expect(adapter.reads, isEmpty);
     expect(adapter.writes, isEmpty);
   });
+
+  test('transient uploads can be durably queued and replayed', () async {
+    final adapter = _CloudFixtureAdapter()..failWrites = true;
+    final store = InMemoryOfflineMutationStore();
+    final synchronizer = OfflineCloudSynchronizer(
+      adapter: adapter,
+      accountId: 'connection-a',
+      store: store,
+    );
+    final service = CloudLibraryService(
+      adapter: adapter,
+      localContentService: _localContentService(),
+      offlineSynchronizer: synchronizer,
+    );
+    final file = LocalPickedFile.fromBytes('fixture.azw3', kindleFixture());
+
+    final result = await service.uploadWithOfflineFallback('books', file);
+    expect(result.queued, isTrue);
+    expect(await service.pendingMutationCount(), 1);
+
+    adapter.failWrites = false;
+    expect(await service.replayPending(), 1);
+    expect(await service.pendingMutationCount(), 0);
+    expect(adapter.writes.single.$1, 'books/fixture.azw3');
+  });
+
+  test('authorization failures are not queued', () {
+    final service = CloudLibraryService(
+      adapter: _CloudFixtureAdapter(),
+      localContentService: _localContentService(),
+      offlineSynchronizer: OfflineCloudSynchronizer(
+        adapter: _CloudFixtureAdapter(),
+        accountId: 'connection-a',
+        store: InMemoryOfflineMutationStore(),
+      ),
+    );
+    expect(
+      service.canQueueAfter(
+        const CoreException(CoreErrorCode.unauthorized, 'expired'),
+      ),
+      isFalse,
+    );
+  });
 }
 
 LocalContentService _localContentService() => LocalContentService(
@@ -93,6 +137,7 @@ LocalContentService _localContentService() => LocalContentService(
 );
 
 final class _CloudFixtureAdapter implements CloudLibraryAdapter {
+  bool failWrites = false;
   Uint8List readBytes = Uint8List(0);
   final List<String> reads = <String>[];
   final List<(String, String?, Uint8List)> writes = [];
@@ -137,6 +182,12 @@ final class _CloudFixtureAdapter implements CloudLibraryAdapter {
     String? etag,
   }) async {
     final data = await bytes.expand((chunk) => chunk).toList();
+    if (failWrites) {
+      throw const CoreException(
+        CoreErrorCode.upstreamError,
+        'fixture unavailable',
+      );
+    }
     writes.add((path, etag, Uint8List.fromList(data)));
     return CloudEntry(path: path, isDirectory: false, etag: 'v2');
   }

@@ -30,25 +30,34 @@ jobs:
       - name: Build Windows release
         working-directory: mobile
         run: flutter build windows --release
-      - name: Package and checksum
+      - name: Package portable bundle and unsigned installer
         shell: pwsh
         run: |
           $archive = Join-Path $env:RUNNER_TEMP "OOHStory-v1.27.0+75-Windows-x64.zip"
           Compress-Archive -Path "mobile/build/windows/x64/runner/Release/*" -DestinationPath $archive
+          choco install innosetup --no-progress -y
+          $env:OOHSTORY_VERSION = "1.27.0+75"
+          $env:OOHSTORY_OUTPUT_DIR = $env:RUNNER_TEMP
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" mobile/packaging/windows/OOHStory.iss
           $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
           "$hash  OOHStory-v1.27.0+75-Windows-x64.zip" | Set-Content -Encoding ascii (Join-Path $env:RUNNER_TEMP "OOHStory-v1.27.0+75-Windows-x64.sha256")
+          $installer = Join-Path $env:RUNNER_TEMP "OOHStory-v1.27.0+75-Windows-x64-Setup-unsigned.exe"
+          $installerHash = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant()
+          "$installerHash  OOHStory-v1.27.0+75-Windows-x64-Setup-unsigned.exe" | Set-Content -Encoding ascii (Join-Path $env:RUNNER_TEMP "OOHStory-v1.27.0+75-Windows-x64-Setup-unsigned.sha256")
       - uses: actions/upload-artifact@v4
         with:
           name: OOHStory-v1.27.0+75-Windows-x64
           path: |
             ${{ runner.temp }}/OOHStory-v1.27.0+75-Windows-x64.zip
             ${{ runner.temp }}/OOHStory-v1.27.0+75-Windows-x64.sha256
+            ${{ runner.temp }}/OOHStory-v1.27.0+75-Windows-x64-Setup-unsigned.exe
+            ${{ runner.temp }}/OOHStory-v1.27.0+75-Windows-x64-Setup-unsigned.sha256
           if-no-files-found: error
           retention-days: 14
 
   ios-ipados:
     name: iPhone and iPad unsigned release
-    runs-on: macos-latest
+    runs-on: macos-14
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -81,5 +90,52 @@ jobs:
           path: |
             ${{ runner.temp }}/OOHStory-v1.27.0+75-iOS-iPadOS-unsigned.zip
             ${{ runner.temp }}/OOHStory-v1.27.0+75-iOS-iPadOS-unsigned.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  macos:
+    name: macOS unsigned release
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.32.4"
+          cache: true
+      - name: Verify secure storage and export entitlements
+        shell: bash
+        run: |
+          grep -Fq '<key>keychain-access-groups</key>' mobile/macos/Runner/Release.entitlements
+          grep -Fq '<key>com.apple.security.files.user-selected.read-write</key>' mobile/macos/Runner/Release.entitlements
+      - name: Resolve dependencies
+        working-directory: mobile
+        run: flutter pub get --enforce-lockfile
+      - name: Build macOS release
+        working-directory: mobile
+        run: flutter build macos --release
+      - name: Package unsigned zip and DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="mobile/build/macos/Build/Products/Release/OOHStory.app"
+          archive="$RUNNER_TEMP/OOHStory-v1.27.0+75-macOS-unsigned.zip"
+          dmg="$RUNNER_TEMP/OOHStory-v1.27.0+75-macOS-unsigned.dmg"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
+          stage="$(mktemp -d)"
+          cp -R "$app" "$stage/"
+          ln -s /Applications "$stage/Applications"
+          hdiutil create -volname OOHStory -srcfolder "$stage" -ov -format UDZO "$dmg"
+          cd "$RUNNER_TEMP"
+          shasum -a 256 "$(basename "$archive")" > OOHStory-v1.27.0+75-macOS-unsigned.sha256
+          shasum -a 256 "$(basename "$dmg")" >> OOHStory-v1.27.0+75-macOS-unsigned.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OOHStory-v1.27.0+75-macOS-unsigned
+          path: |
+            ${{ runner.temp }}/OOHStory-v1.27.0+75-macOS-unsigned.zip
+            ${{ runner.temp }}/OOHStory-v1.27.0+75-macOS-unsigned.dmg
+            ${{ runner.temp }}/OOHStory-v1.27.0+75-macOS-unsigned.sha256
           if-no-files-found: error
           retention-days: 14

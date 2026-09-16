@@ -85,7 +85,9 @@ class _CloudConnectionsScreenState extends State<CloudConnectionsScreen> {
       context: context,
       builder: (context) => AlertDialog(
         title: Text('断开 ${connection.name}？'),
-        content: const Text('只会删除本机连接配置和安全存储中的凭据，不会删除任何云端文件。'),
+        content: const Text(
+          '会删除本机连接配置、安全存储凭据和尚未发送的离线操作，不会删除任何云端文件。',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -99,6 +101,20 @@ class _CloudConnectionsScreenState extends State<CloudConnectionsScreen> {
       ),
     );
     if (confirmed != true) return;
+    try {
+      final store = await createPersistentOfflineMutationStore(
+        credentialStore: manager.repository.credentialStore,
+      );
+      final scope = CloudMutationScope(
+        providerId: connection.provider.providerId,
+        accountId: connection.id,
+      );
+      for (final mutation in await store.pending(scope)) {
+        await store.remove(scope, mutation.idempotencyKey);
+      }
+    } on Object {
+      // Queue cleanup is best effort; disconnect must still revoke credentials.
+    }
     await manager.remove(connection);
     if (!mounted) return;
     setState(() => _connections = manager.repository.load());
@@ -470,27 +486,54 @@ class CloudLibraryScreen extends StatefulWidget {
 }
 
 class _CloudLibraryScreenState extends State<CloudLibraryScreen> {
-  late final CloudLibraryService _service;
+  CloudLibraryService? _service;
   String _path = '';
   List<CloudEntry> _entries = const [];
   String? _nextCursor;
   bool _busy = false;
   String? _message;
   bool _messageIsError = false;
+  int _pendingMutations = 0;
   final Set<String> _requestedCursors = <String>{};
 
   @override
   void initState() {
     super.initState();
-    _service =
-        widget.service ??
-        CloudLibraryService(
-          adapter: widget.manager.adapterFor(widget.connection),
+    _initialize();
+  }
+
+  Future<void> _initialize() async {
+    final injected = widget.service;
+    if (injected != null) {
+      _service = injected;
+    } else {
+      final adapter = widget.manager.adapterFor(widget.connection);
+      OfflineCloudSynchronizer? synchronizer;
+      try {
+        synchronizer = OfflineCloudSynchronizer(
+          adapter: adapter,
+          accountId: widget.connection.id,
+          store: await createPersistentOfflineMutationStore(
+            credentialStore: widget.manager.repository.credentialStore,
+          ),
         );
-    _load(reset: true);
+      } on Object {
+        synchronizer = null;
+      }
+      _service = CloudLibraryService(
+        adapter: adapter,
+        offlineSynchronizer: synchronizer,
+      );
+    }
+    if (!mounted) return;
+    setState(() {});
+    await _retryPending(silent: true);
+    await _load(reset: true);
   }
 
   Future<void> _load({required bool reset}) async {
+    final service = _service;
+    if (service == null) return;
     if (_busy) return;
     final requestedCursor = reset ? null : _nextCursor;
     if (!reset && requestedCursor == null) return;
@@ -505,7 +548,7 @@ class _CloudLibraryScreenState extends State<CloudLibraryScreen> {
       _messageIsError = false;
     });
     try {
-      final page = await _service.list(
+      final page = await service.list(
         _path,
         cursor: reset ? null : _nextCursor,
       );
@@ -522,11 +565,13 @@ class _CloudLibraryScreenState extends State<CloudLibraryScreen> {
         _busy = false;
       });
     } on Object catch (error) {
-      _showError(_service.describeError(error));
+      _showError(service.describeError(error));
     }
   }
 
   Future<void> _openEntry(CloudEntry entry) async {
+    final service = _service;
+    if (service == null) return;
     if (entry.isDirectory) {
       setState(() {
         _path = entry.path;
@@ -536,14 +581,14 @@ class _CloudLibraryScreenState extends State<CloudLibraryScreen> {
       await _load(reset: true);
       return;
     }
-    if (!_service.canOpen(entry) || _busy) return;
+    if (!service.canOpen(entry) || _busy) return;
     setState(() {
       _busy = true;
       _message = '正在安全下载并解析 ${_fileName(entry.path)}…';
       _messageIsError = false;
     });
     try {
-      final book = await _service.open(entry);
+      final book = await service.open(entry);
       if (!mounted) return;
       setState(() => _busy = false);
       await Navigator.of(context).push(
@@ -552,34 +597,41 @@ class _CloudLibraryScreenState extends State<CloudLibraryScreen> {
         ),
       );
     } on Object catch (error) {
-      _showError(_service.describeError(error));
+      _showError(service.describeError(error));
     }
   }
 
   Future<void> _upload() async {
+    final service = _service;
+    if (service == null) return;
     if (_busy) return;
+    LocalPickedFile? file;
     try {
-      final file = await widget.picker(LocalContentService.bookExtensions);
+      file = await widget.picker(LocalContentService.bookExtensions);
       if (file == null || !mounted) return;
+      final selected = file;
       setState(() {
         _busy = true;
-        _message = '正在条件上传 ${file.name}…';
+        _message = '正在条件上传 ${selected.name}…';
         _messageIsError = false;
       });
-      await _service.upload(_path, file);
+      final result = await service.uploadWithOfflineFallback(_path, selected);
       if (!mounted) return;
+      await _refreshPendingCount();
       setState(() {
         _busy = false;
-        _message = '上传完成；未覆盖任何同名文件';
+        _message = result.queued ? '网络暂不可用，已加密保存到待同步队列' : '上传完成；未覆盖任何同名文件';
+        _messageIsError = false;
       });
-      await _load(reset: true);
+      if (!result.queued) await _load(reset: true);
     } on Object catch (error) {
-      _showError(_service.describeError(error));
+      _showError(service.describeError(error));
     }
   }
 
   Future<void> _delete(CloudEntry entry) async {
-    if (!_service.canDelete(entry) || _busy) return;
+    final service = _service;
+    if (service == null || !service.canDelete(entry) || _busy) return;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -600,17 +652,56 @@ class _CloudLibraryScreenState extends State<CloudLibraryScreen> {
     if (confirmed != true) return;
     setState(() => _busy = true);
     try {
-      await _service.delete(entry);
+      final result = await service.deleteWithOfflineFallback(entry);
       if (!mounted) return;
+      await _refreshPendingCount();
       setState(() {
         _busy = false;
-        _message = '已删除 ${_fileName(entry.path)}';
+        _message = result.queued
+            ? '网络暂不可用，删除操作已加入待同步队列'
+            : '已删除 ${_fileName(entry.path)}';
         _messageIsError = false;
       });
-      await _load(reset: true);
+      if (!result.queued) await _load(reset: true);
     } on Object catch (error) {
-      _showError(_service.describeError(error));
+      _showError(service.describeError(error));
     }
+  }
+
+  Future<void> _retryPending({bool silent = false}) async {
+    final service = _service;
+    if (service == null || !service.hasOfflineQueue || (!silent && _busy)) {
+      return;
+    }
+    if (!silent && mounted) {
+      setState(() {
+        _busy = true;
+        _message = '正在重试待同步操作…';
+        _messageIsError = false;
+      });
+    }
+    try {
+      final applied = await service.replayPending();
+      await _refreshPendingCount();
+      if (!mounted) return;
+      if (!silent || applied > 0) {
+        setState(() {
+          _busy = false;
+          _message = applied == 0 ? '没有待同步操作' : '已完成 $applied 个待同步操作';
+          _messageIsError = false;
+        });
+      }
+    } on Object catch (error) {
+      await _refreshPendingCount();
+      if (!silent) _showError(service.describeError(error));
+    }
+  }
+
+  Future<void> _refreshPendingCount() async {
+    final service = _service;
+    if (service == null || !service.hasOfflineQueue) return;
+    final count = await service.pendingMutationCount();
+    if (mounted) setState(() => _pendingMutations = count);
   }
 
   void _goParent() {
@@ -636,10 +727,23 @@ class _CloudLibraryScreenState extends State<CloudLibraryScreen> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final service = _service;
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.connection.name),
         actions: [
+          if (service?.hasOfflineQueue ?? false)
+            IconButton(
+              tooltip: _pendingMutations == 0
+                  ? '检查待同步操作'
+                  : '重试 $_pendingMutations 个待同步操作',
+              onPressed: _busy ? null : _retryPending,
+              icon: Badge(
+                isLabelVisible: _pendingMutations > 0,
+                label: Text('$_pendingMutations'),
+                child: const Icon(Icons.sync_rounded),
+              ),
+            ),
           IconButton(
             tooltip: '上传电子书',
             onPressed: _busy ? null : _upload,
@@ -652,90 +756,94 @@ class _CloudLibraryScreenState extends State<CloudLibraryScreen> {
           ),
         ],
       ),
-      body: SafeArea(
-        child: Column(
-          children: [
-            Material(
-              color: theme.colorScheme.surfaceContainerLow,
-              child: ListTile(
-                leading: IconButton(
-                  tooltip: '返回上级目录',
-                  onPressed: _path.isEmpty || _busy ? null : _goParent,
-                  icon: const Icon(Icons.arrow_upward_rounded),
-                ),
-                title: Text(_path.isEmpty ? '/' : '/$_path'),
-                subtitle: Text(
-                  '${widget.connection.provider.label} · 受限于 /${widget.connection.root}',
-                ),
-              ),
-            ),
-            if (_message != null)
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(12),
-                color: _messageIsError
-                    ? theme.colorScheme.errorContainer
-                    : theme.colorScheme.primaryContainer,
-                child: Text(_message!),
-              ),
-            if (_busy) const LinearProgressIndicator(minHeight: 2),
-            Expanded(
-              child: _entries.isEmpty && !_busy
-                  ? const _StatusPanel(
-                      icon: Icons.folder_open_rounded,
-                      title: '此目录为空',
-                      detail: '可使用右上角上传受支持的电子书。',
-                    )
-                  : ListView.builder(
-                      itemCount:
-                          _entries.length + (_nextCursor == null ? 0 : 1),
-                      itemBuilder: (context, index) {
-                        if (index == _entries.length) {
-                          return Padding(
-                            padding: const EdgeInsets.all(16),
-                            child: OutlinedButton(
-                              onPressed: _busy
-                                  ? null
-                                  : () => _load(reset: false),
-                              child: const Text('加载更多'),
-                            ),
-                          );
-                        }
-                        final entry = _entries[index];
-                        final canOpen = _service.canOpen(entry);
-                        return ListTile(
-                          leading: Icon(
-                            entry.isDirectory
-                                ? Icons.folder_rounded
-                                : canOpen
-                                ? Icons.menu_book_rounded
-                                : Icons.insert_drive_file_outlined,
-                          ),
-                          title: Text(_fileName(entry.path)),
-                          subtitle: entry.isDirectory
-                              ? const Text('目录')
-                              : Text(canOpen ? '点按后在本机安全解析' : '当前阅读器不支持此格式'),
-                          onTap: entry.isDirectory || canOpen
-                              ? () => _openEntry(entry)
-                              : null,
-                          trailing: _service.canDelete(entry)
-                              ? IconButton(
-                                  tooltip: '条件删除',
-                                  onPressed: _busy
-                                      ? null
-                                      : () => _delete(entry),
-                                  icon: const Icon(
-                                    Icons.delete_outline_rounded,
-                                  ),
-                                )
-                              : null,
-                        );
-                      },
+      body: service == null
+          ? const Center(child: CircularProgressIndicator())
+          : SafeArea(
+              child: Column(
+                children: [
+                  Material(
+                    color: theme.colorScheme.surfaceContainerLow,
+                    child: ListTile(
+                      leading: IconButton(
+                        tooltip: '返回上级目录',
+                        onPressed: _path.isEmpty || _busy ? null : _goParent,
+                        icon: const Icon(Icons.arrow_upward_rounded),
+                      ),
+                      title: Text(_path.isEmpty ? '/' : '/$_path'),
+                      subtitle: Text(
+                        '${widget.connection.provider.label} · 受限于 /${widget.connection.root}',
+                      ),
                     ),
+                  ),
+                  if (_message != null)
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(12),
+                      color: _messageIsError
+                          ? theme.colorScheme.errorContainer
+                          : theme.colorScheme.primaryContainer,
+                      child: Text(_message!),
+                    ),
+                  if (_busy) const LinearProgressIndicator(minHeight: 2),
+                  Expanded(
+                    child: _entries.isEmpty && !_busy
+                        ? const _StatusPanel(
+                            icon: Icons.folder_open_rounded,
+                            title: '此目录为空',
+                            detail: '可使用右上角上传受支持的电子书。',
+                          )
+                        : ListView.builder(
+                            itemCount:
+                                _entries.length + (_nextCursor == null ? 0 : 1),
+                            itemBuilder: (context, index) {
+                              if (index == _entries.length) {
+                                return Padding(
+                                  padding: const EdgeInsets.all(16),
+                                  child: OutlinedButton(
+                                    onPressed: _busy
+                                        ? null
+                                        : () => _load(reset: false),
+                                    child: const Text('加载更多'),
+                                  ),
+                                );
+                              }
+                              final entry = _entries[index];
+                              final canOpen = service.canOpen(entry);
+                              return ListTile(
+                                leading: Icon(
+                                  entry.isDirectory
+                                      ? Icons.folder_rounded
+                                      : canOpen
+                                      ? Icons.menu_book_rounded
+                                      : Icons.insert_drive_file_outlined,
+                                ),
+                                title: Text(_fileName(entry.path)),
+                                subtitle: entry.isDirectory
+                                    ? const Text('目录')
+                                    : Text(
+                                        canOpen ? '点按后在本机安全解析' : '当前阅读器不支持此格式',
+                                      ),
+                                onTap: entry.isDirectory || canOpen
+                                    ? () => _openEntry(entry)
+                                    : null,
+                                trailing: service.canDelete(entry)
+                                    ? IconButton(
+                                        tooltip: '条件删除',
+                                        onPressed: _busy
+                                            ? null
+                                            : () => _delete(entry),
+                                        icon: const Icon(
+                                          Icons.delete_outline_rounded,
+                                        ),
+                                      )
+                                    : null,
+                              );
+                            },
+                          ),
+                  ),
+                ],
+              ),
             ),
-          ],
-        ),
-      ),
     );
   }
 }

@@ -344,12 +344,27 @@ void main() {
     );
     expect(adapter.deletes, isEmpty);
   });
+
+  test('offline delete treats an already absent object as applied', () async {
+    final adapter = _RecordingAdapter()..deleteNotFound = true;
+    final store = InMemoryOfflineMutationStore();
+    final sync = OfflineCloudSynchronizer(
+      adapter: adapter,
+      accountId: 'account-a',
+      store: store,
+    );
+    await sync.enqueueDelete('book.epub', etag: 'v1');
+
+    expect(await sync.replay(), 1);
+    expect(await store.pending(sync.scope), isEmpty);
+  });
 }
 
 final class _RecordingAdapter implements CloudLibraryAdapter {
   _RecordingAdapter([this.providerId = 'recording']);
 
   bool failWrites = false;
+  bool deleteNotFound = false;
   final List<String> writes = <String>[];
   final List<String> deletes = <String>[];
 
@@ -364,6 +379,9 @@ final class _RecordingAdapter implements CloudLibraryAdapter {
 
   @override
   Future<void> delete(String path, {String? etag}) async {
+    if (deleteNotFound) {
+      throw const CoreException(CoreErrorCode.notFound, 'fixture missing');
+    }
     deletes.add('$path:$etag');
   }
 

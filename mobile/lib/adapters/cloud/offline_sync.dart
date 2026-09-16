@@ -107,7 +107,7 @@ final class InMemoryOfflineMutationStore implements OfflineMutationStore {
   @override
   Future<void> put(QueuedCloudMutation mutation) async {
     final partition = _partitions.putIfAbsent(
-      _scopeKey(mutation.scope),
+      cloudMutationScopeKey(mutation.scope),
       () => <String, QueuedCloudMutation>{},
     );
     partition.putIfAbsent(mutation.idempotencyKey, () => mutation);
@@ -115,12 +115,14 @@ final class InMemoryOfflineMutationStore implements OfflineMutationStore {
 
   @override
   Future<List<QueuedCloudMutation>> pending(CloudMutationScope scope) async =>
-      _partitions[_scopeKey(scope)]?.values.toList(growable: false) ??
+      _partitions[cloudMutationScopeKey(scope)]?.values.toList(
+        growable: false,
+      ) ??
       const <QueuedCloudMutation>[];
 
   @override
   Future<void> remove(CloudMutationScope scope, String idempotencyKey) async {
-    final key = _scopeKey(scope);
+    final key = cloudMutationScopeKey(scope);
     final partition = _partitions[key];
     partition?.remove(idempotencyKey);
     if (partition?.isEmpty ?? false) _partitions.remove(key);
@@ -228,7 +230,11 @@ final class OfflineCloudSynchronizer {
             etag: mutation.etag,
           );
         case CloudMutationType.delete:
-          await adapter.delete(mutation.path, etag: mutation.etag);
+          try {
+            await adapter.delete(mutation.path, etag: mutation.etag);
+          } on CoreException catch (error) {
+            if (error.code != CoreErrorCode.notFound) rethrow;
+          }
       }
       cancellationToken?.throwIfCancelled();
       await store.remove(scope, mutation.idempotencyKey);
@@ -251,7 +257,7 @@ final class OfflineCloudSynchronizer {
   ]).toString();
 }
 
-String _scopeKey(CloudMutationScope scope) => sha256
+String cloudMutationScopeKey(CloudMutationScope scope) => sha256
     .convert(
       utf8.encode(jsonEncode(<String>[scope.providerId, scope.accountId])),
     )

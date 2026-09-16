@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=OOHStory
+Comment=免费中文小说阅读与深度拆书
+Exec=oohstory %U
+Icon=com.oohstory.oohstory
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/x-mobipocket-ebook;application/vnd.amazon.ebook;application/x-cbr;application/x-cbt;application/x-7z-compressed;
+StartupWMClass=com.oohstory.oohstory
