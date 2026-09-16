@@ -1,13 +1,21 @@
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import '../services/api_service.dart';
+import '../services/authenticated_resource.dart';
 import '../services/local_storage_service.dart';
 import '../services/reading_progress.dart';
+import '../services/progress_sync_runtime.dart';
 import '../services/account_service.dart';
 import '../services/app_update_service.dart';
+import '../core/product_capabilities.dart';
+import '../features/local_content/local_content.dart';
+import '../features/cloud_library/cloud_library.dart';
+import '../models/book.dart';
 import '../theme/app_theme.dart';
 import 'book_detail_screen.dart';
-import 'local_reader_screen.dart';
+import 'offline_book_screen.dart';
+import 'reader_screen.dart';
+import 'offline_notes_screen.dart';
 import 'history_page.dart';
 import 'favorites_page.dart';
 import 'auth_screen.dart';
@@ -15,11 +23,18 @@ import 'account_records_screen.dart';
 import 'account_settings_screen.dart';
 import 'notifications_screen.dart';
 import 'submission_center_screen.dart';
+import 'deconstruction_screen.dart';
+import 'bookshelf_page.dart';
 import '../widgets/reading_identity.dart';
 import '../main.dart' show ttsService;
 
 class ProfileScreen extends StatefulWidget {
-  const ProfileScreen({super.key});
+  const ProfileScreen({
+    super.key,
+    this.capabilities = ProductCapabilityProfile.production,
+  });
+
+  final ProductCapabilityProfile capabilities;
 
   @override
   State<ProfileScreen> createState() => _ProfileScreenState();
@@ -116,6 +131,28 @@ class _ProfileScreenState extends State<ProfileScreen> {
     }
   }
 
+  Future<void> _syncDedicatedProgress() async {
+    if (!_account.isSignedIn) {
+      await _openAuth();
+      return;
+    }
+    try {
+      final summary = await ProgressSyncRuntime.instance.synchronize();
+      if (!mounted || summary == null) return;
+      final message = summary.conflicts.isEmpty
+          ? '进度同步完成：上传 ${summary.uploaded} 条，云端 ${summary.remoteRecords.length} 条'
+          : '发现 ${summary.conflicts.length} 个进度冲突，已保留本机和云端版本，未自动覆盖';
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('专用进度服务暂不可用，本地阅读进度已保留')));
+    }
+  }
+
   void _openBook(String bookId) {
     Navigator.of(context)
         .push(
@@ -127,7 +164,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
   void _openLocalBook(LocalBookInfo book) {
     Navigator.of(
       context,
-    ).push(MaterialPageRoute(builder: (_) => LocalReaderScreen(book: book)));
+    ).push(MaterialPageRoute(builder: (_) => buildOfflineBookScreen(book)));
   }
 
   Future<void> _openAuth() async {
@@ -231,8 +268,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
             SliverToBoxAdapter(
               child: ReadingIdentityCard(reading: _accountReading),
             ),
+          SliverToBoxAdapter(child: _buildContentTools(theme)),
           if (_account.isSignedIn)
-            SliverToBoxAdapter(child: _buildAccountActions(theme, isDark)),
+            SliverToBoxAdapter(child: _buildAccountActions(theme)),
           SliverToBoxAdapter(child: _buildStatsRow(theme, isDark)),
 
           // Local source files intentionally remain device-only.
@@ -346,19 +384,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
       margin: const EdgeInsets.fromLTRB(16, 8, 16, 0),
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [Color(0xFF6C5CE7), Color(0xFF8B7CF6), Color(0xFFA29BFE)],
-        ),
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: [
-          BoxShadow(
-            color: AppTheme.seedPurple.withValues(alpha: 0.3),
-            blurRadius: 20,
-            offset: const Offset(0, 8),
-          ),
-        ],
+        gradient: AppTheme.heroGradient,
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: [AppTheme.softShadow(theme.brightness)],
       ),
       child: Row(
         children: [
@@ -384,7 +412,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       _account.avatarUrl(
                         _accountProfile['avatar_url'] as String,
                       ),
-                      headers: _account.authHeaders,
+                      headers: oohstoryAuthenticatedResourceHeaders(
+                        _account.avatarUrl(
+                          _accountProfile['avatar_url'] as String,
+                        ),
+                        _account.authHeaders,
+                      ),
                       fit: BoxFit.cover,
                       errorBuilder: (_, __, ___) => const Icon(
                         Icons.person_rounded,
@@ -492,7 +525,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     );
   }
 
-  Widget _buildAccountActions(ThemeData theme, bool isDark) {
+  Widget _buildAccountActions(ThemeData theme) {
     final items = <(IconData, String, String, VoidCallback)>[
       (
         Icons.history_rounded,
@@ -555,38 +588,48 @@ class _ProfileScreenState extends State<ProfileScreen> {
       padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
       child: LayoutBuilder(
         builder: (context, constraints) {
-          final width = (constraints.maxWidth - 10) / 2;
+          final columns = constraints.maxWidth >= 640 ? 3 : 2;
+          final width = (constraints.maxWidth - ((columns - 1) * 12)) / columns;
           return Wrap(
-            spacing: 10,
-            runSpacing: 10,
+            spacing: 12,
+            runSpacing: 12,
             children: items
                 .map(
                   (item) => SizedBox(
                     width: width,
                     child: Material(
-                      color: isDark ? const Color(0xFF1E1E30) : Colors.white,
-                      borderRadius: BorderRadius.circular(15),
+                      color: theme.colorScheme.surface,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(
+                          AppTheme.cardRadius,
+                        ),
+                        side: BorderSide(
+                          color: theme.colorScheme.outlineVariant,
+                        ),
+                      ),
                       child: InkWell(
                         onTap: item.$4,
-                        borderRadius: BorderRadius.circular(15),
+                        borderRadius: BorderRadius.circular(
+                          AppTheme.cardRadius,
+                        ),
                         child: Padding(
-                          padding: const EdgeInsets.all(14),
+                          padding: const EdgeInsets.all(16),
                           child: Row(
                             children: [
                               Container(
-                                width: 38,
-                                height: 38,
+                                width: 42,
+                                height: 42,
                                 alignment: Alignment.center,
                                 decoration: BoxDecoration(
                                   color: AppTheme.seedPurple.withValues(
                                     alpha: .1,
                                   ),
-                                  borderRadius: BorderRadius.circular(12),
+                                  borderRadius: BorderRadius.circular(13),
                                 ),
                                 child: Icon(
                                   item.$1,
                                   size: 20,
-                                  color: AppTheme.seedPurple,
+                                  color: theme.colorScheme.primary,
                                 ),
                               ),
                               const SizedBox(width: 10),
@@ -599,7 +642,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                       maxLines: 1,
                                       overflow: TextOverflow.ellipsis,
                                       style: const TextStyle(
-                                        fontSize: 13,
+                                        fontSize: 14,
                                         fontWeight: FontWeight.w700,
                                       ),
                                     ),
@@ -609,9 +652,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                       maxLines: 1,
                                       overflow: TextOverflow.ellipsis,
                                       style: TextStyle(
-                                        fontSize: 10,
-                                        color: theme.colorScheme.onSurface
-                                            .withValues(alpha: .45),
+                                        fontSize: 11,
+                                        color:
+                                            theme.colorScheme.onSurfaceVariant,
                                       ),
                                     ),
                                   ],
@@ -627,6 +670,136 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 .toList(),
           );
         },
+      ),
+    );
+  }
+
+  Widget _buildContentTools(ThemeData theme) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
+      child: Column(
+        children: [
+          _contentToolTile(
+            theme,
+            icon: Icons.auto_stories_rounded,
+            title: '拆书档案',
+            subtitle: '查看深度拆解、写作技法与设定资料',
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => Scaffold(
+                  appBar: AppBar(title: const Text('拆书档案')),
+                  body: const DeconstructionScreen(),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          _contentToolTile(
+            theme,
+            icon: Icons.offline_pin_rounded,
+            title: '本地离线书库',
+            subtitle: '导入、备份与管理离线书籍',
+            onTap: () => Navigator.of(
+              context,
+            ).push(MaterialPageRoute(builder: (_) => const BookshelfPage())),
+          ),
+          if (widget.capabilities.localContentEnabled) ...[
+            const SizedBox(height: 10),
+            _contentToolTile(
+              theme,
+              icon: Icons.folder_open_rounded,
+              title: '本地阅读',
+              subtitle: 'MOBI · AZW3 · CBR · CBT · CB7 · MDX',
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => const LocalContentHubScreen(),
+                  settings: const RouteSettings(name: '/local-content'),
+                ),
+              ),
+            ),
+          ],
+          if (widget.capabilities.cloudLibraryEnabled) ...[
+            const SizedBox(height: 10),
+            _contentToolTile(
+              theme,
+              icon: Icons.cloud_sync_rounded,
+              title: '存储与同步',
+              subtitle: 'WebDAV · S3 云端书库',
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) =>
+                      CloudConnectionsScreen(capabilities: widget.capabilities),
+                  settings: const RouteSettings(name: '/cloud-library'),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _contentToolTile(
+    ThemeData theme, {
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required VoidCallback onTap,
+  }) {
+    return Material(
+      color: theme.colorScheme.surface,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(AppTheme.cardRadius),
+        side: BorderSide(color: theme.colorScheme.outlineVariant),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 15),
+          child: Row(
+            children: [
+              Container(
+                width: 46,
+                height: 46,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.primaryContainer,
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Icon(icon, color: theme.colorScheme.onPrimaryContainer),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      subtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Icon(
+                Icons.chevron_right_rounded,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -1304,10 +1477,40 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 ),
                 onPressed: () => _showDeleteDownloadDialog(dl),
               ),
-              onTap: () => _openBook(dl.book.id),
+              onTap: () => _openDownloadedBook(dl),
             ),
           );
         }).toList(),
+      ),
+    );
+  }
+
+  void _openDownloadedBook(DownloadedBookInfo downloaded) {
+    if (downloaded.chapters.isEmpty) return;
+    final chapters = downloaded.chapters
+        .map(
+          (chapter) => Chapter(
+            id: chapter.id,
+            title: chapter.title,
+            position: chapter.position,
+          ),
+        )
+        .toList();
+    final book = Book(
+      id: downloaded.book.id,
+      title: downloaded.book.title,
+      author: downloaded.book.author,
+      coverUrl: downloaded.book.coverUrl,
+      chapterCount: chapters.length,
+    );
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ReaderScreen(
+          bookId: book.id,
+          chapterId: chapters.first.id,
+          chapters: chapters,
+          book: book,
+        ),
       ),
     );
   }
@@ -1330,6 +1533,37 @@ class _ProfileScreenState extends State<ProfileScreen> {
         ),
         child: Column(
           children: [
+            _settingsTile(
+              theme,
+              Icons.collections_bookmark_rounded,
+              '书签与批注',
+              subtitle: '本地保存 · 可导出',
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) =>
+                      OfflineNotesScreen(capabilities: widget.capabilities),
+                ),
+              ),
+            ),
+            if (widget.capabilities.accountProgressSyncEnabled) ...[
+              Divider(
+                height: 1,
+                indent: 52,
+                color: theme.colorScheme.onSurface.withValues(alpha: 0.06),
+              ),
+              _settingsTile(
+                theme,
+                Icons.sync_rounded,
+                '阅读进度同步',
+                subtitle: _account.isSignedIn ? '立即同步 · 冲突不自动覆盖' : '登录后可用',
+                onTap: _syncDedicatedProgress,
+              ),
+            ],
+            Divider(
+              height: 1,
+              indent: 52,
+              color: theme.colorScheme.onSurface.withValues(alpha: 0.06),
+            ),
             _settingsTile(
               theme,
               Icons.cleaning_services_rounded,

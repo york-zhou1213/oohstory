@@ -1,0 +1,35 @@
+{
+    "name": "OOHStory",
+    "short_name": "OOHStory",
+    "start_url": ".",
+    "display": "standalone",
+    "background_color": "#111A2E",
+    "theme_color": "#315FC7",
+    "description": "OOHStory 跨平台中文小说阅读、听书与离线书架。",
+    "orientation": "any",
+    "prefer_related_applications": false,
+    "icons": [
+        {
+            "src": "icons/Icon-192.png",
+            "sizes": "192x192",
+            "type": "image/png"
+        },
+        {
+            "src": "icons/Icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png"
+        },
+        {
+            "src": "icons/Icon-maskable-192.png",
+            "sizes": "192x192",
+            "type": "image/png",
+            "purpose": "maskable"
+        },
+        {
+            "src": "icons/Icon-maskable-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "maskable"
+        }
+    ]
+}

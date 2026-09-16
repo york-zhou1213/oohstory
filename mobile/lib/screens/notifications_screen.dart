@@ -81,11 +81,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
   Widget _hero() => Container(
     padding: const EdgeInsets.all(20),
     decoration: BoxDecoration(
-      gradient: const LinearGradient(
-        begin: Alignment.topLeft,
-        end: Alignment.bottomRight,
-        colors: [Color(0xFF282640), Color(0xFF514E83), Color(0xFF6C5CE7)],
-      ),
+      gradient: AppTheme.heroGradient,
       borderRadius: BorderRadius.circular(22),
       boxShadow: [
         BoxShadow(

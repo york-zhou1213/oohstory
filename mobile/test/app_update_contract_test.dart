@@ -12,14 +12,33 @@ void main() {
     final service = File(
       'lib/services/app_update_service.dart',
     ).readAsStringSync();
+    final transport = File(
+      'lib/services/ooh_origin_transport.dart',
+    ).readAsStringSync();
+    final nativeClientFactory = File(
+      'lib/services/http_client_factory_native.dart',
+    ).readAsStringSync();
+    final webClientFactory = File(
+      'lib/services/http_client_factory_web.dart',
+    ).readAsStringSync();
     final main = File('lib/main.dart').readAsStringSync();
     final activity = File(
       'android/app/src/main/kotlin/com/oohstory/oohstory/MainActivity.kt',
     ).readAsStringSync();
 
-    expect(pubspec, contains('version: 1.18.21+65'));
-    expect(AppUpdateService.currentVersionName, '1.18.21');
-    expect(AppUpdateService.currentVersionCode, 65);
+    expect(pubspec, contains('version: 1.27.0+75'));
+    expect(AppUpdateService.currentVersionName, '1.27.0');
+    expect(AppUpdateService.currentVersionCode, 75);
+    expect(api, contains('createOohHttpClient()'));
+    expect(nativeClientFactory, contains('configureProductionOrigin(client)'));
+    expect(webClientFactory, contains('BrowserClient()'));
+    expect(transport, contains("'OOHSTORY_ORIGIN_IP'"));
+    expect(transport, contains("defaultValue: '154.218.0.70'"));
+    expect(
+      transport,
+      contains('connectionFactory = connectToProductionOrigin'),
+    );
+    expect(transport, contains("url.host == 'oohstory.com'"));
     expect(api, contains('/api/v1/app/android/latest'));
     expect(api, contains('version_code'));
     expect(api, contains('version_name'));
@@ -37,10 +56,11 @@ void main() {
     tester,
   ) async {
     const info = AppUpdateInfo(
-      versionName: '1.18.22',
-      versionCode: 66,
+      versionName: '1.27.1',
+      versionCode: 76,
       releaseDate: '2026-08-13',
-      downloadUrl: 'https://reader.example.com/downloads/android/latest.apk',
+      downloadUrl:
+          'https://oohstory.com/downloads/android/OOHStory-v1.27.1+76.apk',
       sha256: 'abc',
       sizeBytes: 28 * 1024 * 1024,
       releaseNotes: ['修复后台播放稳定性', '新增自动检查更新'],
@@ -62,7 +82,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('发现新版本'), findsOneWidget);
-    expect(find.text('当前版本 v1.18.21，可更新至 v1.18.22。'), findsOneWidget);
+    expect(find.text('当前版本 v1.27.0，可更新至 v1.27.1。'), findsOneWidget);
     expect(find.text('更新内容'), findsOneWidget);
     expect(find.text('修复后台播放稳定性'), findsOneWidget);
     expect(find.text('新增自动检查更新'), findsOneWidget);

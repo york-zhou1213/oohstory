@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
@@ -61,17 +60,19 @@ class AccountService extends ChangeNotifier {
       accessibility: KeychainAccessibility.first_unlock_this_device,
     ),
   );
-  // OAuth client IDs are deployment-specific public identifiers. Supply them
-  // at build time; the source tree deliberately ships no production ID.
+  // OAuth client IDs are public identifiers. Keep the production Web client
+  // as a safe default so release builds cannot silently lose Google Sign-In;
+  // CI or alternate environments may still override it with --dart-define.
   static const _webClientId = String.fromEnvironment(
     'GOOGLE_WEB_CLIENT_ID',
-    defaultValue: '',
+    defaultValue:
+        '1046473401516-7iohcfjigv2ufopiimo3a2ihiepr0dbh.apps.googleusercontent.com',
   );
   static const _iosClientId = String.fromEnvironment('GOOGLE_IOS_CLIENT_ID');
   static const _requestTimeout = Duration(seconds: 20);
   static const _uploadTimeout = Duration(minutes: 4);
 
-  final http.Client _client = http.Client();
+  final http.Client _client = OohHttpClient();
   String? _token;
   AccountUser? user;
   bool initialized = false;
@@ -86,11 +87,19 @@ class AccountService extends ChangeNotifier {
       ? const {}
       : <String, String>{'Authorization': 'Bearer $_token'};
   bool get googleAvailable =>
-      _webClientId.isNotEmpty && (!Platform.isIOS || _iosClientId.isNotEmpty);
+      _webClientId.isNotEmpty &&
+      (defaultTargetPlatform != TargetPlatform.iOS || _iosClientId.isNotEmpty);
 
   String get platformClient {
-    if (Platform.isIOS) return 'ios';
-    return 'android';
+    if (kIsWeb) return 'web';
+    return switch (defaultTargetPlatform) {
+      TargetPlatform.android => 'android',
+      TargetPlatform.iOS => 'ios',
+      TargetPlatform.macOS => 'macos',
+      TargetPlatform.windows => 'windows',
+      TargetPlatform.linux => 'linux',
+      TargetPlatform.fuchsia => 'fuchsia',
+    };
   }
 
   Future<Map<String, dynamic>> _request(
@@ -198,7 +207,10 @@ class AccountService extends ChangeNotifier {
     if (!googleAvailable) throw const AccountException('Google 登录尚未配置');
     final google = GoogleSignIn(
       scopes: const ['email', 'profile'],
-      clientId: Platform.isIOS && _iosClientId.isNotEmpty ? _iosClientId : null,
+      clientId:
+          defaultTargetPlatform == TargetPlatform.iOS && _iosClientId.isNotEmpty
+          ? _iosClientId
+          : null,
       serverClientId: _webClientId,
     );
     final account = await google.signIn();
@@ -332,22 +344,8 @@ class AccountService extends ChangeNotifier {
 
   Future<void> mergeLocalState(LocalStorageService storage) async {
     if (!isSignedIn) return;
-    final history = storage
-        .getHistory()
-        .map(
-          (entry) => {
-            'book_id': entry.book.id,
-            'title': entry.book.title,
-            'author': entry.book.author,
-            'cover_url': entry.book.coverUrl ?? '',
-            'chapter_id': int.tryParse(entry.lastChapterId) ?? 1,
-            'progress': 0,
-            'updated_at': DateTime.fromMillisecondsSinceEpoch(
-              entry.lastReadAt,
-            ).toUtc().toIso8601String(),
-          },
-        )
-        .toList();
+    final localHistory = storage.getHistory();
+    final history = localHistory.map(_readingState).toList();
     final favorites = storage
         .getFavorites()
         .map(
@@ -368,10 +366,27 @@ class AccountService extends ChangeNotifier {
       body: {
         'history': history,
         'favorites': favorites,
-        'bookshelf': <dynamic>[],
+        'bookshelf': localHistory.map(_automaticShelfState).toList(),
       },
     );
     storage.mergeCloudState(cloudState);
+    notifyListeners();
+  }
+
+  /// Persist one authoritative reading checkpoint and automatically promote
+  /// the work into the account bookshelf. The API performs partial upserts, so
+  /// this does not replace unrelated account records.
+  Future<void> syncReadingEntry(HistoryEntry entry) async {
+    if (!isSignedIn) return;
+    cloudState = await _request(
+      '/api/v1/me/state',
+      method: 'PUT',
+      body: {
+        'history': [_readingState(entry)],
+        'favorites': <dynamic>[],
+        'bookshelf': [_automaticShelfState(entry)],
+      },
+    );
     notifyListeners();
   }
 
@@ -461,6 +476,38 @@ class AccountService extends ChangeNotifier {
     'cover_url': book.coverUrl ?? '',
     'updated_at': DateTime.now().toUtc().toIso8601String(),
   };
+
+  Map<String, dynamic> _readingState(HistoryEntry entry) => {
+    'book_id': entry.book.id,
+    'title': entry.book.title,
+    'author': entry.book.author,
+    'cover_url': entry.book.coverUrl ?? '',
+    'chapter_id': entry.lastChapterPosition,
+    'progress': entry.chapterProgress,
+    'updated_at': DateTime.fromMillisecondsSinceEpoch(
+      entry.lastReadAt,
+    ).toUtc().toIso8601String(),
+  };
+
+  Map<String, dynamic> _automaticShelfState(HistoryEntry entry) => {
+    'book_id': entry.book.id,
+    'title': entry.book.title,
+    'author': entry.book.author,
+    'cover_url': entry.book.coverUrl ?? '',
+    'note': _existingBookshelfNote(entry.book.id),
+    'updated_at': DateTime.fromMillisecondsSinceEpoch(
+      entry.lastReadAt,
+    ).toUtc().toIso8601String(),
+  };
+
+  String _existingBookshelfNote(String bookId) {
+    for (final item in cloudState['bookshelf'] as List? ?? const []) {
+      if (item is Map && item['book_id'] == bookId) {
+        return item['note'] as String? ?? '';
+      }
+    }
+    return '';
+  }
 
   Future<List<Map<String, dynamic>>> uploads() async {
     final data = await _request('/api/v1/me/uploads');

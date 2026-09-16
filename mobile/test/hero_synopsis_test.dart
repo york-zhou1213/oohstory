@@ -69,12 +69,16 @@ void main() {
     expect(heroChapterCountLabelFor(heroBooks[3]), '?章');
   });
 
-  test('hero cover scales with phone width while preserving a 2:3 frame', () {
-    expect(heroCoverWidthFor(296), 104);
-    expect(heroCoverHeightFor(296), 156);
-    expect(heroCoverWidthFor(366), closeTo(117.12, 0.001));
-    expect(heroCoverHeightFor(366), closeTo(175.68, 0.001));
-    expect(heroCoverWidthFor(500), 136);
-    expect(heroCoverHeightFor(500), 204);
-  });
+  test(
+    'hero cover scales from phone to tablet with a reader-friendly frame',
+    () {
+      expect(heroCoverWidthFor(296), 124);
+      expect(heroCoverHeightFor(296), closeTo(176.08, 0.001));
+      expect(heroCoverWidthFor(366), closeTo(128.1, 0.001));
+      expect(heroCoverHeightFor(366), closeTo(181.902, 0.001));
+      expect(heroCoverWidthFor(500), 175);
+      expect(heroCoverHeightFor(500), closeTo(248.5, 0.001));
+      expect(heroCoverWidthFor(900), 200);
+    },
+  );
 }

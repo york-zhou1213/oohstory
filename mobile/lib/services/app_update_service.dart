@@ -44,8 +44,8 @@ class AppUpdateInfo {
 }
 
 class AppUpdateService {
-  static const currentVersionName = '1.18.21';
-  static const currentVersionCode = 65;
+  static const currentVersionName = '1.27.0';
+  static const currentVersionCode = 75;
   static const _channel = MethodChannel('com.oohstory.oohstory/app');
   static const _lastPromptedVersionCodeKey =
       'oohstory_android_update_prompted_version_code';
@@ -109,11 +109,9 @@ class AppUpdateService {
 
   bool _isTrustedDownloadUrl(String value) {
     final uri = Uri.tryParse(value);
-    final apiOrigin = Uri.tryParse(ApiService.baseUrl);
     return uri != null &&
-        apiOrigin != null &&
         uri.scheme == 'https' &&
-        uri.host == apiOrigin.host &&
+        uri.host == 'oohstory.com' &&
         uri.path.startsWith('/downloads/android/') &&
         uri.path.endsWith('.apk');
   }

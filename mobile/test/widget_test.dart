@@ -6,8 +6,11 @@
 // tree, read text, and verify that the values of widget properties are correct.
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/material.dart';
 
 import 'package:oohstory/main.dart';
+import 'package:oohstory/screens/reading_bookshelf_screen.dart';
+import 'package:oohstory/screens/profile_screen.dart';
 
 void main() {
   testWidgets('OOH Story app opens the main shell after the branded splash', (
@@ -19,5 +22,18 @@ void main() {
 
     expect(find.text('发现'), findsWidgets);
     expect(find.text('书库'), findsOneWidget);
+    expect(find.text('书架'), findsOneWidget);
+    expect(find.text('拆书'), findsNothing);
+
+    var rail = tester.widget<NavigationRail>(find.byType(NavigationRail));
+    rail.onDestinationSelected!(2);
+    await tester.pump();
+    expect(find.byType(ReadingBookshelfScreen), findsOneWidget);
+
+    rail = tester.widget<NavigationRail>(find.byType(NavigationRail));
+    rail.onDestinationSelected!(3);
+    await tester.pump();
+    expect(find.byType(ProfileScreen), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 }

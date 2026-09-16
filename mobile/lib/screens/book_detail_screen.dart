@@ -7,6 +7,7 @@ import '../models/book.dart';
 import '../theme/app_theme.dart';
 import '../widgets/recommendation_donation_dialog.dart';
 import '../widgets/user_content_notice_dialog.dart';
+import '../widgets/ooh_ui.dart';
 import '../utils/user_content_guard.dart';
 import 'reader_screen.dart';
 import 'volume_detail_screen.dart';
@@ -378,141 +379,114 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
   }
 
   Widget _buildAppBar(ThemeData theme, Book book) {
+    final coverUrl = book.coverUrl != null
+        ? _api.fullCoverUrl(book.coverUrl)
+        : _api.coverUrl(widget.bookId);
     return SliverAppBar(
-      expandedHeight: 280,
+      expandedHeight: 272,
       pinned: true,
       stretch: true,
       backgroundColor: theme.appBarTheme.backgroundColor,
+      foregroundColor: theme.colorScheme.onSurface,
+      surfaceTintColor: Colors.transparent,
       flexibleSpace: FlexibleSpaceBar(
-        background: Container(
-          decoration: const BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: [Color(0xFF6C5CE7), Color(0xFF8B7CF6), Color(0xFFA29BFE)],
-            ),
-          ),
-          child: SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(20, 56, 20, 20),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Hero(
-                    tag: 'book_cover_${widget.bookId}',
-                    child: Container(
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(12),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.3),
-                            blurRadius: 20,
-                            offset: const Offset(0, 8),
-                          ),
-                        ],
-                      ),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(12),
-                        child: Image.network(
-                          _api.coverUrl(widget.bookId),
-                          width: 110,
-                          height: 155,
-                          fit: BoxFit.cover,
-                          errorBuilder: (_, __, ___) => Container(
-                            width: 110,
-                            height: 155,
-                            decoration: BoxDecoration(
-                              gradient: LinearGradient(
-                                begin: Alignment.topLeft,
-                                end: Alignment.bottomRight,
-                                colors: [
-                                  Colors.white.withValues(alpha: 0.2),
-                                  Colors.white.withValues(alpha: 0.05),
-                                ],
-                              ),
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: Center(
-                              child: Text(
-                                book.title.length > 4
-                                    ? book.title.substring(0, 4)
-                                    : book.title,
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 18,
-                                  fontWeight: FontWeight.w700,
-                                ),
-                                textAlign: TextAlign.center,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
+        background: ColoredBox(
+          color: theme.colorScheme.surface,
+          child: Stack(
+            children: [
+              Positioned.fill(
+                left: MediaQuery.sizeOf(context).width * .48,
+                child: Opacity(
+                  opacity: theme.brightness == Brightness.dark ? .12 : .07,
+                  child: OohNetworkImage(
+                    imageUrl: coverUrl,
+                    fit: BoxFit.cover,
+                    alignment: Alignment.topCenter,
+                    error: const SizedBox.shrink(),
+                  ),
+                ),
+              ),
+              Positioned.fill(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.centerLeft,
+                      end: Alignment.centerRight,
+                      colors: [
+                        theme.colorScheme.surface,
+                        theme.colorScheme.surface.withValues(alpha: .96),
+                        theme.colorScheme.surface.withValues(alpha: .72),
+                      ],
+                      stops: const [0, .64, 1],
                     ),
                   ),
-                  const SizedBox(width: 18),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          book.title,
-                          style: const TextStyle(
-                            fontSize: 22,
-                            fontWeight: FontWeight.w800,
-                            color: Colors.white,
-                            height: 1.2,
-                            letterSpacing: -0.3,
-                          ),
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              SafeArea(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 54, 20, 18),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      Hero(
+                        tag: 'book_cover_${widget.bookId}',
+                        child: OohBookCover(
+                          imageUrl: coverUrl,
+                          title: book.title,
+                          width: 112,
+                          height: 168,
+                          borderRadius: BorderRadius.circular(9),
                         ),
-                        const SizedBox(height: 8),
-                        Text(
-                          book.author,
-                          style: TextStyle(
-                            fontSize: 14,
-                            color: Colors.white.withValues(alpha: 0.8),
-                          ),
-                        ),
-                        const SizedBox(height: 12),
-                        Wrap(
-                          spacing: 8,
-                          runSpacing: 6,
+                      ),
+                      const SizedBox(width: 19),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisAlignment: MainAxisAlignment.center,
                           children: [
-                            if (book.category != null)
-                              _tagBadge(book.category!),
-                            if (book.status != null)
-                              _tagBadge(_statusLabel(book.status)),
+                            Text(
+                              book.title,
+                              style: theme.textTheme.headlineSmall?.copyWith(
+                                fontWeight: FontWeight.w800,
+                                height: 1.18,
+                                letterSpacing: -.35,
+                              ),
+                              maxLines: 3,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            const SizedBox(height: 9),
+                            Text(
+                              book.author,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.bodyMedium?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            Text(
+                              [
+                                if (book.category != null) book.category!,
+                                if (book.status != null)
+                                  _statusLabel(book.status),
+                                '${book.chapterCount ?? _chapters.length}章',
+                              ].join('  '),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.labelSmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
                           ],
                         ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
-                ],
+                ),
               ),
-            ),
+            ],
           ),
-        ),
-      ),
-    );
-  }
-
-  Widget _tagBadge(String label) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.18),
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.2)),
-      ),
-      child: Text(
-        label,
-        style: const TextStyle(
-          color: Colors.white,
-          fontSize: 11,
-          fontWeight: FontWeight.w500,
         ),
       ),
     );
@@ -541,7 +515,7 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
             value,
             style: theme.textTheme.titleSmall?.copyWith(
               fontWeight: FontWeight.w700,
-              color: AppTheme.seedPurple,
+              color: theme.colorScheme.primary,
             ),
           ),
           const SizedBox(height: 2),
@@ -613,7 +587,10 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
                 ),
                 child: Text(
                   '展开',
-                  style: TextStyle(fontSize: 12, color: AppTheme.seedPurple),
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: theme.colorScheme.primary,
+                  ),
                 ),
               ),
             ),
@@ -640,12 +617,15 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                 decoration: BoxDecoration(
-                  color: AppTheme.seedPurple.withValues(alpha: .1),
+                  color: theme.colorScheme.primary.withValues(alpha: .1),
                   borderRadius: BorderRadius.circular(8),
                 ),
                 child: Text(
                   '${_bookComments.length} 条',
-                  style: TextStyle(fontSize: 11, color: AppTheme.seedPurple),
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: theme.colorScheme.primary,
+                  ),
                 ),
               ),
             ],
@@ -706,7 +686,7 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
                       children: [
                         CircleAvatar(
                           radius: 17,
-                          backgroundColor: AppTheme.seedPurple.withValues(
+                          backgroundColor: theme.colorScheme.primary.withValues(
                             alpha: .12,
                           ),
                           child: Text(
@@ -825,14 +805,14 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
             decoration: BoxDecoration(
-              color: AppTheme.seedPurple.withValues(alpha: 0.1),
+              color: theme.colorScheme.primary.withValues(alpha: 0.1),
               borderRadius: BorderRadius.circular(8),
             ),
             child: Text(
               label,
               style: TextStyle(
                 fontSize: 11,
-                color: AppTheme.seedPurple,
+                color: theme.colorScheme.primary,
                 fontWeight: FontWeight.w600,
               ),
             ),
@@ -877,8 +857,9 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
 
   Widget _buildChapterList(ThemeData theme) {
     if (_volumes.isNotEmpty) return _buildVolumeList(theme);
-    final displayChapters =
-        _chaptersReversed ? _chapters.reversed.toList() : _chapters;
+    final displayChapters = _chaptersReversed
+        ? _chapters.reversed.toList()
+        : _chapters;
     final showCount = _catalogExpanded
         ? displayChapters.length
         : displayChapters.length.clamp(0, 20);
@@ -896,7 +877,7 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
               width: 28,
               height: 28,
               decoration: BoxDecoration(
-                color: AppTheme.seedPurple.withValues(alpha: 0.08),
+                color: theme.colorScheme.primary.withValues(alpha: 0.08),
                 borderRadius: BorderRadius.circular(7),
               ),
               child: Center(
@@ -904,7 +885,7 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
                   '${i + 1}',
                   style: TextStyle(
                     fontSize: 11,
-                    color: AppTheme.seedPurple,
+                    color: theme.colorScheme.primary,
                     fontWeight: FontWeight.w600,
                   ),
                 ),
@@ -1000,20 +981,21 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(10),
                 child: vol.hasCover
-                    ? Image.network(
-                        _api.illustrationUrl(widget.bookId, vol.coverPath),
+                    ? OohNetworkImage(
+                        imageUrl: _api.illustrationUrl(
+                          widget.bookId,
+                          vol.coverPath,
+                        ),
                         fit: BoxFit.cover,
                         width: double.infinity,
-                        errorBuilder: (_, __, ___) =>
-                            _volumePlaceholder(theme, vol),
+                        error: _volumePlaceholder(theme, vol),
                       )
                     : useBookCover
-                    ? Image.network(
-                        _api.coverUrl(widget.bookId),
+                    ? OohNetworkImage(
+                        imageUrl: _api.coverUrl(widget.bookId),
                         fit: BoxFit.cover,
                         width: double.infinity,
-                        errorBuilder: (_, __, ___) =>
-                            _volumePlaceholder(theme, vol),
+                        error: _volumePlaceholder(theme, vol),
                       )
                     : _volumePlaceholder(theme, vol),
               ),
@@ -1049,8 +1031,8 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
           colors: [
-            AppTheme.seedPurple.withValues(alpha: 0.15),
-            AppTheme.seedPurple.withValues(alpha: 0.05),
+            theme.colorScheme.primary.withValues(alpha: 0.15),
+            theme.colorScheme.primary.withValues(alpha: 0.05),
           ],
         ),
       ),
@@ -1061,7 +1043,7 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
             Icon(
               Icons.menu_book_rounded,
               size: 28,
-              color: AppTheme.seedPurple.withValues(alpha: 0.4),
+              color: theme.colorScheme.primary.withValues(alpha: 0.4),
             ),
             const SizedBox(height: 4),
             Padding(
@@ -1071,7 +1053,7 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
                 style: TextStyle(
                   fontSize: 11,
                   fontWeight: FontWeight.w600,
-                  color: AppTheme.seedPurple.withValues(alpha: 0.6),
+                  color: theme.colorScheme.primary.withValues(alpha: 0.6),
                 ),
                 textAlign: TextAlign.center,
               ),
@@ -1104,7 +1086,7 @@ class _BookDetailScreenState extends State<BookDetailScreen> {
                 icon: _recommended ? Icons.thumb_up : Icons.thumb_up_outlined,
                 label: '推荐 · $_recommendCount',
                 color: _recommended
-                    ? AppTheme.seedPurple
+                    ? theme.colorScheme.primary
                     : theme.colorScheme.onSurface.withValues(alpha: 0.6),
                 onTap: _recommend,
               ),

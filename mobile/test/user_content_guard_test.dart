@@ -3,10 +3,7 @@ import 'package:oohstory/utils/user_content_guard.dart';
 
 void main() {
   test('content guard catches usernames and split website evasions', () {
-    final identity = UserContentGuard.issue(
-      '玩球+我vXxXx赚钱',
-      identity: true,
-    );
+    final identity = UserContentGuard.issue('玩球+我vXxXx赚钱', identity: true);
     expect(identity, contains('这个昵称暂时无法使用'));
     final promotion = UserContentGuard.issue('请看 e x a m p l e c o m');
     expect(promotion, contains('这条评论需要修改'));

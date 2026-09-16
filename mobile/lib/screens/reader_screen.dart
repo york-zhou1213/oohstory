@@ -1,20 +1,25 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ui' as ui;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/book.dart';
+import '../models/reader_preferences.dart';
 import '../services/api_service.dart';
 import '../services/local_storage_service.dart';
 import '../services/account_service.dart';
 import '../services/reading_progress.dart' show ReadingProgressService;
+import '../services/progress_sync_runtime.dart';
 import '../services/tts_service.dart';
 import '../main.dart' show ttsService;
 import '../theme/app_theme.dart';
 import '../utils/user_content_guard.dart';
 import '../widgets/user_content_notice_dialog.dart';
 import '../widgets/reading_identity.dart';
+import '../utils/reader_pagination.dart';
 
 class ReaderScreen extends StatefulWidget {
   final String bookId;
@@ -43,6 +48,7 @@ class _ReaderScreenState extends State<ReaderScreen>
   final ItemScrollController _scrollCtrl = ItemScrollController();
   final ItemPositionsListener _positionsListener =
       ItemPositionsListener.create();
+  final PageController _pageController = PageController();
 
   static final _illustPattern = RegExp(r'^\[illustration:(.+)\]$');
 
@@ -67,10 +73,13 @@ class _ReaderScreenState extends State<ReaderScreen>
   bool _ttsScrollRetryScheduled = false;
   int _ttsScrollRetryAttempts = 0;
   Timer? _readingHeartbeatTimer;
+  Timer? _shelfSyncTimer;
   DateTime _lastInteraction = DateTime.now();
   bool _readerForeground = true;
   int _chapterLoadGeneration = 0;
   bool _chapterNavigationPending = false;
+  ReaderViewMode _viewMode = ReaderViewMode.scroll;
+  final Map<int, int> _ttsPageByParagraph = {};
 
   final List<Color> _bgColors = [
     const Color(0xFFF5F1E8),
@@ -108,7 +117,11 @@ class _ReaderScreenState extends State<ReaderScreen>
   }
 
   void _updateReadProgress() {
-    if (_loading || _chapterNavigationPending) return;
+    if (_loading ||
+        _chapterNavigationPending ||
+        _viewMode != ReaderViewMode.scroll) {
+      return;
+    }
     final positions = _positionsListener.itemPositions.value;
     if (positions.isEmpty || _items.isEmpty) return;
     final maxIndex = positions
@@ -119,7 +132,7 @@ class _ReaderScreenState extends State<ReaderScreen>
     if ((_readProgress - progress).abs() > 0.005) {
       _markInteraction();
       setState(() => _readProgress = progress);
-      _progress.save(widget.bookId, _currentChapterId, progress);
+      _recordReadingProgress(progress);
     }
   }
 
@@ -145,12 +158,84 @@ class _ReaderScreenState extends State<ReaderScreen>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _readerForeground = state == AppLifecycleState.resumed;
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      unawaited(_syncShelfCheckpoint());
+    }
+  }
+
+  void _recordReadingProgress(
+    double progress, {
+    Chapter? chapter,
+    bool syncImmediately = false,
+  }) {
+    final book = widget.book;
+    final activeChapter = chapter ?? _chapter;
+    if (book == null || activeChapter == null) return;
+    final safeProgress = progress.clamp(0.0, 1.0).toDouble();
+    _progress.save(widget.bookId, activeChapter.id, safeProgress);
+    _storage.recordRead(
+      book,
+      activeChapter.id,
+      activeChapter.displayTitle,
+      chapterPosition: activeChapter.position > 0
+          ? activeChapter.position
+          : _currentChapterIdx + 1,
+      chapterCount: widget.chapters.length,
+      chapterProgress: safeProgress,
+    );
+    _shelfSyncTimer?.cancel();
+    if (!AccountService.instance.isSignedIn) return;
+    if (syncImmediately) {
+      unawaited(_syncShelfCheckpoint());
+    } else {
+      _shelfSyncTimer = Timer(
+        const Duration(seconds: 6),
+        () => unawaited(_syncShelfCheckpoint()),
+      );
+    }
+  }
+
+  Future<void> _syncShelfCheckpoint() async {
+    _shelfSyncTimer?.cancel();
+    if (!AccountService.instance.isSignedIn || widget.book == null) return;
+    try {
+      final matches = _storage.getHistory().where(
+        (entry) => entry.book.id == widget.bookId,
+      );
+      if (matches.isEmpty) return;
+      final checkpoint = matches.first;
+      await AccountService.instance.syncReadingEntry(checkpoint);
+      await ProgressSyncRuntime.instance.record(
+        bookId: widget.bookId,
+        chapterId: checkpoint.lastChapterId,
+        percentage: checkpoint.chapterProgress,
+      );
+      await ProgressSyncRuntime.instance.synchronize();
+    } catch (_) {
+      // Local shelf state stays authoritative until connectivity returns.
+    }
   }
 
   Future<void> _loadSettings() async {
     await _progress.init();
     await _storage.init();
+    final preferences = _storage.getReaderPreferences();
+    _viewMode = preferences.viewMode;
+    _fontSize = preferences.fontSize;
+    _lineHeight = preferences.lineHeight;
+    _bgIndex = preferences.backgroundIndex.clamp(0, _bgColors.length - 1);
+    _darkMode = _bgIndex == _bgColors.length - 1;
   }
+
+  Future<void> _persistReaderSettings() => _storage.saveReaderPreferences(
+    ReaderPreferences(
+      viewMode: _viewMode,
+      fontSize: _fontSize,
+      lineHeight: _lineHeight,
+      backgroundIndex: _bgIndex,
+    ),
+  );
 
   Future<void> _initializeReader() async {
     await _loadSettings();
@@ -205,6 +290,10 @@ class _ReaderScreenState extends State<ReaderScreen>
       if (mounted &&
           loadGeneration == _chapterLoadGeneration &&
           loadChapterId == _currentChapterId) {
+        final saved = _progress.get(widget.bookId);
+        final startingProgress = saved?.chapterId == loadChapterId
+            ? saved!.within.clamp(0.0, 1.0).toDouble()
+            : 0.0;
         setState(() {
           _chapter = ch;
           _items = items;
@@ -213,8 +302,13 @@ class _ReaderScreenState extends State<ReaderScreen>
           _loading = false;
           _chapterNavigationPending = false;
           _ttsHighlight = -1;
-          _readProgress = 0.0;
+          _readProgress = startingProgress;
         });
+        if (_viewMode != ReaderViewMode.scroll) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (_pageController.hasClients) _pageController.jumpToPage(0);
+          });
+        }
         final shouldContinueTts = _ttsContinueOnLoad;
         _ttsContinueOnLoad = false;
         if (shouldContinueTts) {
@@ -229,13 +323,11 @@ class _ReaderScreenState extends State<ReaderScreen>
           });
           _scrollToTtsParagraph(_tts.currentParagraphIndex);
         }
-        _progress.save(widget.bookId, loadChapterId, 0.0);
-        if (widget.book != null) {
-          _storage.recordRead(widget.book!, loadChapterId, ch.displayTitle);
-          if (AccountService.instance.isSignedIn) {
-            await AccountService.instance.mergeLocalState(_storage);
-          }
-        }
+        _recordReadingProgress(
+          startingProgress,
+          chapter: ch,
+          syncImmediately: true,
+        );
       }
     } catch (_) {
       if (mounted && loadGeneration == _chapterLoadGeneration) {
@@ -261,6 +353,7 @@ class _ReaderScreenState extends State<ReaderScreen>
     if (_loading || _chapterNavigationPending) return;
     final nextIndex = _currentChapterIdx + offset;
     if (nextIndex < 0 || nextIndex >= widget.chapters.length) return;
+    unawaited(HapticFeedback.selectionClick());
     _chapterNavigationPending = true;
     _ttsContinueOnLoad = continueTts;
     _tts.stop();
@@ -333,6 +426,19 @@ class _ReaderScreenState extends State<ReaderScreen>
     if (!mounted || _tts.currentChapterId != _currentChapterId) {
       _pendingTtsScrollParagraph = null;
       _ttsScrollRetryAttempts = 0;
+      return;
+    }
+    if (_viewMode != ReaderViewMode.scroll) {
+      final targetPage = _ttsPageByParagraph[idx];
+      if (targetPage != null && _pageController.hasClients) {
+        unawaited(
+          _pageController.animateToPage(
+            targetPage,
+            duration: const Duration(milliseconds: 260),
+            curve: Curves.easeOutCubic,
+          ),
+        );
+      }
       return;
     }
     final scrollIdx = _items.indexWhere((item) => item.ttsIndex == idx);
@@ -556,9 +662,78 @@ class _ReaderScreenState extends State<ReaderScreen>
                 ),
               ],
             ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: _ParagraphActionButton(
+                    icon: Icons.highlight_rounded,
+                    label: '本地高亮',
+                    subtitle: '断网仍可查看',
+                    onTap: () {
+                      _storage.addAnnotation(
+                        bookId: widget.bookId,
+                        type: 'highlight',
+                        excerpt: item.text ?? '',
+                        progress: _readProgress,
+                      );
+                      Navigator.of(sheetContext).pop();
+                    },
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: _ParagraphActionButton(
+                    icon: Icons.edit_note_rounded,
+                    label: '阅读笔记',
+                    subtitle: '记录这一段',
+                    onTap: () {
+                      Navigator.of(sheetContext).pop();
+                      unawaited(_promptParagraphNote(item));
+                    },
+                  ),
+                ),
+              ],
+            ),
           ],
         ),
       ),
+    );
+  }
+
+  Future<void> _promptParagraphNote(_ReaderItem item) async {
+    final controller = TextEditingController();
+    final note = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('添加阅读笔记'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          minLines: 3,
+          maxLines: 8,
+          decoration: const InputDecoration(hintText: '记录你的想法'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, controller.text.trim()),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (note == null || note.isEmpty) return;
+    _storage.addAnnotation(
+      bookId: widget.bookId,
+      type: 'note',
+      excerpt: item.text ?? '',
+      note: note,
+      progress: _readProgress,
     );
   }
 
@@ -609,6 +784,35 @@ class _ReaderScreenState extends State<ReaderScreen>
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
+              SegmentedButton<ReaderViewMode>(
+                segments: ReaderViewMode.values
+                    .map(
+                      (mode) => ButtonSegment(
+                        value: mode,
+                        label: Text(switch (mode) {
+                          ReaderViewMode.scroll => '滚动',
+                          ReaderViewMode.page => '单页',
+                          ReaderViewMode.spread => '双页',
+                        }),
+                        icon: Icon(switch (mode) {
+                          ReaderViewMode.scroll => Icons.swap_vert_rounded,
+                          ReaderViewMode.page => Icons.crop_portrait_rounded,
+                          ReaderViewMode.spread => Icons.menu_book_rounded,
+                        }),
+                      ),
+                    )
+                    .toList(),
+                selected: {_viewMode},
+                onSelectionChanged: (selection) {
+                  setSheetState(() => _viewMode = selection.first);
+                  setState(() {
+                    _viewMode = selection.first;
+                    _readProgress = 0;
+                  });
+                  unawaited(_persistReaderSettings());
+                },
+              ),
+              const SizedBox(height: 12),
               Row(
                 children: [
                   const Text('字号'),
@@ -622,6 +826,7 @@ class _ReaderScreenState extends State<ReaderScreen>
                       onChanged: (v) {
                         setSheetState(() => _fontSize = v);
                         setState(() {});
+                        unawaited(_persistReaderSettings());
                       },
                     ),
                   ),
@@ -641,6 +846,7 @@ class _ReaderScreenState extends State<ReaderScreen>
                       onChanged: (v) {
                         setSheetState(() => _lineHeight = v);
                         setState(() {});
+                        unawaited(_persistReaderSettings());
                       },
                     ),
                   ),
@@ -660,6 +866,7 @@ class _ReaderScreenState extends State<ReaderScreen>
                         onTap: () {
                           setSheetState(() => _bgIndex = i);
                           setState(() => _darkMode = i == _bgColors.length - 1);
+                          unawaited(_persistReaderSettings());
                         },
                         child: Container(
                           width: 36,
@@ -720,156 +927,22 @@ class _ReaderScreenState extends State<ReaderScreen>
       body: GestureDetector(
         onTapDown: (_) => _markInteraction(),
         onTap: _toggleControls,
-        onHorizontalDragStart: (_) => _markInteraction(),
-        onHorizontalDragEnd: (details) {
-          if (details.primaryVelocity == null) return;
-          if (details.primaryVelocity! < -300) _nextChapter();
-          if (details.primaryVelocity! > 300) _prevChapter();
-        },
+        onHorizontalDragStart: _viewMode == ReaderViewMode.scroll
+            ? (_) => _markInteraction()
+            : null,
+        onHorizontalDragEnd: _viewMode == ReaderViewMode.scroll
+            ? (details) {
+                if (details.primaryVelocity == null) return;
+                if (details.primaryVelocity! < -300) _nextChapter();
+                if (details.primaryVelocity! > 300) _prevChapter();
+              }
+            : null,
         child: Stack(
           children: [
             if (_loading)
               const Center(child: CircularProgressIndicator())
             else ...[
-              ScrollablePositionedList.builder(
-                itemScrollController: _scrollCtrl,
-                itemPositionsListener: _positionsListener,
-                itemCount: _items.length + 2,
-                itemBuilder: (context, index) {
-                  if (index == 0) {
-                    return Padding(
-                      padding: const EdgeInsets.fromLTRB(24, 80, 24, 24),
-                      child: Text(
-                        _chapter?.displayTitle ?? '',
-                        style: TextStyle(
-                          fontSize: _fontSize + 4,
-                          fontWeight: FontWeight.bold,
-                          color: textColor,
-                          height: 1.4,
-                        ),
-                      ),
-                    );
-                  }
-                  if (index == _items.length + 1) {
-                    return _buildChapterNav(textColor);
-                  }
-                  final item = _items[index - 1];
-                  if (item.isIllustration) {
-                    return Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 8,
-                      ),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(8),
-                        child: Image.network(
-                          _api.illustrationUrl(widget.bookId, item.illustPath!),
-                          fit: BoxFit.contain,
-                          loadingBuilder: (_, child, progress) {
-                            if (progress == null) return child;
-                            return Container(
-                              height: 200,
-                              alignment: Alignment.center,
-                              child: CircularProgressIndicator(
-                                value: progress.expectedTotalBytes != null
-                                    ? progress.cumulativeBytesLoaded /
-                                          progress.expectedTotalBytes!
-                                    : null,
-                                strokeWidth: 2,
-                              ),
-                            );
-                          },
-                          errorBuilder: (_, __, ___) => const SizedBox.shrink(),
-                        ),
-                      ),
-                    );
-                  }
-                  final isHighlighted =
-                      item.ttsIndex >= 0 && item.ttsIndex == _ttsHighlight;
-                  final commentCount =
-                      (_paragraphThreads[item.ttsIndex]?['count'] as num?)
-                          ?.toInt() ??
-                      0;
-                  return Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 24,
-                      vertical: 2,
-                    ),
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onLongPress: () => _showParagraphActions(item),
-                      child: Container(
-                        decoration: isHighlighted
-                            ? BoxDecoration(
-                                color: Theme.of(context)
-                                    .colorScheme
-                                    .primaryContainer
-                                    .withValues(alpha: 0.3),
-                                borderRadius: BorderRadius.circular(4),
-                              )
-                            : null,
-                        padding: const EdgeInsets.symmetric(vertical: 2),
-                        child: Text.rich(
-                          TextSpan(
-                            children: [
-                              TextSpan(
-                                text: item.text!.startsWith('　')
-                                    ? item.text!
-                                    : '　　${item.text!}',
-                              ),
-                              if (commentCount > 0)
-                                WidgetSpan(
-                                  alignment: PlaceholderAlignment.middle,
-                                  child: Padding(
-                                    padding: const EdgeInsets.only(left: 7),
-                                    child: InkWell(
-                                      borderRadius: BorderRadius.circular(20),
-                                      onTap: () => _openInterline(item),
-                                      child: Container(
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 7,
-                                          vertical: 2,
-                                        ),
-                                        decoration: BoxDecoration(
-                                          color: AppTheme.seedPurple.withValues(
-                                            alpha: .10,
-                                          ),
-                                          borderRadius: BorderRadius.circular(
-                                            20,
-                                          ),
-                                          border: Border.all(
-                                            color: AppTheme.seedPurple
-                                                .withValues(alpha: .24),
-                                          ),
-                                        ),
-                                        child: Text(
-                                          '🫧 $commentCount',
-                                          style: TextStyle(
-                                            color: _darkMode
-                                                ? Colors.white70
-                                                : AppTheme.seedPurple,
-                                            fontSize: 11,
-                                            height: 1.35,
-                                            fontWeight: FontWeight.w700,
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                            ],
-                          ),
-                          style: TextStyle(
-                            fontSize: _fontSize,
-                            height: _lineHeight,
-                            color: textColor,
-                          ),
-                        ),
-                      ),
-                    ),
-                  );
-                },
-              ),
+              _buildReaderBody(textColor),
             ],
             Positioned(
               top: 0,
@@ -892,58 +965,335 @@ class _ReaderScreenState extends State<ReaderScreen>
     );
   }
 
+  Widget _buildReaderBody(Color textColor) {
+    if (_viewMode == ReaderViewMode.scroll) {
+      return Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(
+            maxWidth: AppTheme.readerContentMaxWidth,
+          ),
+          child: ScrollablePositionedList.builder(
+            itemScrollController: _scrollCtrl,
+            itemPositionsListener: _positionsListener,
+            itemCount: _items.length + 2,
+            itemBuilder: (context, index) {
+              if (index == 0) return _buildChapterHeading(textColor);
+              if (index == _items.length + 1) {
+                return _buildChapterNav(textColor);
+              }
+              return _buildReaderItem(_items[index - 1], textColor);
+            },
+          ),
+        ),
+      );
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final spread =
+            _viewMode == ReaderViewMode.spread && constraints.maxWidth >= 720;
+        final pageWidth = spread
+            ? constraints.maxWidth / 2
+            : constraints.maxWidth;
+        final target = ReaderPagination.estimatedCharactersPerPage(
+          width: pageWidth,
+          height: constraints.maxHeight,
+          fontSize: _fontSize,
+          lineHeight: _lineHeight,
+        );
+        final pages = _paginateReaderItems(target);
+        final pageViewCount = spread ? (pages.length / 2).ceil() : pages.length;
+        _ttsPageByParagraph.clear();
+        for (var pageIndex = 0; pageIndex < pages.length; pageIndex++) {
+          final targetPage = spread ? pageIndex ~/ 2 : pageIndex;
+          for (final item in pages[pageIndex]) {
+            if (item.ttsIndex >= 0) {
+              _ttsPageByParagraph[item.ttsIndex] = targetPage;
+            }
+          }
+        }
+        return PageView.builder(
+          controller: _pageController,
+          itemCount: pageViewCount,
+          onPageChanged: (index) {
+            final progress = pageViewCount <= 1
+                ? 1.0
+                : (index / (pageViewCount - 1)).clamp(0, 1).toDouble();
+            setState(() => _readProgress = progress);
+            _recordReadingProgress(progress);
+          },
+          itemBuilder: (context, index) {
+            if (!spread) {
+              return _buildReaderPage(
+                pages[index],
+                textColor,
+                pageNumber: index + 1,
+                totalPages: pages.length,
+                showHeading: index == 0,
+                showNavigation: index == pages.length - 1,
+              );
+            }
+            final left = index * 2;
+            return Row(
+              children: [
+                Expanded(
+                  child: _buildReaderPage(
+                    pages[left],
+                    textColor,
+                    pageNumber: left + 1,
+                    totalPages: pages.length,
+                    showHeading: left == 0,
+                    showNavigation: left == pages.length - 1,
+                  ),
+                ),
+                Container(
+                  width: 1,
+                  margin: const EdgeInsets.symmetric(vertical: 84),
+                  color: textColor.withValues(alpha: .08),
+                ),
+                Expanded(
+                  child: left + 1 < pages.length
+                      ? _buildReaderPage(
+                          pages[left + 1],
+                          textColor,
+                          pageNumber: left + 2,
+                          totalPages: pages.length,
+                          showHeading: false,
+                          showNavigation: left + 1 == pages.length - 1,
+                        )
+                      : const SizedBox.shrink(),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  List<List<_ReaderItem>> _paginateReaderItems(int targetCharacters) {
+    final pages = <List<_ReaderItem>>[];
+    var current = <_ReaderItem>[];
+    var length = 0;
+    for (final item in _items) {
+      final weight = item.isIllustration
+          ? targetCharacters
+          : (item.text?.length ?? 0) + 8;
+      if (current.isNotEmpty && length + weight > targetCharacters) {
+        pages.add(current);
+        current = <_ReaderItem>[];
+        length = 0;
+      }
+      current.add(item);
+      length += weight;
+    }
+    if (current.isNotEmpty) pages.add(current);
+    return pages.isEmpty ? [<_ReaderItem>[]] : pages;
+  }
+
+  Widget _buildReaderPage(
+    List<_ReaderItem> items,
+    Color textColor, {
+    required int pageNumber,
+    required int totalPages,
+    required bool showHeading,
+    required bool showNavigation,
+  }) => Padding(
+    padding: const EdgeInsets.fromLTRB(12, 72, 12, 58),
+    child: Column(
+      children: [
+        Expanded(
+          child: ListView(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
+            children: [
+              if (showHeading) _buildChapterHeading(textColor, paged: true),
+              ...items.map((item) => _buildReaderItem(item, textColor)),
+              if (showNavigation) _buildChapterNav(textColor),
+            ],
+          ),
+        ),
+        Text(
+          '$pageNumber / $totalPages',
+          style: TextStyle(
+            color: textColor.withValues(alpha: .42),
+            fontSize: 11,
+          ),
+        ),
+      ],
+    ),
+  );
+
+  Widget _buildChapterHeading(Color textColor, {bool paged = false}) => Padding(
+    padding: EdgeInsets.fromLTRB(24, paged ? 12 : 80, 24, 24),
+    child: Text(
+      _chapter?.displayTitle ?? '',
+      style: TextStyle(
+        fontSize: _fontSize + 4,
+        fontWeight: FontWeight.bold,
+        color: textColor,
+        height: 1.4,
+      ),
+    ),
+  );
+
+  Widget _buildReaderItem(_ReaderItem item, Color textColor) {
+    if (item.isIllustration) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: Image.network(
+            _api.illustrationUrl(widget.bookId, item.illustPath!),
+            fit: BoxFit.contain,
+            loadingBuilder: (_, child, progress) {
+              if (progress == null) return child;
+              return Container(
+                height: 200,
+                alignment: Alignment.center,
+                child: CircularProgressIndicator(
+                  value: progress.expectedTotalBytes != null
+                      ? progress.cumulativeBytesLoaded /
+                            progress.expectedTotalBytes!
+                      : null,
+                  strokeWidth: 2,
+                ),
+              );
+            },
+            errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+          ),
+        ),
+      );
+    }
+    final isHighlighted = item.ttsIndex >= 0 && item.ttsIndex == _ttsHighlight;
+    final commentCount =
+        (_paragraphThreads[item.ttsIndex]?['count'] as num?)?.toInt() ?? 0;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 2),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onLongPress: () => _showParagraphActions(item),
+        child: Container(
+          decoration: isHighlighted
+              ? BoxDecoration(
+                  color: Theme.of(
+                    context,
+                  ).colorScheme.primaryContainer.withValues(alpha: 0.3),
+                  borderRadius: BorderRadius.circular(4),
+                )
+              : null,
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: Text.rich(
+            TextSpan(
+              children: [
+                TextSpan(
+                  text: item.text!.startsWith('　')
+                      ? item.text!
+                      : '　　${item.text!}',
+                ),
+                if (commentCount > 0)
+                  WidgetSpan(
+                    alignment: PlaceholderAlignment.middle,
+                    child: Padding(
+                      padding: const EdgeInsets.only(left: 7),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(20),
+                        onTap: () => _openInterline(item),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 7,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: AppTheme.seedPurple.withValues(alpha: .10),
+                            borderRadius: BorderRadius.circular(20),
+                            border: Border.all(
+                              color: AppTheme.seedPurple.withValues(alpha: .24),
+                            ),
+                          ),
+                          child: Text(
+                            '🫧 $commentCount',
+                            style: TextStyle(
+                              color: _darkMode
+                                  ? Colors.white70
+                                  : AppTheme.seedPurple,
+                              fontSize: 11,
+                              height: 1.35,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            style: TextStyle(
+              fontSize: _fontSize,
+              height: _lineHeight,
+              color: textColor,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildTopBar() {
     return Positioned(
       top: 0,
       left: 0,
       right: 0,
-      child: Container(
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [Colors.black.withValues(alpha: 0.6), Colors.transparent],
-          ),
-        ),
-        child: SafeArea(
-          bottom: false,
-          child: Row(
-            children: [
-              IconButton(
-                icon: const Icon(Icons.arrow_back, color: Colors.white),
-                onPressed: () => Navigator.of(context).pop(),
-              ),
-              Expanded(
-                child: Text(
-                  _chapter?.displayTitle ?? '',
-                  style: const TextStyle(color: Colors.white, fontSize: 16),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-              if (_readProgress > 0)
-                Padding(
-                  padding: const EdgeInsets.only(right: 12),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 3,
-                    ),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: 0.15),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Text(
-                      '${(_readProgress * 100).round()}%',
-                      style: TextStyle(
-                        color: Colors.white.withValues(alpha: 0.8),
-                        fontSize: 12,
-                        fontWeight: FontWeight.w500,
+      child: ClipRect(
+        child: BackdropFilter(
+          filter: ui.ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+          child: ColoredBox(
+            color: const Color(0xFF081225).withValues(alpha: .78),
+            child: SafeArea(
+              bottom: false,
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 860),
+                  child: Row(
+                    children: [
+                      IconButton(
+                        tooltip: '返回',
+                        icon: Icon(
+                          !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS
+                              ? Icons.arrow_back_ios_new_rounded
+                              : Icons.arrow_back_rounded,
+                          color: Colors.white,
+                        ),
+                        onPressed: () => Navigator.of(context).pop(),
                       ),
-                    ),
+                      Expanded(
+                        child: Text(
+                          _chapter?.displayTitle ?? '',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      if (_readProgress > 0)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 16),
+                          child: Text(
+                            '${(_readProgress * 100).round()}%',
+                            style: TextStyle(
+                              color: Colors.white.withValues(alpha: .72),
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                    ],
                   ),
                 ),
-            ],
+              ),
+            ),
           ),
         ),
       ),
@@ -955,55 +1305,92 @@ class _ReaderScreenState extends State<ReaderScreen>
       bottom: 0,
       left: 0,
       right: 0,
-      child: Container(
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.bottomCenter,
-            end: Alignment.topCenter,
-            colors: [Colors.black.withValues(alpha: 0.6), Colors.transparent],
-          ),
-        ),
-        child: SafeArea(
-          top: false,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceAround,
-              children: [
-                IconButton(
-                  icon: const Icon(Icons.skip_previous, color: Colors.white),
-                  onPressed:
-                      !_loading &&
-                          !_chapterNavigationPending &&
-                          _currentChapterIdx > 0
-                      ? _prevChapter
-                      : null,
-                ),
-                IconButton(
-                  icon: const Icon(Icons.list, color: Colors.white),
-                  onPressed: _showCatalog,
-                ),
-                IconButton(
-                  icon: Icon(
-                    _ttsPlaying ? Icons.stop : Icons.headphones,
-                    color: Colors.white,
+      child: SafeArea(
+        top: false,
+        minimum: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 680),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(22),
+              child: BackdropFilter(
+                filter: ui.ImageFilter.blur(sigmaX: 22, sigmaY: 22),
+                child: Container(
+                  height: 62,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF081225).withValues(alpha: .84),
+                    borderRadius: BorderRadius.circular(22),
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: .12),
+                    ),
                   ),
-                  onPressed: _ttsParagraphs.isNotEmpty ? _toggleTts : null,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceAround,
+                    children: [
+                      IconButton(
+                        tooltip: '上一章',
+                        icon: const Icon(
+                          Icons.skip_previous_rounded,
+                          color: Colors.white,
+                        ),
+                        onPressed:
+                            !_loading &&
+                                !_chapterNavigationPending &&
+                                _currentChapterIdx > 0
+                            ? _prevChapter
+                            : null,
+                      ),
+                      IconButton(
+                        tooltip: '目录',
+                        icon: const Icon(
+                          Icons.format_list_bulleted_rounded,
+                          color: Colors.white,
+                        ),
+                        onPressed: _showCatalog,
+                      ),
+                      FilledButton.tonalIcon(
+                        onPressed: _ttsParagraphs.isNotEmpty
+                            ? _toggleTts
+                            : null,
+                        style: FilledButton.styleFrom(
+                          minimumSize: const Size(92, 44),
+                          backgroundColor: Colors.white,
+                          foregroundColor: AppTheme.brandNavy,
+                          padding: const EdgeInsets.symmetric(horizontal: 14),
+                        ),
+                        icon: Icon(
+                          _ttsPlaying
+                              ? Icons.stop_rounded
+                              : Icons.headphones_rounded,
+                          size: 20,
+                        ),
+                        label: Text(_ttsPlaying ? '停止' : '听书'),
+                      ),
+                      IconButton(
+                        tooltip: '阅读设置',
+                        icon: const Icon(
+                          Icons.text_fields_rounded,
+                          color: Colors.white,
+                        ),
+                        onPressed: _showSettingsSheet,
+                      ),
+                      IconButton(
+                        tooltip: '下一章',
+                        icon: const Icon(
+                          Icons.skip_next_rounded,
+                          color: Colors.white,
+                        ),
+                        onPressed:
+                            !_loading &&
+                                !_chapterNavigationPending &&
+                                _currentChapterIdx < widget.chapters.length - 1
+                            ? _nextChapter
+                            : null,
+                      ),
+                    ],
+                  ),
                 ),
-                IconButton(
-                  icon: const Icon(Icons.settings, color: Colors.white),
-                  onPressed: _showSettingsSheet,
-                ),
-                IconButton(
-                  icon: const Icon(Icons.skip_next, color: Colors.white),
-                  onPressed:
-                      !_loading &&
-                          !_chapterNavigationPending &&
-                          _currentChapterIdx < widget.chapters.length - 1
-                      ? _nextChapter
-                      : null,
-                ),
-              ],
+              ),
             ),
           ),
         ),
@@ -1096,6 +1483,8 @@ class _ReaderScreenState extends State<ReaderScreen>
   @override
   void dispose() {
     _readingHeartbeatTimer?.cancel();
+    _shelfSyncTimer?.cancel();
+    unawaited(_syncShelfCheckpoint());
     WidgetsBinding.instance.removeObserver(this);
     _positionsListener.itemPositions.removeListener(_updateReadProgress);
     _tts.dispose();

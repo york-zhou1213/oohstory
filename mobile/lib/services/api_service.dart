@@ -1,37 +1,27 @@
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
-import 'package:http/io_client.dart' as io_client;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/book.dart';
+import 'http_client_factory.dart';
 
-const _appUserAgent = 'OOHStoryApp/1.18 (Flutter; official)';
+const _appUserAgent = 'OOHStoryApp/1.27.0 (Flutter; official)';
 
-class _OOHClient extends http.BaseClient {
+class OohHttpClient extends http.BaseClient {
   late final http.Client _inner;
 
-  _OOHClient() {
-    final httpClient = HttpClient()
-      ..badCertificateCallback = _rejectBadCert
-      ..connectionTimeout = const Duration(seconds: 15)
-      ..idleTimeout = const Duration(seconds: 30);
-    _inner = io_client.IOClient(httpClient);
-  }
-
-  static bool _rejectBadCert(X509Certificate cert, String host, int port) {
-    return false;
-  }
+  OohHttpClient() : _inner = createOohHttpClient();
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) {
-    final host = request.url.host.toLowerCase();
-    final isLocalDevelopment =
-        host == 'localhost' || host == '127.0.0.1' || host == '10.0.2.2';
-    if (!isLocalDevelopment && request.url.scheme != 'https') {
+    if (request.url.host.endsWith('oohstory.com') &&
+        request.url.scheme != 'https') {
       throw ApiException('不安全的连接已被阻止', 0);
     }
-    request.headers.putIfAbsent('User-Agent', () => _appUserAgent);
+    if (!kIsWeb) {
+      request.headers.putIfAbsent('User-Agent', () => _appUserAgent);
+    }
     return _inner.send(request);
   }
 
@@ -40,15 +30,9 @@ class _OOHClient extends http.BaseClient {
 }
 
 class ApiService {
-  static const String _configuredBaseUrl = String.fromEnvironment(
-    'OOHSTORY_API_BASE_URL',
-    defaultValue: 'http://127.0.0.1:8091',
-  );
-  static String get baseUrl => _configuredBaseUrl.endsWith('/')
-      ? _configuredBaseUrl.substring(0, _configuredBaseUrl.length - 1)
-      : _configuredBaseUrl;
+  static const String baseUrl = 'https://oohstory.com';
 
-  final http.Client _client = _OOHClient();
+  final http.Client _client = OohHttpClient();
 
   Future<Map<String, dynamic>> _getJson(String path) async {
     final response = await _client.get(Uri.parse('$baseUrl$path'));
@@ -176,9 +160,17 @@ class ApiService {
   }
 
   String fullCoverUrl(String? relativePath) {
-    if (relativePath == null || relativePath.isEmpty) return '';
-    if (relativePath.startsWith('http')) return relativePath;
-    return '$baseUrl$relativePath';
+    final source = relativePath?.trim() ?? '';
+    if (source.isEmpty) return '';
+    final base = Uri.parse(baseUrl);
+    final parsed = Uri.tryParse(source);
+    if (parsed == null) return '';
+    final resolved = parsed.hasScheme ? parsed : base.resolveUri(parsed);
+    if (resolved.scheme != 'https') return '';
+    if (resolved.host == 'www.oohstory.com') {
+      return resolved.replace(host: base.host).toString();
+    }
+    return resolved.toString();
   }
 
   Future<List<Deconstruction>> getDeconstructions() async {

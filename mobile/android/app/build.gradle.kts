@@ -1,17 +1,8 @@
-import java.io.FileInputStream
-import java.util.Properties
-
 plugins {
     id("com.android.application")
     id("kotlin-android")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
-}
-
-val keystoreProperties = Properties()
-val keystorePropertiesFile = rootProject.file("key.properties")
-if (keystorePropertiesFile.exists()) {
-    FileInputStream(keystorePropertiesFile).use(keystoreProperties::load)
 }
 
 android {
@@ -39,22 +30,9 @@ android {
         versionName = flutter.versionName
     }
 
-    signingConfigs {
-        if (keystorePropertiesFile.exists()) {
-            create("release") {
-                keyAlias = keystoreProperties.getProperty("keyAlias")
-                keyPassword = keystoreProperties.getProperty("keyPassword")
-                storeFile = file(keystoreProperties.getProperty("storeFile"))
-                storePassword = keystoreProperties.getProperty("storePassword")
-            }
-        }
-    }
-
     buildTypes {
         release {
-            if (keystorePropertiesFile.exists()) {
-                signingConfig = signingConfigs.getByName("release")
-            }
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
@@ -62,7 +40,10 @@ android {
         val variant = this
         variant.outputs.all {
             val output = this as com.android.build.gradle.internal.api.BaseVariantOutputImpl
-            output.outputFileName = "OohStory-v${variant.versionName}.apk"
+            val abi = output.getFilter(com.android.build.OutputFile.ABI)
+            val abiSuffix = abi?.let { "-$it" }.orEmpty()
+            output.outputFileName =
+                "OOHStory-v${variant.versionName}+${variant.versionCode}$abiSuffix.apk"
         }
     }
 }

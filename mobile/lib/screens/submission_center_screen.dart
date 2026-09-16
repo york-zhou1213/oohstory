@@ -223,11 +223,7 @@ class _SubmissionCenterScreenState extends State<SubmissionCenterScreen> {
   Widget _hero() => Container(
     padding: const EdgeInsets.all(20),
     decoration: BoxDecoration(
-      gradient: const LinearGradient(
-        colors: [Color(0xFF282640), Color(0xFF514E83), Color(0xFF6C5CE7)],
-        begin: Alignment.topLeft,
-        end: Alignment.bottomRight,
-      ),
+      gradient: AppTheme.heroGradient,
       borderRadius: BorderRadius.circular(22),
     ),
     child: Column(
