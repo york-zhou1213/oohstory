@@ -22,10 +22,11 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: "3.32.4"
           cache: true
       - name: Resolve dependencies
         working-directory: mobile
-        run: flutter pub get
+        run: flutter pub get --enforce-lockfile
       - name: Build Windows release
         working-directory: mobile
         run: flutter build windows --release
@@ -54,12 +55,13 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: "3.32.4"
           cache: true
       - name: Verify universal device family
         run: grep -Fq 'TARGETED_DEVICE_FAMILY = "1,2";' mobile/ios/Runner.xcodeproj/project.pbxproj
       - name: Resolve dependencies
         working-directory: mobile
-        run: flutter pub get
+        run: flutter pub get --enforce-lockfile
       - name: Build unsigned iOS and iPadOS release
         working-directory: mobile
         run: flutter build ios --release --no-codesign
