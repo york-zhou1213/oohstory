@@ -8,7 +8,7 @@
 ## Verification
 
 - `flutter analyze`: 0 issues.
-- Full Flutter suite: 276 passed, 1 explicitly skipped live-Joplin acceptance.
+- Final GitHub Flutter suite: 277 passed, 1 explicitly skipped live-Joplin acceptance.
 - Linux x64 Release build: passed.
 - Linux Debian package metadata, ownership/mode and contents: passed.
 - Android split Release APK and AAB builds: passed; `apksigner` confirms they are
