@@ -6,12 +6,12 @@ never presented as a shipped binary.
 
 | Platform | Source target | Build verification | Signed distribution |
 | --- | --- | --- | --- |
-| Android | Yes | Local and CI | Production APK |
+| Android | Yes | Local unsigned split APK + AAB | Requires a release keystore |
 | iOS / iPadOS | Yes | macOS CI, no codesign | Requires Apple signing |
 | Web | Yes | Local and CI | Existing Safari Web remains production owner |
-| Linux | Yes | Local and CI | Packaging pending |
-| Windows | Yes | Windows CI | Packaging and signing pending |
-| macOS | Yes | macOS CI | Packaging and signing pending |
+| Linux | Yes | Local Release bundle + `.deb` | Unsigned `.deb` produced |
+| Windows | Yes | Windows CI | Portable ZIP + unsigned installer produced |
+| macOS | Yes | macOS CI | Unsigned ZIP/DMG pipeline; signing still required |
 
 ## Adaptive information architecture
 
@@ -39,7 +39,11 @@ implementation and product identity.
 - WebDAV/S3 now have a gated “存储与同步” client path with verified-before-save
   configuration, secure credential separation, directory browsing, bounded local
   opening, create-only upload, ETag delete, WebDAV 207 mapping, S3 addressing
-  modes and multipart upload. Both providers remain disabled by default until
+  modes and multipart upload. Native builds now persist pending upload/delete
+  mutations in an AES-256-GCM encrypted, provider/account-partitioned queue whose
+  master key stays in system secure storage. The UI exposes pending counts and
+  explicit retry; Web deliberately falls back without persistent queuing because
+  it has no equivalent trusted local key/file boundary. Both providers remain disabled by default until
   real sandbox/platform evidence exists. Dropbox/Google Drive are still adapter
   contracts only and have no OAuth product flow.
 - Dedicated `/api/v1/sync/progress` has a gated client transport and persistent
@@ -69,5 +73,6 @@ implementation and product identity.
   persistence plus offline backup/restore are tested. Real Joplin note/tag/
   resource protocol acceptance passes; Readwise is still only an adapter
   contract.
-- Desktop installers, code signing, auto-update, and store distribution.
+- Windows and Linux packaging exists; code signing, notarization, auto-update,
+  clean-machine acceptance, and store distribution remain external release work.
 - Signed iOS / macOS artifacts and Apple release validation.
