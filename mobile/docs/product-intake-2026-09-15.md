@@ -20,9 +20,9 @@
 
 | 边界 | 规范源 | 本轮职责 |
 | --- | --- | --- |
-| Flutter 客户端 | `/root/.codespace/workspace/oohstory-app` | 本地格式、词典/OCR、云书库、同步客户端、桌面/iOS/Web 构建 |
-| Reader 服务 | `/root/.codespace/workspace/oohstory-reader` | 账户态进度同步、KOReader 兼容服务、Web 同源发布工具 |
-| Operations Admin | `/root/.codespace/workspace/oohstory-backend` | 不承载个人阅读同步；仅在发布需要运维可观测性时添加只读状态 |
+| Flutter 客户端 | `<workspace>/oohstory-app` | 本地格式、词典/OCR、云书库、同步客户端、桌面/iOS/Web 构建 |
+| Reader 服务 | `<workspace>/oohstory-reader` | 账户态进度同步、KOReader 兼容服务、Web 同源发布工具 |
+| Operations Admin | `<workspace>/oohstory-backend` | 不承载个人阅读同步；仅在发布需要运维可观测性时添加只读状态 |
 
 基线版本：Flutter 工作区 `de2ed752cbbeb2464b47f192959991a600ca4778`，Reader
 仓库 `f6f3aaa28ffc53d3558e7513a4eaf02102e85303`，Operations Admin 仓库

@@ -43,6 +43,23 @@ TEXT_RULES = {
     ),
 }
 
+# Public product identifiers and the canonical service origin are required by
+# the shipped clients. Keep their exceptions path-scoped so the same patterns
+# still fail everywhere else in the repository.
+ALLOWED_TEXT_RULE_PATHS = {
+    "Google OAuth client identifier": {
+        "mobile/lib/services/account_service.dart",
+    },
+    "production public URL": {
+        "README.md",
+        "mobile/lib/services/api_service.dart",
+        "mobile/packaging/windows/OOHStory.iss",
+        "mobile/test/app_update_contract_test.dart",
+        "mobile/test/cover_transport_contract_test.dart",
+        "mobile/test/review_blocker_regression_test.dart",
+    },
+}
+
 
 def is_ignored(path: Path) -> bool:
     return any(part in IGNORED_PARTS for part in path.relative_to(ROOT).parts)
@@ -87,14 +104,11 @@ def main() -> int:
         if b"\x00" in payload:
             continue
         for label, rule in TEXT_RULES.items():
-            inspected_payload = payload
-            if label == "production public URL" and relative.as_posix() == "README.md":
-                inspected_payload = inspected_payload.replace(
-                    b"https://www." + b"oohstory.com", b""
-                )
-            match = rule.search(inspected_payload)
+            if relative.as_posix() in ALLOWED_TEXT_RULE_PATHS.get(label, set()):
+                continue
+            match = rule.search(payload)
             if match:
-                line = inspected_payload.count(b"\n", 0, match.start()) + 1
+                line = payload.count(b"\n", 0, match.start()) + 1
                 findings.append((relative.as_posix(), line, label))
 
     if findings:

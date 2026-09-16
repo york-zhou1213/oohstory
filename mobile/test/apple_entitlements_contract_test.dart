@@ -4,6 +4,20 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   group('Apple entitlement contracts', () {
+    test('macOS deployment target satisfies current native plugins', () {
+      final project = File(
+        'macos/Runner.xcodeproj/project.pbxproj',
+      ).readAsStringSync();
+
+      expect(project, isNot(contains('MACOSX_DEPLOYMENT_TARGET = 10.14;')));
+      expect(
+        'MACOSX_DEPLOYMENT_TARGET = 10.15;'
+            .allMatches(project)
+            .length,
+        greaterThanOrEqualTo(3),
+      );
+    });
+
     for (final path in <String>[
       'macos/Runner/DebugProfile.entitlements',
       'macos/Runner/Release.entitlements',
