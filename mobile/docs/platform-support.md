@@ -6,12 +6,25 @@ never presented as a shipped binary.
 
 | Platform | Source target | Build verification | Signed distribution |
 | --- | --- | --- | --- |
-| Android | Yes | Local unsigned split APK + AAB | Requires a release keystore |
+| Android | Yes | Local unsigned split APK + AAB; CI pipeline | Requires a release keystore |
 | iOS / iPadOS | Yes | macOS CI, no codesign | Requires Apple signing |
 | Web | Yes | Local and CI | Existing Safari Web remains production owner |
-| Linux | Yes | Local Release bundle + `.deb` | Unsigned `.deb` produced |
+| Linux | Yes | Local Release bundle + `.deb` + `.rpm` + AppImage | Unsigned packages produced |
 | Windows | Yes | Windows CI | Portable ZIP + unsigned installer produced |
 | macOS | Yes | macOS CI | Unsigned ZIP/DMG pipeline; signing still required |
+
+### Linux package boundary
+
+- Current desktop artifacts target `x86_64`/`amd64` only and are built on the
+  Ubuntu 24.04 GitHub runner baseline.
+- The `.deb` is locally built and inspected on Ubuntu 24.04. The `.rpm` is
+  metadata- and dependency-verified, with a clean Fedora 40+ install/upgrade/
+  uninstall run still required before Fedora is listed as accepted.
+- The AppImage contains the dependencies selected by `linuxdeploy`; it passed
+  extraction and isolated Xvfb launch smoke tests on the build host. A clean
+  supported-distribution launch and native file-dialog test is still required.
+- No ARM Linux package, distribution signature, repository, or automatic
+  update channel is claimed.
 
 ## Adaptive information architecture
 
@@ -71,8 +84,17 @@ implementation and product identity.
   Binary resources are adapter- and fixture-verified through a provenance-bound
   multipart path; native users can add/remove local attachments, and attachment
   persistence plus offline backup/restore are tested. Real Joplin note/tag/
-  resource protocol acceptance passes; Readwise is still only an adapter
-  contract.
-- Windows and Linux packaging exists; code signing, notarization, auto-update,
-  clean-machine acceptance, and store distribution remain external release work.
+  resource protocol acceptance passes.
+- Readwise now has a separately gated native one-way export. It verifies and
+  stores the access token through system secure storage, assigns stable opaque
+  highlight URLs, recovers de-duplicated creation after ambiguous responses,
+  and protects remote edits/deletions with explicit conflict confirmation. Its
+  fixture-backed contract and UI gating are verified; it remains disabled by
+  default pending a real Readwise account acceptance run. Disconnect never
+  deletes remote highlights.
+- Windows and Linux packaging exists. Linux now produces a tarball, `.deb`,
+  `.rpm`, and linuxdeploy-collected AppImage from the same Release bundle, with
+  AppStream metadata and SHA-256 checks. Code signing, notarization,
+  clean-machine cross-distribution acceptance, auto-update, and store
+  distribution remain external release work.
 - Signed iOS / macOS artifacts and Apple release validation.

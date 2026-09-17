@@ -63,6 +63,23 @@ void main() {
     expect(find.byTooltip('导出到 Obsidian'), findsNothing);
   });
 
+  testWidgets('Readwise action is independently gated on native builds', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: OfflineNotesScreen(
+          capabilities: ProductCapabilityProfile(readwiseExportEnabled: true),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byTooltip('Readwise 导出'), findsOneWidget);
+    expect(find.byTooltip('Notion 导出'), findsNothing);
+    expect(find.byTooltip('导出到 Obsidian'), findsNothing);
+  });
+
   testWidgets('Joplin action is independently gated on desktop', (
     tester,
   ) async {

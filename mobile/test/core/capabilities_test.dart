@@ -89,6 +89,10 @@ void main() {
         registry.supports('joplin', AdapterCapability.annotationExport),
         isFalse,
       );
+      expect(
+        registry.supports('readwise', AdapterCapability.annotationExport),
+        isFalse,
+      );
     },
   );
 
@@ -101,6 +105,7 @@ void main() {
       obsidianExportEnabled: true,
       notionExportEnabled: true,
       joplinExportEnabled: true,
+      readwiseExportEnabled: true,
     );
     final registry = profile.buildRegistry(platform: 'windows');
 
@@ -122,6 +127,10 @@ void main() {
     );
     expect(
       registry.supports('joplin', AdapterCapability.annotationExport),
+      isTrue,
+    );
+    expect(
+      registry.supports('readwise', AdapterCapability.annotationExport),
       isTrue,
     );
     expect(

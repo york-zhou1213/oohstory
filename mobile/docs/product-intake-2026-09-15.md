@@ -43,8 +43,8 @@
 | WebDAV/S3/Dropbox/Drive | 四套云适配器及模拟 HTTP 测试 | 骨架 | OAuth/凭据 UI、持久离线队列、真实服务契约测试、冲突与恢复体验 |
 | 跨设备进度 | 冻结 API 契约、MySQL 仓储、独立 staging unit | 服务端骨架 | Flutter 传输/本地队列接线、账户隔离、冲突 UI、生产灰度与迁移证据 |
 | KOReader | 独立兼容服务、迁移和 staging 配置 | 服务端骨架 | 文档指纹映射、端到端设备测试、用户配置说明、正式域名与发布 |
-| Readwise/Notion/Obsidian/Joplin | Obsidian 本地导出、Notion 原生端单向导出、Joplin 桌面笔记/标签导出已接线 | 部分已接线 | Notion/Joplin 真实连接验收；Joplin 资源契约；Readwise 适配器；OAuth、撤销/删除语义 |
-| Windows/Linux/macOS | CI 可构建目标 | 构建骨架 | 安装包、签名/公证、更新通道、干净机安装与升级/降级证据 |
+| Readwise/Notion/Obsidian/Joplin | Obsidian、Notion、Readwise 原生端单向导出与 Joplin 桌面笔记/标签/资源导出已接线 | 部分已接线 | Readwise/Notion 与打包版 Joplin 真实账号/安全存储验收；OAuth、撤销/删除语义 |
+| Windows/Linux/macOS | CI 可构建目标；Windows 安装器、Linux deb/rpm/AppImage、macOS ZIP/DMG 打包已接线 | 构建与打包 | 签名/公证、更新通道、干净机安装与升级/降级证据 |
 | iOS | CI `--no-codesign` 构建 | 构建骨架 | Bundle/entitlements、签名、TestFlight、商店元数据与审核流程 |
 | Web 同源部署 | `/app/` 原子发布和回滚工具 | staging 骨架 | 与现有 Reader Web 的路由归属决策、生产构建、CSP/缓存/E2E、灰度切换 |
 

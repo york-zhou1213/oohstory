@@ -138,6 +138,19 @@ void main() {
     expect(workflow, contains('windows-2022'));
     expect(workflow, contains('flutter-version: \${{ env.FLUTTER_VERSION }}'));
     expect(workflow, contains('tool/package_linux_deb.sh'));
+    expect(workflow, contains('tool/package_linux_rpm.sh'));
+    expect(workflow, contains('tool/package_linux_appimage.sh'));
+    expect(workflow, contains('linuxdeploy-x86_64.AppImage'));
+    expect(workflow, contains('appimagetool-x86_64.AppImage'));
+    expect(workflow, contains('runtime-x86_64'));
+    expect(workflow, contains('apksigner'));
+    expect(workflow, contains(r'Android-${abi}-unsigned.apk'));
+    expect(File('tool/package_linux_rpm.sh').existsSync(), isTrue);
+    expect(File('tool/package_linux_appimage.sh').existsSync(), isTrue);
+    expect(
+      File('packaging/linux/com.oohstory.oohstory.appdata.xml').existsSync(),
+      isTrue,
+    );
     expect(workflow, contains('Inno Setup 6'));
     expect(workflow, contains('OOHStory-Linux.spdx.json'));
   });

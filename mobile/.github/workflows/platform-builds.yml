@@ -41,23 +41,57 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
       - run: sudo apt-get update -qq
-      - run: sudo apt-get install -y ninja-build clang cmake pkg-config libgtk-3-dev libsecret-1-dev
+      - run: sudo apt-get install -y ninja-build clang cmake pkg-config libgtk-3-dev libsecret-1-dev appstream imagemagick rpm
       - run: flutter pub get --enforce-lockfile
       - run: flutter build linux --release
-      - name: Package Linux bundle and deb
+      - name: Download verified Linux packaging tool
+        shell: bash
+        run: |
+          curl --fail --location --silent --show-error \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage \
+            --output "$RUNNER_TEMP/linuxdeploy-x86_64.AppImage"
+          curl --fail --location --silent --show-error \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+            --output "$RUNNER_TEMP/appimagetool-x86_64.AppImage"
+          curl --fail --location --silent --show-error \
+            https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64 \
+            --output "$RUNNER_TEMP/runtime-x86_64"
+          echo "c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d  $RUNNER_TEMP/linuxdeploy-x86_64.AppImage" \
+            | sha256sum --check --strict
+          echo "a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0  $RUNNER_TEMP/appimagetool-x86_64.AppImage" \
+            | sha256sum --check --strict
+          echo "1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf  $RUNNER_TEMP/runtime-x86_64" \
+            | sha256sum --check --strict
+          chmod 0755 "$RUNNER_TEMP/linuxdeploy-x86_64.AppImage" "$RUNNER_TEMP/appimagetool-x86_64.AppImage"
+      - name: Package Linux bundle, deb, rpm, and AppImage
         shell: bash
         run: |
           version="$(sed -n 's/^version: //p' pubspec.yaml)"
           mkdir -p artifacts
           tar -C build/linux/x64/release/bundle -czf "artifacts/OOHStory-v${version}-Linux-x64.tar.gz" .
-          chmod +x tool/package_linux_deb.sh
+          chmod +x tool/package_linux_deb.sh tool/package_linux_rpm.sh tool/package_linux_appimage.sh
           tool/package_linux_deb.sh "$version" artifacts
-          sha256sum artifacts/*.tar.gz >> artifacts/SHA256SUMS
+          tool/package_linux_rpm.sh "$version" artifacts
+          tool/package_linux_appimage.sh "$version" artifacts \
+            "$RUNNER_TEMP/linuxdeploy-x86_64.AppImage" \
+            "$RUNNER_TEMP/appimagetool-x86_64.AppImage" \
+            "$RUNNER_TEMP/runtime-x86_64"
       - uses: anchore/sbom-action@v0
         with:
           path: build/linux/x64/release/bundle
           format: spdx-json
           output-file: artifacts/OOHStory-Linux.spdx.json
+      - name: Verify Linux package metadata and checksums
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version: //p' pubspec.yaml)"
+          dpkg-deb --info "artifacts/OOHStory-v${version}-Linux-amd64.deb" >/dev/null
+          rpm -qpi "artifacts/OOHStory-v${version}-Linux-x86_64.rpm" >/dev/null
+          test -x "artifacts/OOHStory-v${version}-Linux-x86_64.AppImage"
+          find artifacts -maxdepth 1 -type f \
+            ! -name '*.sha256' ! -name SHA256SUMS -print0 \
+            | sort -z | xargs -0 sha256sum > artifacts/SHA256SUMS
+          sha256sum --check artifacts/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: oohstory-linux
@@ -145,11 +179,36 @@ jobs:
       - name: Package unsigned Android release outputs
         shell: bash
         run: |
+          set -euo pipefail
           version="$(sed -n 's/^version: //p' pubspec.yaml)"
           mkdir -p artifacts
-          cp build/app/outputs/flutter-apk/*.apk artifacts/
-          cp build/app/outputs/bundle/release/*.aab "artifacts/OOHStory-v${version}-Android-unsigned.aab"
+          android_sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -d "$android_sdk/build-tools"
+          apksigner="$(find "$android_sdk/build-tools" -type f \
+            -name apksigner -print | sort -V | tail -n 1)"
+          test -x "$apksigner"
+          for abi in armeabi-v7a arm64-v8a x86_64; do
+            mapfile -t matches < <(find build/app/outputs/flutter-apk \
+              -maxdepth 1 -type f -name "*${abi}*.apk" -print)
+            test "${#matches[@]}" -eq 1
+            apk="${matches[0]}"
+            if "$apksigner" verify "$apk" >/dev/null 2>&1; then
+              echo "release APK is unexpectedly signed: $apk" >&2
+              exit 1
+            fi
+            cp "$apk" \
+              "artifacts/OOHStory-v${version}-Android-${abi}-unsigned.apk"
+          done
+          aab="$(find build/app/outputs/bundle/release -maxdepth 1 \
+            -type f -name '*.aab' -print -quit)"
+          test -s "$aab"
+          if unzip -Z1 "$aab" | grep -Eiq '^META-INF/[^/]+\.(RSA|DSA|EC)$'; then
+            echo "release AAB is unexpectedly signed" >&2
+            exit 1
+          fi
+          cp "$aab" "artifacts/OOHStory-v${version}-Android-unsigned.aab"
           sha256sum artifacts/* > artifacts/SHA256SUMS
+          sha256sum --check artifacts/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: oohstory-android-unsigned

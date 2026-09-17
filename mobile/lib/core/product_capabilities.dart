@@ -18,6 +18,7 @@ class ProductCapabilityProfile {
     this.obsidianExportEnabled = false,
     this.notionExportEnabled = false,
     this.joplinExportEnabled = false,
+    this.readwiseExportEnabled = false,
   });
 
   static const production = ProductCapabilityProfile(
@@ -42,6 +43,9 @@ class ProductCapabilityProfile {
     ),
     notionExportEnabled: bool.fromEnvironment('OOHSTORY_NOTION_EXPORT_ENABLED'),
     joplinExportEnabled: bool.fromEnvironment('OOHSTORY_JOPLIN_EXPORT_ENABLED'),
+    readwiseExportEnabled: bool.fromEnvironment(
+      'OOHSTORY_READWISE_EXPORT_ENABLED',
+    ),
   );
 
   final bool localFormatsEnabled;
@@ -55,6 +59,7 @@ class ProductCapabilityProfile {
   final bool obsidianExportEnabled;
   final bool notionExportEnabled;
   final bool joplinExportEnabled;
+  final bool readwiseExportEnabled;
 
   bool get localContentEnabled =>
       localFormatsEnabled || localDictionaryEnabled || localOcrEnabled;
@@ -63,6 +68,15 @@ class ProductCapabilityProfile {
 
   CapabilityRegistry buildRegistry({required String platform}) {
     final registry = CapabilityRegistry();
+    registry.register(
+      ProviderCapabilities(
+        providerId: 'readwise',
+        supported: const <AdapterCapability>[
+          AdapterCapability.annotationExport,
+        ],
+      ),
+      enabled: readwiseExportEnabled,
+    );
     registry.register(
       ProviderCapabilities(
         providerId: 'kindle-drm-free',

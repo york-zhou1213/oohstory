@@ -33,6 +33,7 @@ class _OfflineNotesScreenState extends State<OfflineNotesScreen> {
   bool _exportingObsidian = false;
   bool _exportingNotion = false;
   bool _exportingJoplin = false;
+  bool _exportingReadwise = false;
   bool _hasAnnotations = false;
 
   @override
@@ -455,6 +456,185 @@ class _OfflineNotesScreenState extends State<OfflineNotesScreen> {
     return 'Notion 导出失败，请稍后重试';
   }
 
+  Future<void> _exportReadwise({bool configure = false}) async {
+    if (_exportingReadwise || kIsWeb) return;
+    final preferences = await SharedPreferences.getInstance();
+    final connection = ReadwiseConnectionRepository(
+      credentialStore: const FlutterSecureCredentialStore(),
+    );
+    final hasSavedToken = await connection.hasAccessToken();
+    if (configure || !hasSavedToken) {
+      if (!mounted) return;
+      final candidate = await _askReadwiseToken(hasSavedToken: hasSavedToken);
+      if (candidate == null || !mounted) return;
+      setState(() => _exportingReadwise = true);
+      try {
+        final token = candidate.isEmpty
+            ? await connection.requireAccessToken()
+            : validateReadwiseToken(candidate);
+        await ReadwiseApiClient(
+          transport: PackageHttpTransport(),
+          accessToken: () async => token,
+        ).verifyConnection();
+        if (candidate.isNotEmpty) await connection.saveAccessToken(candidate);
+      } on Object catch (error) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(_friendlyReadwiseError(error))));
+        return;
+      } finally {
+        if (mounted) setState(() => _exportingReadwise = false);
+      }
+    }
+    if (!_hasAnnotations || !mounted) return;
+
+    setState(() => _exportingReadwise = true);
+    try {
+      final exporter = ReadwiseAnnotationExporter(
+        api: ReadwiseApiClient(
+          transport: PackageHttpTransport(),
+          accessToken: connection.requireAccessToken,
+        ),
+        stateStore: SharedPreferencesReadwiseExportStateStore(preferences),
+      );
+      final service = ReadwiseAnnotationExportService(exporter);
+      final documents = StoredAnnotationExportSource.documentsFrom(_storage);
+      final firstPass = await service.exportDocuments(documents);
+      var receipts = [...firstPass.receipts];
+      var unresolved = firstPass.conflicts.length;
+      if (firstPass.conflicts.isNotEmpty && mounted) {
+        final overwrite = await _confirmReadwiseOverwrite(firstPass.conflicts);
+        if (overwrite == true) {
+          final conflictIds = firstPass.conflicts
+              .map((conflict) => conflict.document.id)
+              .toSet();
+          final retry = await service.exportDocuments(
+            documents.where(
+              (document) => conflictIds.contains(document.identity.id),
+            ),
+            overwriteExternalChanges: true,
+          );
+          receipts.addAll(retry.receipts);
+          unresolved = retry.conflicts.length;
+        }
+      }
+      if (!mounted) return;
+      final changed = receipts
+          .where(
+            (receipt) => receipt.disposition != ExportDisposition.unchanged,
+          )
+          .length;
+      final unchanged = receipts.length - changed;
+      final parts = <String>[
+        'Readwise 已更新 $changed 本',
+        if (unchanged > 0) '$unchanged 本无变化',
+        if (unresolved > 0) '$unresolved 本保留 Readwise 修改',
+      ];
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(parts.join('，'))));
+    } on Object catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(_friendlyReadwiseError(error))));
+    } finally {
+      if (mounted) setState(() => _exportingReadwise = false);
+    }
+  }
+
+  Future<String?> _askReadwiseToken({required bool hasSavedToken}) async {
+    final controller = TextEditingController();
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('连接 Readwise'),
+        content: TextField(
+          controller: controller,
+          obscureText: true,
+          enableSuggestions: false,
+          autocorrect: false,
+          decoration: InputDecoration(
+            labelText: 'Access token',
+            helperText: hasSavedToken
+                ? '留空则验证并保留系统安全存储中的令牌'
+                : '从 readwise.io/access_token 获取；仅保存到系统安全存储',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(controller.text.trim()),
+            child: const Text('验证并导出'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    return result;
+  }
+
+  Future<bool?> _confirmReadwiseOverwrite(
+    List<ReadwiseExportConflict> conflicts,
+  ) => showDialog<bool>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('检测到 Readwise 外部修改'),
+      content: Text(
+        '${conflicts.length} 本书包含在上次导出后被修改或删除的高亮。'
+        '继续会用当前 OOHStory 批注替换或重建冲突项；不会删除其他 Readwise 内容。',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('保留 Readwise 修改'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(true),
+          child: const Text('确认替换冲突项'),
+        ),
+      ],
+    ),
+  );
+
+  Future<void> _disconnectReadwise() async {
+    try {
+      final preferences = await SharedPreferences.getInstance();
+      await SharedPreferencesReadwiseExportStateStore(preferences).clear();
+      await ReadwiseConnectionRepository(
+        credentialStore: const FlutterSecureCredentialStore(),
+      ).disconnect();
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('已断开 Readwise；远端高亮未删除')));
+    } on Object {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('无法清除 Readwise 本机连接，请稍后重试')));
+    }
+  }
+
+  String _friendlyReadwiseError(Object error) {
+    if (error is FormatException) return error.message;
+    if (error is CoreException) {
+      return switch (error.code) {
+        CoreErrorCode.unauthorized ||
+        CoreErrorCode.forbidden => 'Readwise 授权无效，请重新配置 access token',
+        CoreErrorCode.notFound => error.message,
+        CoreErrorCode.rateLimitExceeded => 'Readwise 请求过于频繁，请稍后重试',
+        CoreErrorCode.payloadTooLarge => error.message,
+        _ => 'Readwise 服务暂时不可用，请稍后重试',
+      };
+    }
+    return 'Readwise 导出失败，请稍后重试';
+  }
+
   bool get _isDesktop =>
       !kIsWeb && (Platform.isLinux || Platform.isWindows || Platform.isMacOS);
 
@@ -779,6 +959,42 @@ class _OfflineNotesScreenState extends State<OfflineNotesScreen> {
               ),
             ],
           ),
+        if (widget.capabilities.readwiseExportEnabled && !kIsWeb)
+          PopupMenuButton<_ReadwiseAction>(
+            tooltip: 'Readwise 导出',
+            enabled: !_exportingReadwise,
+            icon: _exportingReadwise
+                ? const SizedBox.square(
+                    dimension: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.auto_stories_outlined),
+            onSelected: (action) {
+              switch (action) {
+                case _ReadwiseAction.export:
+                  _exportReadwise();
+                case _ReadwiseAction.configure:
+                  _exportReadwise(configure: true);
+                case _ReadwiseAction.disconnect:
+                  _disconnectReadwise();
+              }
+            },
+            itemBuilder: (context) => <PopupMenuEntry<_ReadwiseAction>>[
+              PopupMenuItem(
+                value: _ReadwiseAction.export,
+                enabled: _hasAnnotations,
+                child: const Text('立即导出'),
+              ),
+              const PopupMenuItem(
+                value: _ReadwiseAction.configure,
+                child: Text('配置连接'),
+              ),
+              const PopupMenuItem(
+                value: _ReadwiseAction.disconnect,
+                child: Text('断开连接'),
+              ),
+            ],
+          ),
         IconButton(
           onPressed: _hasAnnotations ? _export : null,
           tooltip: '导出',
@@ -879,6 +1095,8 @@ class _OfflineNotesScreenState extends State<OfflineNotesScreen> {
 enum _NotionAction { export, configure, disconnect }
 
 enum _JoplinAction { export, configure, disconnect }
+
+enum _ReadwiseAction { export, configure, disconnect }
 
 enum _AnnotationAction { attach, attachments, delete }
 

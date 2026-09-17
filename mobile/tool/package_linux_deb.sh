@@ -18,6 +18,10 @@ if [[ ! -x "$bundle_directory/oohstory" ]]; then
   echo "Linux release bundle is missing; run flutter build linux --release" >&2
   exit 66
 fi
+if ! command -v convert >/dev/null 2>&1; then
+  echo "ImageMagick convert is required" >&2
+  exit 67
+fi
 
 package_root="$(mktemp -d)"
 trap 'rm -rf -- "$package_root"' EXIT
@@ -28,12 +32,17 @@ mkdir -p \
   "$package_root/opt/oohstory" \
   "$package_root/usr/bin" \
   "$package_root/usr/share/applications" \
-  "$package_root/usr/share/icons/hicolor/512x512/apps"
+  "$package_root/usr/share/icons/hicolor/512x512/apps" \
+  "$package_root/usr/share/metainfo"
 cp -a "$bundle_directory/." "$package_root/opt/oohstory/"
-ln -s /opt/oohstory/oohstory "$package_root/usr/bin/oohstory"
+ln -s ../../opt/oohstory/oohstory "$package_root/usr/bin/oohstory"
 install -m 0644 packaging/linux/com.oohstory.oohstory.desktop \
   "$package_root/usr/share/applications/com.oohstory.oohstory.desktop"
-install -m 0644 assets/oohstory-brand-icon.png \
+install -m 0644 packaging/linux/com.oohstory.oohstory.appdata.xml \
+  "$package_root/usr/share/metainfo/com.oohstory.oohstory.appdata.xml"
+convert assets/oohstory-brand-icon.png -resize 512x512 \
+  "$package_root/usr/share/icons/hicolor/512x512/apps/com.oohstory.oohstory.png"
+chmod 0644 \
   "$package_root/usr/share/icons/hicolor/512x512/apps/com.oohstory.oohstory.png"
 
 installed_size="$(du -sk "$package_root/opt/oohstory" | cut -f1)"
