@@ -4,7 +4,10 @@ import 'dart:typed_data';
 
 Uint8List buildMdxFixture({
   bool compressed = true,
+  int? compression,
   bool encrypted = false,
+  bool includeEncoding = true,
+  bool resourceLibrary = false,
   String engineVersion = '2.0',
   List<MapEntry<String, String>> entries = const <MapEntry<String, String>>[
     MapEntry<String, String>('apple', '<b>first</b>'),
@@ -12,33 +15,42 @@ Uint8List buildMdxFixture({
     MapEntry<String, String>('banana', 'yellow fruit'),
   ],
 }) {
+  final selectedCompression = compression ?? (compressed ? 2 : 0);
+  final utf16Keys = resourceLibrary && !includeEncoding;
   final records = <int>[];
   final keyPayload = <int>[];
   for (final entry in entries) {
     keyPayload.addAll(_uint64(records.length));
-    keyPayload.addAll(utf8.encode(entry.key));
-    keyPayload.add(0);
+    keyPayload.addAll(utf16Keys ? _utf16Le(entry.key) : utf8.encode(entry.key));
+    keyPayload.addAll(utf16Keys ? const <int>[0, 0] : const <int>[0]);
     records.addAll(utf8.encode(entry.value));
   }
-  final keyBlock = _block(keyPayload, compressed: compressed);
-  final first = utf8.encode(entries.first.key);
-  final last = utf8.encode(entries.last.key);
+  final keyBlock = _block(keyPayload, compression: selectedCompression);
+  final first = utf16Keys
+      ? _utf16Le(entries.first.key)
+      : utf8.encode(entries.first.key);
+  final last = utf16Keys
+      ? _utf16Le(entries.last.key)
+      : utf8.encode(entries.last.key);
+  final terminator = utf16Keys ? const <int>[0, 0] : const <int>[0];
   final keyInfoPayload = <int>[
     ..._uint64(entries.length),
-    ..._uint16(first.length),
+    ..._uint16(utf16Keys ? first.length ~/ 2 : first.length),
     ...first,
-    0,
-    ..._uint16(last.length),
+    ...terminator,
+    ..._uint16(utf16Keys ? last.length ~/ 2 : last.length),
     ...last,
-    0,
+    ...terminator,
     ..._uint64(keyBlock.length),
     ..._uint64(keyPayload.length),
   ];
-  final keyInfoBlock = _block(keyInfoPayload, compressed: compressed);
-  final recordBlock = _block(records, compressed: compressed);
+  final keyInfoBlock = _block(keyInfoPayload, compression: selectedCompression);
+  final recordBlock = _block(records, compression: selectedCompression);
   final header = _utf16Le(
-    '<Dictionary GeneratedByEngineVersion="$engineVersion" '
-    'Encoding="UTF-8" Encrypted="${encrypted ? '2' : 'No'}"/>\u0000',
+    '<${resourceLibrary ? 'Library_Data' : 'Dictionary'} '
+    'GeneratedByEngineVersion="$engineVersion" '
+    '${includeEncoding ? 'Encoding="UTF-8" ' : ''}'
+    'Encrypted="${encrypted ? '2' : 'No'}"/>\u0000',
   );
   final keyHeader = <int>[
     ..._uint64(1),
@@ -50,7 +62,7 @@ Uint8List buildMdxFixture({
   final result = <int>[
     ..._uint32(header.length),
     ...header,
-    ..._uint32(_adler32(header)),
+    ..._uint32Le(_adler32(header)),
     ...keyHeader,
     ..._uint32(_adler32(keyHeader)),
     ...keyInfoBlock,
@@ -66,18 +78,48 @@ Uint8List buildMdxFixture({
   return Uint8List.fromList(result);
 }
 
-List<int> _block(List<int> expanded, {required bool compressed}) {
-  final payload = compressed
-      ? ZLibCodec(level: 6).encode(expanded)
-      : List<int>.from(expanded);
+List<int> _block(List<int> expanded, {required int compression}) {
+  final payload = switch (compression) {
+    0 => List<int>.from(expanded),
+    1 => _lzoLiteralBlock(expanded),
+    2 => ZLibCodec(level: 6).encode(expanded),
+    _ => throw ArgumentError.value(compression, 'compression'),
+  };
   return <int>[
-    compressed ? 2 : 0,
+    compression,
     0,
     0,
     0,
     ..._uint32(_adler32(expanded)),
     ...payload,
   ];
+}
+
+List<int> _lzoLiteralBlock(List<int> expanded) {
+  if (expanded.isEmpty) return const <int>[17, 0, 0];
+  final result = <int>[];
+  if (expanded.length <= 238) {
+    result.add(17 + expanded.length);
+  } else {
+    final encoded = expanded.length - 18;
+    result.add(0);
+    var remaining = encoded;
+    while (remaining > 255) {
+      result.add(0);
+      remaining -= 255;
+    }
+    if (remaining == 0) {
+      result
+        ..removeLast()
+        ..add(255);
+    } else {
+      result.add(remaining);
+    }
+  }
+  result
+    ..addAll(expanded)
+    ..addAll(const <int>[17, 0, 0]);
+  return result;
 }
 
 List<int> _utf16Le(String value) => <int>[
@@ -91,6 +133,13 @@ List<int> _uint32(int value) => <int>[
   (value >> 16) & 0xff,
   (value >> 8) & 0xff,
   value & 0xff,
+];
+
+List<int> _uint32Le(int value) => <int>[
+  value & 0xff,
+  (value >> 8) & 0xff,
+  (value >> 16) & 0xff,
+  (value >> 24) & 0xff,
 ];
 
 List<int> _uint64(int value) => <int>[

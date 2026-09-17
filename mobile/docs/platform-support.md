@@ -46,9 +46,14 @@ implementation and product identity.
 - MOBI / AZW / AZW3 and CBR / CBT / CB7 now have a product-visible local
   reading entry, but formal compatibility remains limited to the fixture-backed
   compression/encoding matrix documented in the UI and tests.
-- Local MDX is product-visible. Portable OCR remains a test/demo engine and is
-  disabled in the production capability profile until a native platform engine
-  has release evidence.
+- Local MDX v2 is integrated in the formal native reader with durable private
+  copies, selected/manual lookup, stored/zlib/LZO blocks, optional MDD
+  image/audio resources, entry links, sandboxed local styles, dictionary
+  enable/order/remove controls, and checksum validation. Encrypted MDX remains
+  explicitly unsupported. Web keeps the existing transient picker path instead
+  of claiming durable native-style file persistence. Portable OCR remains a
+  test/demo engine and is disabled in the production capability profile until a
+  native platform engine has release evidence.
 - WebDAV/S3 now have a gated “存储与同步” client path with verified-before-save
   configuration, secure credential separation, directory browsing, bounded local
   opening, create-only upload, ETag delete, WebDAV 207 mapping, S3 addressing

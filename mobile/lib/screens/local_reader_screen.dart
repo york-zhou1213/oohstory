@@ -5,15 +5,23 @@ import 'package:flutter/material.dart';
 
 import '../features/annotation_export/annotation_attachment_ui.dart';
 import '../models/reader_preferences.dart';
+import '../services/local_dictionary_service.dart';
 import '../services/local_storage_service.dart';
 import '../theme/app_theme.dart';
 import '../utils/reader_pagination.dart';
+import '../widgets/local_dictionary_ui.dart';
 
 class LocalReaderScreen extends StatefulWidget {
   final LocalBookInfo book;
   final LocalStorageService? storage;
+  final LocalDictionaryService? dictionaryService;
 
-  const LocalReaderScreen({super.key, required this.book, this.storage});
+  const LocalReaderScreen({
+    super.key,
+    required this.book,
+    this.storage,
+    this.dictionaryService,
+  });
 
   @override
   State<LocalReaderScreen> createState() => _LocalReaderScreenState();
@@ -21,6 +29,7 @@ class LocalReaderScreen extends StatefulWidget {
 
 class _LocalReaderScreenState extends State<LocalReaderScreen> {
   late final LocalStorageService _storage;
+  late final LocalDictionaryService _dictionaryService;
   final _scrollController = ScrollController();
   final _pageController = PageController();
   final _sessionStartedAt = DateTime.now();
@@ -29,6 +38,8 @@ class _LocalReaderScreenState extends State<LocalReaderScreen> {
   bool _showControls = true;
   ReaderPreferences _preferences = const ReaderPreferences();
   double _progress = 0;
+  String _selectedText = '';
+  bool _dictionaryReady = false;
 
   static const _backgrounds = [
     Color(0xFFF7F1E5),
@@ -41,12 +52,21 @@ class _LocalReaderScreenState extends State<LocalReaderScreen> {
   void initState() {
     super.initState();
     _storage = widget.storage ?? LocalStorageService();
+    _dictionaryService = widget.dictionaryService ?? LocalDictionaryService();
     _scrollController.addListener(_updateScrollProgress);
     unawaited(_load());
   }
 
   Future<void> _load() async {
     await _storage.init();
+    if (!kIsWeb) {
+      try {
+        await _dictionaryService.init();
+        _dictionaryReady = true;
+      } on Object {
+        _dictionaryReady = false;
+      }
+    }
     final content = await _storage.getLocalBookContent(widget.book.id);
     final preferences = _storage.getReaderPreferences();
     if (!mounted) return;
@@ -485,6 +505,32 @@ class _LocalReaderScreenState extends State<LocalReaderScreen> {
     return content.substring(start, end).replaceAll(RegExp(r'\s+'), ' ').trim();
   }
 
+  void _captureSelection(String text, TextSelection selection) {
+    if (!selection.isValid || selection.isCollapsed) {
+      _selectedText = '';
+      return;
+    }
+    final start = selection.start.clamp(0, text.length);
+    final end = selection.end.clamp(start, text.length);
+    _selectedText = text.substring(start, end).trim();
+  }
+
+  Future<void> _openDictionary() async {
+    if (!_dictionaryReady) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(kIsWeb ? 'Web 端请在“本地阅读”工具中临时挂载 MDX 词典' : '本地词典存储暂不可用'),
+        ),
+      );
+      return;
+    }
+    await showLocalDictionaryLookup(
+      context: context,
+      service: _dictionaryService,
+      initialTerm: _selectedText,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final backgroundIndex = _preferences.backgroundIndex.clamp(
@@ -552,6 +598,8 @@ class _LocalReaderScreenState extends State<LocalReaderScreen> {
           ),
           child: SelectableText(
             _content!,
+            onSelectionChanged: (selection, _) =>
+                _captureSelection(_content!, selection),
             style: TextStyle(
               fontSize: _preferences.fontSize,
               height: _preferences.lineHeight,
@@ -622,6 +670,8 @@ class _LocalReaderScreenState extends State<LocalReaderScreen> {
             alignment: Alignment.topLeft,
             child: SelectableText(
               text,
+              onSelectionChanged: (selection, _) =>
+                  _captureSelection(text, selection),
               style: TextStyle(
                 fontSize: _preferences.fontSize,
                 height: _preferences.lineHeight,
@@ -672,7 +722,13 @@ class _LocalReaderScreenState extends State<LocalReaderScreen> {
             ),
             IconButton(
               onPressed: _search,
+              tooltip: '书内搜索',
               icon: const Icon(Icons.search_rounded),
+            ),
+            IconButton(
+              onPressed: _openDictionary,
+              tooltip: '本地词典（优先查询所选文字）',
+              icon: const Icon(Icons.menu_book_outlined),
             ),
           ],
         ),

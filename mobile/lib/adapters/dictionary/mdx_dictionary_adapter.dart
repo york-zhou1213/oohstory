@@ -5,14 +5,15 @@ import '../../core/capabilities.dart';
 import '../../core/errors.dart';
 import '../../core/models.dart';
 import '../contracts/adapter_contracts.dart';
+import '_lzo_decoder.dart';
 import '_zlib_decoder.dart';
 
 class MdxLimits {
   const MdxLimits({
     this.maxInputBytes = 32 * 1024 * 1024,
     this.maxHeaderBytes = 1024 * 1024,
-    this.maxEntries = 200000,
-    this.maxBlocks = 4096,
+    this.maxEntries = 1000000,
+    this.maxBlocks = 65536,
     this.maxKeyBytes = 4096,
     this.maxDefinitionBytes = 4 * 1024 * 1024,
     this.maxExpandedBytes = 64 * 1024 * 1024,
@@ -42,7 +43,7 @@ class MdxDictionaryAdapter implements DictionaryAdapter {
           'MDX input exceeds the configured size limit',
         );
       }
-      final parsed = _MdxParser(bytes, limits).parse();
+      final parsed = _MdxParser(bytes, limits).parseDictionary();
       return MdxDictionaryAdapter._(parsed);
     } on CoreException {
       rethrow;
@@ -83,7 +84,82 @@ class MdxDictionaryAdapter implements DictionaryAdapter {
         'Dictionary locale must not be blank',
       );
     }
-    return _entries[normalized] ?? const <DictionaryEntry>[];
+    return _resolve(normalized, const <String>{}, 0);
+  }
+
+  List<DictionaryEntry> _resolve(
+    String normalized,
+    Set<String> visited,
+    int depth,
+  ) {
+    if (depth > 8 || visited.contains(normalized)) {
+      throw const CoreException(
+        CoreErrorCode.validationError,
+        'MDX entry link is cyclic or too deep',
+      );
+    }
+    final entries = _entries[normalized] ?? const <DictionaryEntry>[];
+    if (entries.isEmpty) return entries;
+    final nextVisited = <String>{...visited, normalized};
+    final resolved = <DictionaryEntry>[];
+    for (final entry in entries) {
+      final definition = entry.definition.trim();
+      if (!definition.startsWith('@@@LINK=')) {
+        resolved.add(entry);
+        continue;
+      }
+      final target = _normalizeTerm(definition.substring('@@@LINK='.length));
+      if (target.isEmpty) {
+        throw const CoreException(
+          CoreErrorCode.validationError,
+          'MDX entry link target is blank',
+        );
+      }
+      resolved.addAll(_resolve(target, nextVisited, depth + 1));
+    }
+    return List<DictionaryEntry>.unmodifiable(resolved);
+  }
+}
+
+/// Binary companion resources from an MDD v2 container.
+class MddResourceAdapter {
+  MddResourceAdapter._(this._resources);
+
+  factory MddResourceAdapter.fromBytes(
+    Uint8List bytes, {
+    MdxLimits limits = const MdxLimits(),
+  }) {
+    try {
+      _validateLimits(limits);
+      if (bytes.length > limits.maxInputBytes) {
+        throw const CoreException(
+          CoreErrorCode.payloadTooLarge,
+          'MDD input exceeds the configured size limit',
+        );
+      }
+      return MddResourceAdapter._(_MdxParser(bytes, limits).parseResources());
+    } on CoreException {
+      rethrow;
+    } on Object {
+      throw const CoreException(
+        CoreErrorCode.validationError,
+        'MDD input is malformed',
+      );
+    }
+  }
+
+  final Map<String, Uint8List> _resources;
+
+  int get resourceCount => _resources.length;
+
+  Uint8List? lookup(String path) {
+    try {
+      final normalized = _normalizeResourcePath(path);
+      final bytes = _resources[normalized];
+      return bytes == null ? null : Uint8List.fromList(bytes);
+    } on FormatException {
+      return null;
+    }
   }
 }
 
@@ -113,31 +189,15 @@ class _MdxParser {
   late final _TextCodec textCodec;
   var expandedBytes = 0;
 
-  Map<String, List<DictionaryEntry>> parse() {
-    _readHeader();
-    final keys = _readKeys();
-    final records = _readRecords(keys.length);
-    if (!cursor.isDone) throw const FormatException('Trailing MDX data');
-    if (keys.isEmpty || records.isEmpty) {
-      throw const FormatException('MDX dictionary is empty');
-    }
-
+  Map<String, List<DictionaryEntry>> parseDictionary() {
+    final parsed = _parseContainer();
+    final keys = parsed.keys;
+    final records = parsed.records;
+    final codec = parsed.codec;
     final result = <String, List<DictionaryEntry>>{};
     for (var index = 0; index < keys.length; index++) {
-      final start = keys[index].recordOffset;
-      final end = index + 1 < keys.length
-          ? keys[index + 1].recordOffset
-          : records.length;
-      if (start < 0 || end < start || end > records.length) {
-        throw const FormatException('MDX record offset is invalid');
-      }
-      if (end - start > limits.maxDefinitionBytes) {
-        throw const CoreException(
-          CoreErrorCode.payloadTooLarge,
-          'MDX definition exceeds the configured size limit',
-        );
-      }
-      final definition = textCodec.decode(records.sublist(start, end));
+      final record = _recordAt(keys, records, index);
+      final definition = codec.decode(record);
       final entry = DictionaryEntry(
         term: keys[index].term,
         definition: definition,
@@ -154,13 +214,57 @@ class _MdxParser {
     );
   }
 
+  Map<String, Uint8List> parseResources() {
+    final parsed = _parseContainer();
+    final result = <String, Uint8List>{};
+    for (var index = 0; index < parsed.keys.length; index++) {
+      final path = _normalizeResourcePath(parsed.keys[index].term);
+      if (result.containsKey(path)) {
+        throw const FormatException('Duplicate MDD resource path');
+      }
+      result[path] = Uint8List.fromList(
+        _recordAt(parsed.keys, parsed.records, index),
+      );
+    }
+    return Map<String, Uint8List>.unmodifiable(result);
+  }
+
+  _ParsedMdict _parseContainer() {
+    _readHeader();
+    final keys = _readKeys();
+    final records = _readRecords(keys.length);
+    if (!cursor.isDone) throw const FormatException('Trailing MDX data');
+    if (keys.isEmpty || records.isEmpty) {
+      throw const FormatException('MDX dictionary is empty');
+    }
+
+    return _ParsedMdict(keys, records, textCodec);
+  }
+
+  List<int> _recordAt(List<_KeyEntry> keys, List<int> records, int index) {
+    final start = keys[index].recordOffset;
+    final end = index + 1 < keys.length
+        ? keys[index + 1].recordOffset
+        : records.length;
+    if (start < 0 || end < start || end > records.length) {
+      throw const FormatException('MDX record offset is invalid');
+    }
+    if (end - start > limits.maxDefinitionBytes) {
+      throw const CoreException(
+        CoreErrorCode.payloadTooLarge,
+        'MDX record exceeds the configured size limit',
+      );
+    }
+    return records.sublist(start, end);
+  }
+
   void _readHeader() {
     final headerSize = cursor.uint32Be();
     if (headerSize <= 2 || headerSize > limits.maxHeaderBytes) {
       throw const FormatException('MDX header size is invalid');
     }
     final headerBytes = cursor.take(headerSize);
-    final checksum = cursor.uint32Be();
+    final checksum = cursor.uint32Le();
     if (_adler32(headerBytes) != checksum) {
       throw const FormatException('MDX header checksum mismatch');
     }
@@ -184,7 +288,13 @@ class _MdxParser {
         'Encrypted MDX dictionaries are unsupported',
       );
     }
-    textCodec = _TextCodec(_attribute(header, 'Encoding'));
+    final isResourceLibrary = header.trimLeft().startsWith('<Library_Data');
+    final encoding = isResourceLibrary
+        ? (_optionalAttribute(header, 'Encoding') ?? '')
+        : _attribute(header, 'Encoding');
+    textCodec = _TextCodec(
+      encoding.isEmpty && isResourceLibrary ? 'UTF-16LE' : encoding,
+    );
   }
 
   List<_KeyEntry> _readKeys() {
@@ -348,9 +458,10 @@ class _MdxParser {
     final decoded = switch (compression) {
       0 => payload,
       2 => decodeZlib(payload, maxOutputBytes: expectedSize),
-      1 => throw const CoreException(
-        CoreErrorCode.unsupported,
-        'LZO-compressed MDX blocks are unsupported',
+      1 => decodeLzo1x(
+        payload,
+        expectedSize: expectedSize,
+        maxOutputBytes: limits.maxExpandedBytes - expandedBytes,
       ),
       _ => throw const CoreException(
         CoreErrorCode.unsupported,
@@ -411,6 +522,12 @@ class _Reader {
     final value = _uint32Be(bytes, offset);
     offset += 4;
     return value;
+  }
+
+  int uint32Le() {
+    final data = take(4);
+    return (data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24)) &
+        0xffffffff;
   }
 
   int uint64Be() {
@@ -477,6 +594,26 @@ class _RecordBlock {
   final int expandedSize;
 }
 
+class _ParsedMdict {
+  const _ParsedMdict(this.keys, this.records, this.codec);
+  final List<_KeyEntry> keys;
+  final List<int> records;
+  final _TextCodec codec;
+}
+
+String _normalizeResourcePath(String value) {
+  final normalized = value.trim().replaceAll('\\', '/');
+  final withoutRoot = normalized.replaceFirst(RegExp(r'^/+'), '');
+  final segments = withoutRoot.split('/');
+  if (withoutRoot.isEmpty ||
+      withoutRoot.contains('\u0000') ||
+      RegExp(r'^[a-zA-Z][a-zA-Z0-9+.-]*:').hasMatch(withoutRoot) ||
+      segments.any((segment) => segment.isEmpty || segment == '..')) {
+    throw const FormatException('MDD resource path is unsafe');
+  }
+  return segments.where((segment) => segment != '.').join('/').toLowerCase();
+}
+
 String _decodeUtf16Header(List<int> bytes) {
   if (bytes.length.isOdd) throw const FormatException('Invalid MDX header');
   var littleEndian = true;
@@ -498,8 +635,9 @@ String _decodeUtf16Header(List<int> bytes) {
 }
 
 String _attribute(String header, String name) {
-  if (!header.trimLeft().startsWith('<Dictionary') ||
-      !header.trimRight().endsWith('/>')) {
+  final trimmed = header.trim();
+  if (!RegExp(r'^<(Dictionary|Library_Data)\b').hasMatch(trimmed) ||
+      !trimmed.endsWith('/>')) {
     throw const FormatException('MDX XML header is invalid');
   }
   final matches = RegExp(
@@ -510,6 +648,22 @@ String _attribute(String header, String name) {
     throw FormatException('Invalid MDX header attribute: $name');
   }
   return matches.single.group(1)!;
+}
+
+String? _optionalAttribute(String header, String name) {
+  final trimmed = header.trim();
+  if (!RegExp(r'^<(Dictionary|Library_Data)\b').hasMatch(trimmed) ||
+      !trimmed.endsWith('/>')) {
+    throw const FormatException('MDX XML header is invalid');
+  }
+  final matches = RegExp(
+    '$name\\s*=\\s*["\\\']([^"\\\']*)["\\\']',
+    caseSensitive: false,
+  ).allMatches(header).toList(growable: false);
+  if (matches.length > 1) {
+    throw FormatException('Invalid MDX header attribute: $name');
+  }
+  return matches.singleOrNull?.group(1);
 }
 
 void _validateCount(int value, int max, String label) {

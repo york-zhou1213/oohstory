@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:oohstory/adapters/dictionary/_lzo_decoder.dart';
 import 'package:oohstory/adapters/dictionary/_zlib_decoder.dart';
 import 'package:oohstory/adapters/dictionary/dictionary.dart';
 import 'package:oohstory/core/capabilities.dart';
@@ -46,6 +47,64 @@ void main() {
         (await adapter.lookup('banana')).single.definition,
         'yellow fruit',
       );
+    });
+
+    test('decodes LZO-compressed MDX blocks', () async {
+      final adapter = MdxDictionaryAdapter.fromBytes(
+        buildMdxFixture(compression: 1),
+      );
+
+      expect(
+        (await adapter.lookup('banana')).single.definition,
+        'yellow fruit',
+      );
+    });
+
+    test('follows bounded entry redirects and rejects cycles', () async {
+      final adapter = MdxDictionaryAdapter.fromBytes(
+        buildMdxFixture(
+          entries: const <MapEntry<String, String>>[
+            MapEntry<String, String>('alias', '@@@LINK=target'),
+            MapEntry<String, String>('target', 'resolved definition'),
+          ],
+        ),
+      );
+      final cyclic = MdxDictionaryAdapter.fromBytes(
+        buildMdxFixture(
+          entries: const <MapEntry<String, String>>[
+            MapEntry<String, String>('a', '@@@LINK=b'),
+            MapEntry<String, String>('b', '@@@LINK=a'),
+          ],
+        ),
+      );
+
+      expect(
+        (await adapter.lookup('alias')).single.definition,
+        'resolved definition',
+      );
+      await expectLater(
+        cyclic.lookup('a'),
+        throwsA(_coreError(CoreErrorCode.validationError)),
+      );
+    });
+
+    test('parses bounded MDD binary resources and normalizes paths', () {
+      final adapter = MddResourceAdapter.fromBytes(
+        buildMdxFixture(
+          compression: 1,
+          includeEncoding: false,
+          resourceLibrary: true,
+          entries: const <MapEntry<String, String>>[
+            MapEntry<String, String>(r'\images\apple.png', 'image-bytes'),
+            MapEntry<String, String>(r'\audio\apple.mp3', 'audio-bytes'),
+          ],
+        ),
+      );
+
+      expect(adapter.resourceCount, 2);
+      expect(utf8.decode(adapter.lookup('/IMAGES/apple.png')!), 'image-bytes');
+      expect(utf8.decode(adapter.lookup(r'\audio\apple.mp3')!), 'audio-bytes');
+      expect(adapter.lookup('../secret'), isNull);
     });
 
     test('rejects encrypted dictionaries explicitly', () {
@@ -201,6 +260,50 @@ void main() {
       await expectLater(
         adapter.lookup('apple', locale: ' '),
         throwsA(_coreError(CoreErrorCode.validationError)),
+      );
+    });
+  });
+
+  group('decodeLzo1x', () {
+    test('decodes a real liblzo1x compressed vector', () {
+      final source = base64Decode(
+        'bG9jYWwtbWR4LWx6by1sb2NhbC1tZHgtbHpvLWxvY2FsLW1keC1sem8tbG9jYWwt'
+        'bWR4LWx6by1sb2NhbC1tZHgtbHpvLWxvY2FsLW1keC1sem8tbG9jYWwtbWR4LWx6'
+        'by1sb2NhbC1tZHgtbHpvLWxvY2FsLW1keC1sem8tbG9jYWwtbWR4LWx6by1sb2Nh'
+        'bC1tZHgtbHpvLWxvY2FsLW1keC1sem8tQVBQTEUgZGVmaW5pdGlvbiB3aXRoIHJl'
+        'cGVhdGVkIHJlcGVhdGVkIHJlcGVhdGVkIHRleHQ=',
+      );
+      final compressed = base64Decode(
+        'C2xvY2FsLW1keC1sem8tIHk0AAAMQVBQTEUgZGVmaW5pdGlvbiB3aXRoIHJlcGVh'
+        'dGVkKiAACHBlYXRlZCB0ZXh0EQAA',
+      );
+
+      expect(
+        decodeLzo1x(
+          compressed,
+          expectedSize: source.length,
+          maxOutputBytes: source.length,
+        ),
+        source,
+      );
+    });
+
+    test('rejects truncated streams and output limits', () {
+      final compressed = base64Decode(
+        'C2xvY2FsLW1keC1sem8tIHk0AAAMQVBQTEUgZGVmaW5pdGlvbiB3aXRoIHJlcGVh'
+        'dGVkKiAACHBlYXRlZCB0ZXh0EQAA',
+      );
+      expect(
+        () => decodeLzo1x(
+          compressed.sublist(0, compressed.length - 1),
+          expectedSize: 221,
+          maxOutputBytes: 221,
+        ),
+        throwsFormatException,
+      );
+      expect(
+        () => decodeLzo1x(compressed, expectedSize: 221, maxOutputBytes: 220),
+        throwsFormatException,
       );
     });
   });
