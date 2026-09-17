@@ -76,8 +76,11 @@ void main() {
       expect(find.text('导入本地书'), findsOneWidget);
       expect(find.text('本地 MDX 查词'), findsOneWidget);
       expect(find.text('可取消本地 OCR'), findsOneWidget);
-      expect(find.textContaining('Kindle：未压缩 / PalmDOC'), findsOneWidget);
-      expect(find.textContaining('CBR：RAR4/5 存储方式'), findsOneWidget);
+      expect(
+        find.textContaining('Kindle：未压缩 / PalmDOC / HUFF'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('CBR：RAR4/5 压缩与存储'), findsOneWidget);
       expect(find.text('当前不可用'), findsOneWidget);
       for (final tooltip in const <String>['挂载 MDX 词典', '本地 OCR 不可用']) {
         final target = find.byTooltip(tooltip);

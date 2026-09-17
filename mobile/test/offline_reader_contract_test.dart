@@ -165,29 +165,80 @@ void main() {
     );
   });
 
+  test('offline parser validates PDF, CBZ, CBR, CBT, and CB7', () async {
+    final temp = await Directory.systemTemp.createTemp('oohstory-binary-');
+    addTearDown(() => temp.delete(recursive: true));
+    const parser = OfflineBookParser();
+
+    final pdf = File('${temp.path}/星图.pdf')
+      ..writeAsBytesSync('%PDF-1.4\n%%EOF'.codeUnits);
+    final parsedPdf = await parser.parse(pdf.path, '星图.pdf');
+    expect(parsedPdf.format, 'pdf');
+    expect(parsedPdf.storageExtension, 'pdf');
+    expect(parsedPdf.assetBytes, isNotEmpty);
+
+    final cbzArchive = Archive()
+      ..addFile(ArchiveFile('10.jpg', 3, [10, 11, 12]))
+      ..addFile(ArchiveFile('2.jpg', 3, [2, 3, 4]));
+    final cbz = File('${temp.path}/漫画.cbz')
+      ..writeAsBytesSync(ZipEncoder().encodeBytes(cbzArchive));
+    final parsedCbz = await parser.parse(cbz.path, '漫画.cbz');
+    expect(parsedCbz.format, 'cbz');
+    expect(parsedCbz.storageExtension, 'cbz');
+    expect(parsedCbz.pageCount, 2);
+
+    for (final fixture in <(String, List<int>)>[
+      ('cbr', realRar5CompressedComicFixture()),
+      ('cbt', tarFixture(<String, int>{'10.jpg': 1, '2.jpg': 1})),
+      (
+        'cb7',
+        await File(
+          'test/fixtures/formats/cb7-default-header.cb7',
+        ).readAsBytes(),
+      ),
+    ]) {
+      final file = File('${temp.path}/漫画.${fixture.$1}')
+        ..writeAsBytesSync(fixture.$2);
+      final parsed = await parser.parse(file.path, '漫画.${fixture.$1}');
+      expect(parsed.format, fixture.$1);
+      expect(parsed.storageExtension, fixture.$1);
+      expect(parsed.assetBytes, isNotEmpty);
+      expect(parsed.pageCount, 2);
+    }
+  });
+
   test(
-    'offline parser validates PDF and naturally ordered CBZ pages',
+    'formal bookshelf persists compressed CBR assets and metadata',
     () async {
-      final temp = await Directory.systemTemp.createTemp('oohstory-binary-');
+      SharedPreferences.setMockInitialValues({});
+      final temp = await Directory.systemTemp.createTemp('oohstory-cbr-');
       addTearDown(() => temp.delete(recursive: true));
-      const parser = OfflineBookParser();
+      final source = File('${temp.path}/压缩漫画.cbr')
+        ..writeAsBytesSync(realRar5CompressedComicFixture());
+      final storage = LocalStorageService(
+        documentsDirectory: () async => temp,
+        temporaryDirectory: () async => temp,
+      );
+      await storage.init();
 
-      final pdf = File('${temp.path}/星图.pdf')
-        ..writeAsBytesSync('%PDF-1.4\n%%EOF'.codeUnits);
-      final parsedPdf = await parser.parse(pdf.path, '星图.pdf');
-      expect(parsedPdf.format, 'pdf');
-      expect(parsedPdf.storageExtension, 'pdf');
-      expect(parsedPdf.assetBytes, isNotEmpty);
+      final imported = await storage.importLocalBook(source.path, '压缩漫画.cbr');
+      expect(imported.format, 'cbr');
+      expect(imported.storageExtension, 'cbr');
+      expect(imported.pageCount, 2);
 
-      final cbzArchive = Archive()
-        ..addFile(ArchiveFile('10.jpg', 3, [10, 11, 12]))
-        ..addFile(ArchiveFile('2.jpg', 3, [2, 3, 4]));
-      final cbz = File('${temp.path}/漫画.cbz')
-        ..writeAsBytesSync(ZipEncoder().encodeBytes(cbzArchive));
-      final parsedCbz = await parser.parse(cbz.path, '漫画.cbz');
-      expect(parsedCbz.format, 'cbz');
-      expect(parsedCbz.storageExtension, 'cbz');
-      expect(parsedCbz.pageCount, 2);
+      final reopened = LocalStorageService(
+        documentsDirectory: () async => temp,
+        temporaryDirectory: () async => temp,
+      );
+      await reopened.init();
+      final persisted = reopened.getLocalBooks().single;
+      expect(persisted.id, imported.id);
+      expect(persisted.storageExtension, 'cbr');
+      expect(persisted.pageCount, 2);
+      expect(
+        await (await reopened.getLocalBookFile(persisted)).exists(),
+        isTrue,
+      );
     },
   );
 

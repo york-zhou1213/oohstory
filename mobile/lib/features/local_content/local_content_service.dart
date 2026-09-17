@@ -280,9 +280,6 @@ class LocalContentService {
         if (lower.contains('ocr') || lower.contains('platform')) {
           return '此平台暂不支持本地 OCR，且不会上传到远程服务';
         }
-        if (lower.contains('compressed rar')) {
-          return '此 CBR 使用暂不支持的压缩 RAR；仅支持 RAR4/RAR5 的“存储”方式';
-        }
         return '此文件使用当前本地阅读器不支持的编码或压缩方式';
       }
       if (error.message.toLowerCase().contains('cancel')) {

@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
+import 'package:koni_archive_core/koni_archive_core.dart' as koni_core;
+import 'package:koni_rar/koni_rar.dart' as koni_rar;
 
 import '../../core/capabilities.dart';
 import '../../core/errors.dart';
@@ -106,9 +108,9 @@ class ComicArchiveFormatDecoder implements FormatDecoder {
     );
     try {
       final result = _startsWith(data, _rar4Signature)
-          ? _parseRar4(data)
+          ? await _parseRar(data, version: 'rar4')
           : _startsWith(data, _rar5Signature)
-          ? _parseRar5(data)
+          ? await _parseRar(data, version: 'rar5')
           : _startsWith(data, _sevenZipSignature)
           ? _parseSevenZip(data)
           : _isTar(data)
@@ -202,218 +204,88 @@ class ComicArchiveFormatDecoder implements FormatDecoder {
     return _ArchiveResult('cbt:tar:${entries.length}', entries, expanded);
   }
 
-  _ArchiveResult _parseRar4(Uint8List bytes) {
+  Future<_ArchiveResult> _parseRar(
+    Uint8List bytes, {
+    required String version,
+  }) async {
+    final source = koni_core.MemoryByteSource(bytes, name: 'comic.cbr');
+    koni_core.ArchiveReader? reader;
     final entries = <_ArchiveEntry>[];
     var expanded = 0;
-    var offset = _rar4Signature.length;
-    var archiveEntries = 0;
-    while (offset < bytes.length) {
-      requireRange(bytes, offset, 7);
-      final type = bytes[offset + 2];
-      final flags = uint16Le(bytes, offset + 3);
-      final headerSize = uint16Le(bytes, offset + 5);
-      if (headerSize < 7) {
-        throw const FormatException('RAR header is too short');
-      }
-      requireRange(bytes, offset, headerSize);
-      if ((crc32(bytes, offset + 2, offset + headerSize) & 0xffff) !=
-          uint16Le(bytes, offset)) {
-        throw const FormatException('RAR header checksum mismatch');
-      }
-      if ((flags & 0x8000) != 0 && headerSize < 11) {
-        throw const FormatException('RAR data header is too short');
-      }
-      final dataSize = (flags & 0x8000) != 0 ? uint32Le(bytes, offset + 7) : 0;
-      if (type == 0x73 && (flags & 0x0080) != 0) {
-        throw const CoreException(
-          CoreErrorCode.unsupported,
-          'Encrypted RAR archives are not supported',
-        );
-      }
-      if (type == 0x74) {
-        archiveEntries++;
-        _checkEntryCount(archiveEntries);
-        if (headerSize < 32) {
-          throw const FormatException('RAR file header is too short');
+    try {
+      reader = await const koni_rar.RarFormat().openReader(
+        source,
+        koni_core.ArchiveReadOptions(
+          maxEntryCount: limits.maxEntries,
+          maxEntrySize: limits.maxEntryBytes,
+          maxContainerDecodeSize: limits.maxExpandedBytes,
+        ),
+      );
+      for (final entry in reader.entries) {
+        if (entry.pathEscapedRoot) {
+          throw const CoreException(
+            CoreErrorCode.validationError,
+            'Comic archive path traversal is not allowed',
+          );
         }
-        if ((flags & 0x0004) != 0) {
+        if (!entry.isFile && !entry.isDirectory) {
+          throw const CoreException(
+            CoreErrorCode.unsupported,
+            'RAR links and special entries are not supported',
+          );
+        }
+        if (entry.isDirectory) continue;
+        final name = _validatePath(entry.path);
+        if (entry.isEncrypted) {
           throw const CoreException(
             CoreErrorCode.unsupported,
             'Encrypted RAR entries are not supported',
           );
         }
-        final nameSize = uint16Le(bytes, offset + 26);
-        var unpackedSize = uint32Le(bytes, offset + 11);
-        var nameOffset = offset + 32;
-        if ((flags & 0x0100) != 0) {
-          if (headerSize < 40) {
-            throw const FormatException('Large RAR file header is too short');
+        _validateEntrySize(entry.uncompressedSize);
+        Uint8List? entryBytes;
+        if (_isImage(name)) {
+          final builder = BytesBuilder(copy: false);
+          await for (final chunk in reader.openRead(entry)) {
+            builder.add(chunk);
           }
-          final highPacked = uint32Le(bytes, nameOffset);
-          final highUnpacked = uint32Le(bytes, nameOffset + 4);
-          if (highPacked != 0) {
-            throw const CoreException(
-              CoreErrorCode.payloadTooLarge,
-              'RAR packed entry exceeds supported size',
-            );
+          entryBytes = builder.takeBytes();
+          if (entryBytes.length != entry.uncompressedSize) {
+            throw const FormatException('RAR entry size mismatch');
           }
-          unpackedSize |= highUnpacked << 32;
-          nameOffset += 8;
         }
-        if (nameOffset + nameSize > offset + headerSize) {
-          throw const FormatException('RAR filename exceeds its header');
-        }
-        final rawName = bytes.sublist(nameOffset, nameOffset + nameSize);
-        final zero = rawName.indexOf(0);
-        final nameBytes = zero < 0 ? rawName : rawName.sublist(0, zero);
-        final name = _validatePath(
-          utf8.decode(nameBytes, allowMalformed: true),
-        );
-        final directory = (flags & 0x00e0) == 0x00e0;
-        if (!directory) {
-          _validateEntrySize(unpackedSize);
-          final method = bytes[offset + 25];
-          if (method != 0x30 || dataSize != unpackedSize) {
-            throw const CoreException(
-              CoreErrorCode.unsupported,
-              'Compressed RAR4 entries are not supported; use stored method',
-            );
-          }
-          final dataOffset = offset + headerSize;
-          requireRange(bytes, dataOffset, dataSize);
-          final entryBytes = Uint8List.fromList(
-            bytes.sublist(dataOffset, dataOffset + dataSize),
-          );
-          final expectedCrc = uint32Le(bytes, offset + 16);
-          if (crc32(entryBytes) != expectedCrc) {
-            throw const FormatException('RAR4 file checksum mismatch');
-          }
-          expanded = _addEntry(
-            entries,
-            name,
-            unpackedSize,
-            expanded,
-            bytes: entryBytes,
-          );
-        }
-      }
-      final next = offset + headerSize + dataSize;
-      if (next <= offset || next > bytes.length) {
-        throw const FormatException('RAR block is truncated');
-      }
-      offset = next;
-      if (type == 0x7b) break;
-    }
-    return _ArchiveResult('cbr:rar4:${entries.length}', entries, expanded);
-  }
-
-  _ArchiveResult _parseRar5(Uint8List bytes) {
-    final entries = <_ArchiveEntry>[];
-    var expanded = 0;
-    var offset = _rar5Signature.length;
-    var archiveEntries = 0;
-    while (offset < bytes.length) {
-      requireRange(bytes, offset, 4);
-      final header = ByteCursor(bytes, offset: offset + 4);
-      final headerSize = header.readRarUint64();
-      final headerStart = header.offset;
-      final headerEnd = headerStart + headerSize;
-      if (headerEnd > bytes.length) {
-        throw const FormatException('RAR5 header is truncated');
-      }
-      if (crc32(bytes, offset + 4, headerEnd) != uint32Le(bytes, offset)) {
-        throw const FormatException('RAR5 header checksum mismatch');
-      }
-      final fields = ByteCursor(bytes, offset: headerStart, end: headerEnd);
-      final type = fields.readRarUint64();
-      final flags = fields.readRarUint64();
-      final extraSize = (flags & 0x0001) != 0 ? fields.readRarUint64() : 0;
-      final dataSize = (flags & 0x0002) != 0 ? fields.readRarUint64() : 0;
-      if (extraSize > headerEnd - fields.offset) {
-        throw const FormatException('RAR5 extra area is invalid');
-      }
-      if (type == 4) {
-        throw const CoreException(
-          CoreErrorCode.unsupported,
-          'Encrypted RAR archives are not supported',
+        expanded = _addEntry(
+          entries,
+          name,
+          entry.uncompressedSize,
+          expanded,
+          bytes: entryBytes,
         );
       }
-      if (type == 2) {
-        archiveEntries++;
-        _checkEntryCount(archiveEntries);
-        final fileFields = ByteCursor(
-          bytes,
-          offset: fields.offset,
-          end: headerEnd - extraSize,
-        );
-        final fileFlags = fileFields.readRarUint64();
-        final unpackedSize = fileFields.readRarUint64();
-        fileFields.readRarUint64();
-        if ((fileFlags & 0x0002) != 0) fileFields.skip(4);
-        final expectedCrc = (fileFlags & 0x0004) != 0
-            ? uint32Le(fileFields.readBytes(4), 0)
-            : null;
-        final compressionInfo = fileFields.readRarUint64();
-        fileFields.readRarUint64();
-        final nameSize = fileFields.readRarUint64();
-        final name = _validatePath(utf8.decode(fileFields.readBytes(nameSize)));
-        if (extraSize > 0) {
-          _rejectEncryptedRar5Extra(bytes, headerEnd - extraSize, headerEnd);
-        }
-        if ((fileFlags & 0x0001) == 0) {
-          _validateEntrySize(unpackedSize);
-          final method = (compressionInfo >> 7) & 0x07;
-          if (method != 0 || dataSize != unpackedSize) {
-            throw const CoreException(
-              CoreErrorCode.unsupported,
-              'Compressed RAR5 entries are not supported; use stored method',
-            );
-          }
-          requireRange(bytes, headerEnd, dataSize);
-          final entryBytes = Uint8List.fromList(
-            bytes.sublist(headerEnd, headerEnd + dataSize),
-          );
-          if (expectedCrc != null && crc32(entryBytes) != expectedCrc) {
-            throw const FormatException('RAR5 file checksum mismatch');
-          }
-          expanded = _addEntry(
-            entries,
-            name,
-            unpackedSize,
-            expanded,
-            bytes: entryBytes,
-          );
-        }
-      }
-      final next = headerEnd + dataSize;
-      if (next <= offset || next > bytes.length) {
-        throw const FormatException('RAR5 block is truncated');
-      }
-      offset = next;
-      if (type == 5) break;
-    }
-    return _ArchiveResult('cbr:rar5:${entries.length}', entries, expanded);
-  }
-
-  void _rejectEncryptedRar5Extra(List<int> bytes, int start, int end) {
-    final extras = ByteCursor(bytes, offset: start, end: end);
-    while (extras.offset < extras.end) {
-      final recordSize = extras.readRarUint64();
-      final recordEnd = extras.offset + recordSize;
-      if (recordEnd <= extras.offset || recordEnd > end) {
-        throw const FormatException('RAR5 extra record is invalid');
-      }
-      final type = extras.readRarUint64();
-      if (extras.offset > recordEnd) {
-        throw const FormatException('RAR5 extra record type is invalid');
-      }
-      if (type == 1) {
-        throw const CoreException(
-          CoreErrorCode.unsupported,
-          'Encrypted RAR entries are not supported',
-        );
-      }
-      extras.offset = recordEnd;
+      return _ArchiveResult(
+        'cbr:$version:${entries.length}',
+        entries,
+        expanded,
+      );
+    } on CoreException {
+      rethrow;
+    } on koni_core.EncryptedArchiveException {
+      throw const CoreException(
+        CoreErrorCode.unsupported,
+        'Encrypted RAR archives are not supported',
+      );
+    } on koni_core.SizeLimitExceededException {
+      throw const CoreException(
+        CoreErrorCode.payloadTooLarge,
+        'Comic archive exceeds the configured size limit',
+      );
+    } on koni_core.UnsupportedFeatureException catch (error) {
+      throw CoreException(CoreErrorCode.unsupported, error.message);
+    } on koni_core.ArchiveException catch (error) {
+      throw FormatException(error.message);
+    } finally {
+      await reader?.close();
+      await source.close();
     }
   }
 

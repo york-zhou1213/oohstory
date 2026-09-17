@@ -332,6 +332,24 @@ Uint8List realRar5CompressedFixture() => base64Decode(
   'MLZq0VcV8d5HmX+syGzQHXdWUQMFBAA=',
 );
 
+// Produced by RAR 6.24 with: rar a -ep -ma4 -m5 pages.cbr 10.jpg 2.jpg
+Uint8List realRar4CompressedComicFixture() => base64Decode(
+  'UmFyIRoHAM+QcwAADQAAAAAAAAB7u3QgkCsAowAAAB4BAAADuTQEz7ReMV0dNQYApIEAADEwLmpwZwDwCiQWDBTYzL2YDRyykUkstv0tDQ4oIwEqkCO0GBwUSPxicTglKEPxErARiZm7waaabafJvYe8l7F+9g8W+CO3u5gtV2m4GMPgdyGgHmeyM95Oid6lCMSFJWuGpS2VsXRVR4NLaaqyJpeSstsK3BZSwNK0FOFS9GoL/g7YGpE3aHM3uNifCdtGMffV9VJ0n4HmQxvx5HubX84hh+sjLGQZxm3a8ruHRD0mdCCQKgCiAAAAHgEAAAMbkOBztF4xXR01BQCkgQAAMi5qcGcA8Fi7DwwU2My9mA0cspCSWW36Wl4yYmAlUgSOzmBwg/GJxOCUoQ/ESsQjEzu7waaabafJvYe8l7F+9g8W+CO4u6gtt+y8GMPod0GsHmeyM+BOid6lCMyFJWuGpS2VsXRVR6NLaaqyJpeystsK3FZSwNK0FONS+GoLLB28NSJvEOZvkbE+E7gNA/esKmTpPwPLjG/ns6pTa/nMMP3kZYyDUNJ7tzuXZMQ9ewBABwA=',
+);
+
+// Produced by RAR 6.24 with: rar a -ep -ma5 -m5 pages.cbr 10.jpg 2.jpg
+Uint8List realRar5CompressedComicFixture() => base64Decode(
+  'UmFyIRoHAQDz4YLrCwEFBwAGAQGAgIAA6szECyQCAwulAQSeAqSDArk0BM+ABQEGMTAuanBnCgMTRWSrakgUpgjEPKIwU0My9lBEcspFJLLbktDYcUEaBKpAjtBoOCiR8aTieJShlgI0Gu8PzMWLE0/jOVNtPyTSb97Q9LfFD6n5BcMN+AUofaPwNwXRJnteJSymS1jNDHNe9zXOfC2D6rKk5rjXZaRRJArr7ivy7KbJU0JbclSQyos/R8hFoo9xaopqKN0w+Y0j98Y10xSlgkalK/xmfDoy53EF+okNIQ2jZ046z7DVutyBIwIDC6MBBJ4CpIMCG5Dgc4AFAQUyLmpwZwoDE0Vkq2qNLiUGwzmgMFM0MvZQRHlymGfNtmWl4yaTQJVIEjs5oOEHxpOJxLKEuIRoNZw+SKKJp/E5U20/JNJv3tD0t8UPqfkFxy4ZBSh8o/A3hdU2m15lbK5rWM1Mc173Nc58bovhbBObJWW3EUiQK/C8sNOyoyVRCW3RUkMgX/0fMSaKvcWqSakjdMPoNg+/GdbQUp4JmKlfo2t1DpT53EV+okNIQ3DavHkfYB13VlEDBQQA',
+);
+
+Uint8List defaultCb7Fixture() => base64Decode(
+  'N3q8ryccAARnVtd+hAAAAAAAAAAhAAAAAAAAANH44b3gASsACF0AAG/998ENIAAAAACBMweuD87ysgwHyEN/QbH6/kwKdmInG6P1wv8pPEqy3uo7dlwGglre6yYoxpWW3uO6eDElgiAATttV2cMbew0eC041NaBBw3yOdi4nFhC2ZdKTJY6XkA9Jmv0XZSNHZtfG2uif6HpAlgOa2jg+4lPnIAAXBhABCXQABwsBAAEjAwEBBV0AEAAADICaCgFhoQrHAAA=',
+);
+
+Uint8List encryptedHeaderCb7Fixture() => base64Decode(
+  'N3q8ryccAASB5C93gAAAAAAAAAA7AAAAAAAAAB7nUOVsvVYSyVWAsOn2y43+ZR72L4KRQLZz7h2n6lpVSonBWsfbqlsNKqxWidOS7IV5cqYrj0X8RHz7hl+bIvEG2CHmQ1QcWcEmgv1qqOWn7HYS6qCzY9qWYV/fr7NEyfFyrFGr0WvscnDY/65os0SgzNBeefo/wsXhERyV+a0+K9NwmxcGEAEJcAAHCwEAAiQG8QcBElMPoYipN0PXFFQL3HEPg6VDJyMDAQEFXQAQAAABAAxtegoB39PNwgAA',
+);
+
 Uint8List sevenZipFixture(List<String> names, {bool encodedHeader = false}) {
   final nextHeader = <int>[];
   final packed = encodedHeader ? Uint8List(0) : Uint8List(names.length);

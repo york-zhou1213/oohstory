@@ -1,4 +1,4 @@
-import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:oohstory/adapters/formats/formats.dart';
@@ -40,41 +40,29 @@ void main() {
     expect(document.sections, <String>['page3.webp', 'page12.webp']);
   });
 
-  test('enumerates RAR5 CBR pages in natural order', () async {
-    final document = await decoder.decode(
-      Stream<List<int>>.value(
-        rar5Fixture(<String, int>{'page12.webp': 1, 'page3.webp': 1}),
-      ),
-    );
-
-    expect(document.version, 'cbr:rar5:2');
-    expect(document.sections, <String>['page3.webp', 'page12.webp']);
+  test('extracts real compressed RAR4 and RAR5 pages', () async {
+    for (final fixture in <(Uint8List, String)>[
+      (realRar4CompressedComicFixture(), 'cbr:rar4:2'),
+      (realRar5CompressedComicFixture(), 'cbr:rar5:2'),
+    ]) {
+      final archive = await decoder.decodeArchive(
+        Stream<List<int>>.value(fixture.$1),
+      );
+      expect(archive.document.version, fixture.$2);
+      expect(archive.document.sections, <String>['2.jpg', '10.jpg']);
+      expect(archive.pages, hasLength(2));
+      expect(archive.pages.every((page) => page.bytes.length == 286), isTrue);
+    }
   });
 
-  test(
-    'extracts a real RAR5 stored page and rejects compressed RAR5',
-    () async {
-      final archive = await decoder.decodeArchive(
-        Stream<List<int>>.value(realRar5StoredFixture()),
-      );
+  test('extracts a real RAR5 stored page', () async {
+    final archive = await decoder.decodeArchive(
+      Stream<List<int>>.value(realRar5StoredFixture()),
+    );
 
-      expect(archive.document.sections, <String>['small.jpg']);
-      expect(archive.pages.single.bytes, isNotEmpty);
-
-      await expectLater(
-        decoder.decodeArchive(
-          Stream<List<int>>.value(realRar5CompressedFixture()),
-        ),
-        throwsA(
-          isA<CoreException>().having(
-            (error) => error.code,
-            'code',
-            CoreErrorCode.unsupported,
-          ),
-        ),
-      );
-    },
-  );
+    expect(archive.document.sections, <String>['small.jpg']);
+    expect(archive.pages.single.bytes, isNotEmpty);
+  });
 
   test('enumerates plain-header CB7 pages in natural order', () async {
     final document = await decoder.decode(
@@ -91,9 +79,7 @@ void main() {
     'decodes encoded Header with SubStreams and EmptyStream files',
     () async {
       // 7-Zip 23.01: 7z a -t7z -mtc=off -mta=off -mtm=off <fixture> ...
-      final fixture = await File(
-        'test/fixtures/formats/cb7-default-header.cb7',
-      ).readAsBytes();
+      final fixture = defaultCb7Fixture();
       final document = await decoder.decode(Stream<List<int>>.value(fixture));
 
       expect(document.version, 'cb7:7z:3');
@@ -156,9 +142,7 @@ void main() {
   });
 
   test('rejects CB7 page corruption before returning decoded pages', () async {
-    final fixture = await File(
-      'test/fixtures/formats/cb7-default-header.cb7',
-    ).readAsBytes();
+    final fixture = defaultCb7Fixture();
     fixture[32] ^= 1;
 
     await expectLater(
@@ -174,13 +158,13 @@ void main() {
   });
 
   test('normalizes truncated archive inputs as validation errors', () async {
-    final rar4 = rar4Fixture(<String, int>{'page.jpg': 1});
-    final rar5 = rar5Fixture(<String, int>{'page.jpg': 1});
+    final rar4 = realRar4CompressedComicFixture();
+    final rar5 = realRar5CompressedComicFixture();
     final sevenZip = sevenZipFixture(<String>['page.jpg']);
     final fixtures = <List<int>>[
       tarFixture(<String, int>{'page.jpg': 1}).sublist(0, 513),
-      rar4.sublist(0, rar4.length - 1),
-      rar5.sublist(0, rar5.length - 1),
+      rar4.sublist(0, rar4.length - 40),
+      rar5.sublist(0, rar5.length - 40),
       sevenZip.sublist(0, sevenZip.length - 1),
     ];
 
@@ -203,9 +187,7 @@ void main() {
     () async {
       for (final fixture in <List<int>>[
         rar4Fixture(<String, int>{'page.jpg': 1}, encrypted: true),
-        await File(
-          'test/fixtures/formats/cb7-encrypted-header.cb7',
-        ).readAsBytes(),
+        encryptedHeaderCb7Fixture(),
       ]) {
         await expectLater(
           decoder.decode(Stream<List<int>>.value(fixture)),
@@ -237,9 +219,9 @@ void main() {
       ),
       (
         decoder: const ComicArchiveFormatDecoder(
-          limits: FormatLimits(maxEntryBytes: 4),
+          limits: FormatLimits(maxEntryBytes: 100),
         ),
-        fixture: rar4Fixture(<String, int>{'1.jpg': 1}, declaredSize: 5),
+        fixture: realRar4CompressedComicFixture(),
       ),
       (
         decoder: const ComicArchiveFormatDecoder(
@@ -249,9 +231,7 @@ void main() {
             maxExpansionRatio: 1,
           ),
         ),
-        fixture: await File(
-          'test/fixtures/formats/cb7-default-header.cb7',
-        ).readAsBytes(),
+        fixture: defaultCb7Fixture(),
       ),
       (
         decoder: const ComicArchiveFormatDecoder(

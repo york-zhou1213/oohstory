@@ -7,6 +7,7 @@ import 'package:path/path.dart' as path;
 import 'package:xml/xml.dart';
 
 import '../adapters/formats/format_limits.dart';
+import '../adapters/formats/comic_archive_decoder.dart';
 import '../adapters/formats/kindle_format_decoder.dart';
 
 class ParsedOfflineBook {
@@ -47,6 +48,9 @@ class OfflineBookParser {
     'epub',
     'pdf',
     'cbz',
+    'cbr',
+    'cbt',
+    'cb7',
     'mobi',
     'azw',
     'azw3',
@@ -76,6 +80,9 @@ class OfflineBookParser {
     return switch (extension) {
       'pdf' => _parsePdf(bytes, fallbackTitle, size),
       'cbz' => _parseCbz(bytes, fallbackTitle, size),
+      'cbr' ||
+      'cbt' ||
+      'cb7' => await _parseComicArchive(bytes, fallbackTitle, size, extension),
       'mobi' || 'azw' || 'azw3' => await _parseKindle(bytes, size),
       'epub' => _parseEpub(bytes, fallbackTitle, size),
       'docx' => _parseDocx(bytes, fallbackTitle, size),
@@ -165,6 +172,34 @@ class OfflineBookParser {
       assetBytes: bytes,
       storageExtension: 'cbz',
       pageCount: pages.length,
+    );
+  }
+
+  Future<ParsedOfflineBook> _parseComicArchive(
+    Uint8List bytes,
+    String fallbackTitle,
+    int size,
+    String extension,
+  ) async {
+    const decoder = ComicArchiveFormatDecoder(
+      limits: FormatLimits(
+        maxInputBytes: _maxSourceBytes,
+        maxExpandedBytes: _maxExpandedBytes,
+        maxEntryBytes: 64 * 1024 * 1024,
+        maxEntries: 5000,
+        maxPages: 5000,
+      ),
+    );
+    final decoded = await decoder.decodeArchive(Stream<List<int>>.value(bytes));
+    return ParsedOfflineBook(
+      title: fallbackTitle,
+      author: '',
+      format: extension,
+      content: '',
+      sourceSize: size,
+      assetBytes: bytes,
+      storageExtension: extension,
+      pageCount: decoded.pages.length,
     );
   }
 

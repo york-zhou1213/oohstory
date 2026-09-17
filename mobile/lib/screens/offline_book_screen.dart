@@ -6,13 +6,15 @@ import 'package:flutter/material.dart';
 import 'package:path/path.dart' as path;
 import 'package:pdfrx/pdfrx.dart';
 
+import '../adapters/formats/comic_archive_decoder.dart';
+import '../adapters/formats/format_limits.dart';
 import '../models/reader_preferences.dart';
 import '../services/local_storage_service.dart';
 import 'local_reader_screen.dart';
 
 Widget buildOfflineBookScreen(LocalBookInfo book) => switch (book.format) {
   'pdf' => _OfflinePdfReader(book: book),
-  'cbz' => _OfflineComicReader(book: book),
+  'cbz' || 'cbr' || 'cbt' || 'cb7' => _OfflineComicReader(book: book),
   _ => LocalReaderScreen(book: book),
 };
 
@@ -162,29 +164,11 @@ class _OfflineComicReaderState extends State<_OfflineComicReader> {
       await _storage.init();
       _storageReady = true;
       final file = await _storage.getLocalBookFile(widget.book);
-      final archive = ZipDecoder().decodeBytes(
-        await file.readAsBytes(),
-        verify: true,
-      );
-      final entries = archive.files.where(
-        (entry) {
-          if (!entry.isFile) return false;
-          return const {
-            '.jpg',
-            '.jpeg',
-            '.png',
-            '.webp',
-            '.gif',
-          }.contains(path.extension(entry.name).toLowerCase());
-        },
-      ).toList()..sort((left, right) => _naturalCompare(left.name, right.name));
-      final pages = entries
-          .map((entry) {
-            final content = entry.content as List<int>;
-            return content is Uint8List ? content : Uint8List.fromList(content);
-          })
-          .toList(growable: false);
-      if (pages.isEmpty) throw const FormatException('CBZ 中没有图片页');
+      final bytes = await file.readAsBytes();
+      final pages = widget.book.storageExtension == 'cbz'
+          ? _decodeCbz(bytes)
+          : await _decodeComicArchive(bytes);
+      if (pages.isEmpty) throw const FormatException('漫画压缩包中没有图片页');
       final page = (widget.book.progress * (pages.length - 1)).round().clamp(
         0,
         pages.length - 1,
@@ -213,6 +197,40 @@ class _OfflineComicReaderState extends State<_OfflineComicReader> {
     } catch (error) {
       if (mounted) setState(() => _error = error);
     }
+  }
+
+  List<Uint8List> _decodeCbz(Uint8List bytes) {
+    final archive = ZipDecoder().decodeBytes(bytes, verify: true);
+    final entries = archive.files.where((entry) {
+      if (!entry.isFile) return false;
+      return const {
+        '.jpg',
+        '.jpeg',
+        '.png',
+        '.webp',
+        '.gif',
+      }.contains(path.extension(entry.name).toLowerCase());
+    }).toList()..sort((left, right) => _naturalCompare(left.name, right.name));
+    return entries
+        .map((entry) {
+          final content = entry.content as List<int>;
+          return content is Uint8List ? content : Uint8List.fromList(content);
+        })
+        .toList(growable: false);
+  }
+
+  Future<List<Uint8List>> _decodeComicArchive(Uint8List bytes) async {
+    const decoder = ComicArchiveFormatDecoder(
+      limits: FormatLimits(
+        maxInputBytes: 256 * 1024 * 1024,
+        maxExpandedBytes: 512 * 1024 * 1024,
+        maxEntryBytes: 64 * 1024 * 1024,
+        maxEntries: 5000,
+        maxPages: 5000,
+      ),
+    );
+    final archive = await decoder.decodeArchive(Stream<List<int>>.value(bytes));
+    return archive.pages.map((page) => page.bytes).toList(growable: false);
   }
 
   int _naturalCompare(String left, String right) {
@@ -374,7 +392,7 @@ class _OfflineComicReaderState extends State<_OfflineComicReader> {
       body: _error != null
           ? Center(
               child: Text(
-                'CBZ 打开失败：$_error',
+                '漫画打开失败：$_error',
                 style: const TextStyle(color: Colors.white),
               ),
             )

@@ -416,7 +416,7 @@ class _LocalContentHubScreenState extends State<LocalContentHubScreen> {
                           icon: Icons.auto_stories_outlined,
                           title: 'Kindle 与漫画',
                           description:
-                              'Kindle：未压缩 / PalmDOC\nCBR：RAR4/5 存储方式；CBT / CB7',
+                              'Kindle：未压缩 / PalmDOC / HUFF\nCBR：RAR4/5 压缩与存储；CBT / CB7',
                           actionLabel: '选择文件',
                           onPressed: _busy ? null : _importBook,
                         ),

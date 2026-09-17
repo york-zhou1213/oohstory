@@ -31,6 +31,8 @@ dependencies:
   cryptography: ^2.7.0
   connectivity_plus: ^6.1.4
   archive: ^4.0.7
+  koni_archive_core: ^0.9.0
+  koni_rar: ^0.9.0
   xml: ^6.5.0
   path: ^1.9.1
   pdfrx: ^2.1.5

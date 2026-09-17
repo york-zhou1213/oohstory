@@ -269,7 +269,7 @@ void main() {
       expect(book.pages.map((page) => page.bytes.length), <int>[100, 200]);
     });
 
-    test('accepts real stored RAR5 and rejects real compressed RAR5', () async {
+    test('accepts real stored and compressed RAR5', () async {
       final service = _service();
 
       final stored = await service.importBook(
@@ -278,21 +278,14 @@ void main() {
       expect(stored.pages.single.name, 'small.jpg');
       expect(stored.pages.single.bytes, isNotEmpty);
 
-      await expectLater(
-        service.importBook(
-          LocalPickedFile.fromBytes(
-            'compressed.cbr',
-            realRar5CompressedFixture(),
-          ),
-        ),
-        throwsA(
-          isA<LocalContentException>().having(
-            (error) => error.message,
-            'message',
-            allOf(contains('压缩 RAR'), contains('存储')),
-          ),
+      final compressed = await service.importBook(
+        LocalPickedFile.fromBytes(
+          'compressed.cbr',
+          realRar5CompressedFixture(),
         ),
       );
+      expect(compressed.pages.single.name, 'page.jpg');
+      expect(compressed.pages.single.bytes, isNotEmpty);
     });
 
     test('rejects JPEG before OCR and keeps the picker PNG-only', () async {

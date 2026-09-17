@@ -218,7 +218,9 @@ class LocalBookInfo {
 
   static String _safeStorageExtension(Object? raw) {
     final extension = raw?.toString().toLowerCase() ?? 'txt';
-    return const {'txt', 'pdf', 'cbz'}.contains(extension) ? extension : 'txt';
+    return const {'txt', 'pdf', 'cbz', 'cbr', 'cbt', 'cb7'}.contains(extension)
+        ? extension
+        : 'txt';
   }
 
   LocalBookInfo copyWith({
