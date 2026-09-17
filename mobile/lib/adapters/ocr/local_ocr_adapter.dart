@@ -12,7 +12,7 @@ class OcrImageLimits {
     this.maxEncodedBytes = 12 * 1024 * 1024,
     this.maxWidth = 8192,
     this.maxHeight = 8192,
-    this.maxPixels = 32 * 1024 * 1024,
+    this.maxPixels = 12 * 1024 * 1024,
     this.maxExpandedBytes = 48 * 1024 * 1024,
   });
 

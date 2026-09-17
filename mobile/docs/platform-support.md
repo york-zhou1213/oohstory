@@ -51,9 +51,14 @@ implementation and product identity.
   image/audio resources, entry links, sandboxed local styles, dictionary
   enable/order/remove controls, and checksum validation. Encrypted MDX remains
   explicitly unsupported. Web keeps the existing transient picker path instead
-  of claiming durable native-style file persistence. Portable OCR remains a
-  test/demo engine and is disabled in the production capability profile until a
-  native platform engine has release evidence.
+  of claiming durable native-style file persistence.
+- Production local OCR now uses bundled Google ML Kit on Android, Apple Vision
+  on iPhone/iPad and macOS, and Windows.Media.Ocr on Windows. These paths accept
+  bounded PNG/JPEG input and recognize Simplified Chinese plus English without
+  an upload. Android/iOS also expose camera capture. Windows requires the
+  relevant installed OS language pack. Linux is explicitly limited to the
+  bounded high-contrast English PNG engine; Web hides OCR and has no remote
+  fallback.
 - WebDAV/S3 now have a gated “存储与同步” client path with verified-before-save
   configuration, secure credential separation, directory browsing, bounded local
   opening, create-only upload, ETag delete, WebDAV 207 mapping, S3 addressing

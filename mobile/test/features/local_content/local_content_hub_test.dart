@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
@@ -217,6 +218,39 @@ void main() {
     await tester.pump();
   });
 
+  testWidgets('Android exposes a camera scan entry and renders local text', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    final service = LocalContentService(
+      ocrAdapter: LocalOcrAdapter.available(
+        engine: const _ImmediateEngine(),
+        platform: 'android',
+      ),
+    );
+    await tester.pumpWidget(
+      _app(
+        service: service,
+        cameraPicker: () async => LocalPickedFile.fromBytes(
+          'camera.jpg',
+          _pngHeader(width: 2, height: 2),
+        ),
+      ),
+    );
+
+    expect(find.text('从相册选择'), findsOneWidget);
+    await tester.ensureVisible(find.text('拍照扫描'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('拍照扫描'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('本地 OCR 结果'), findsOneWidget);
+    expect(find.text('中文 English'), findsOneWidget);
+    expect(find.textContaining('本地 OCR 完成'), findsOneWidget);
+    debugDefaultTargetPlatformOverride = null;
+  });
+
   testWidgets('reader controls expose semantic tap actions and 48px targets', (
     tester,
   ) async {
@@ -243,10 +277,17 @@ void main() {
 Widget _app({
   required LocalContentService service,
   LocalContentPicker picker = _cancelPicker,
+  OcrImagePicker cameraPicker = _cancelCameraPicker,
+  OcrImagePicker galleryPicker = _cancelCameraPicker,
 }) => MaterialApp(
   debugShowCheckedModeBanner: false,
   theme: AppTheme.light(),
-  home: LocalContentHubScreen(service: service, picker: picker),
+  home: LocalContentHubScreen(
+    service: service,
+    picker: picker,
+    cameraPicker: cameraPicker,
+    galleryPicker: galleryPicker,
+  ),
 );
 
 LocalContentService _unavailableService() => LocalContentService(
@@ -254,6 +295,7 @@ LocalContentService _unavailableService() => LocalContentService(
 );
 
 Future<LocalPickedFile?> _cancelPicker(List<String> _) async => null;
+Future<LocalPickedFile?> _cancelCameraPicker() async => null;
 
 class _FailingFilePicker extends FilePicker {
   _FailingFilePicker(this.error);
@@ -308,6 +350,20 @@ class _BlockingEngine implements LocalOcrEngine {
     await finish.future;
     return const OcrResult(text: 'late', confidence: 1);
   }
+}
+
+class _ImmediateEngine implements LocalOcrEngine {
+  const _ImmediateEngine();
+
+  @override
+  Set<String> get supportedLanguages => const <String>{'en', 'zh-Hans'};
+
+  @override
+  Future<OcrResult> recognize(
+    Uint8List ephemeralImageBytes, {
+    required OcrCancellationToken cancellation,
+    String? locale,
+  }) async => const OcrResult(text: '中文 English', confidence: .95);
 }
 
 Uint8List _pngHeader({required int width, required int height}) {

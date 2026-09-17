@@ -30,6 +30,10 @@
 	<false/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>用于连接您主动添加的局域网 OPDS 书库并下载离线书籍。</string>
+	<key>NSCameraUsageDescription</key>
+	<string>用于拍摄需要在设备上识别文字的图片，图片不会上传。</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>用于选择需要在设备上识别文字的图片，图片不会上传。</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

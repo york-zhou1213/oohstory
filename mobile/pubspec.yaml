@@ -26,6 +26,7 @@ dependencies:
   audio_service: ^0.18.17
   scrollable_positioned_list: ^0.3.8
   file_picker: ^8.3.7
+  image_picker: ^1.1.2
   flutter_secure_storage: ^9.2.4
   google_sign_in: ^6.2.2
   crypto: ^3.0.6

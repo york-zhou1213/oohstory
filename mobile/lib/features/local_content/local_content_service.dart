@@ -2,11 +2,13 @@ import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
+import 'package:image_picker/image_picker.dart';
 
 import '../../adapters/dictionary/mdx_dictionary_adapter.dart';
 import '../../adapters/formats/comic_archive_decoder.dart';
 import '../../adapters/formats/kindle_format_decoder.dart';
 import '../../adapters/ocr/local_ocr_adapter.dart';
+import '../../adapters/ocr/platform_ocr_engine.dart';
 import '../../core/errors.dart';
 import '../../core/models.dart';
 import '../../core/product_capabilities.dart';
@@ -121,6 +123,47 @@ Future<LocalPickedFile?> pickLocalContentFile({
   return LocalPickedFile(name: file.name, size: file.size, stream: stream);
 }
 
+bool get canCaptureOcrImage =>
+    !kIsWeb &&
+    const <TargetPlatform>{
+      TargetPlatform.android,
+      TargetPlatform.iOS,
+    }.contains(defaultTargetPlatform);
+
+Future<LocalPickedFile?> captureOcrImage() async {
+  return _pickMobileOcrImage(ImageSource.camera);
+}
+
+Future<LocalPickedFile?> pickOcrImageFromGallery() async {
+  return _pickMobileOcrImage(ImageSource.gallery);
+}
+
+Future<LocalPickedFile?> _pickMobileOcrImage(ImageSource source) async {
+  if (!canCaptureOcrImage) {
+    throw const LocalContentException('此平台不提供移动图片选择，请从本地选择图片');
+  }
+  try {
+    final file = await ImagePicker().pickImage(
+      source: source,
+      imageQuality: 95,
+      requestFullMetadata: false,
+    );
+    if (file == null) return null;
+    final size = await file.length();
+    return LocalPickedFile(
+      name: file.name,
+      size: size,
+      stream: file.openRead(),
+    );
+  } on LocalContentException {
+    rethrow;
+  } on Object {
+    throw LocalContentException(
+      source == ImageSource.camera ? '无法打开相机，请检查相机权限后重试' : '无法打开相册，请检查照片权限后重试',
+    );
+  }
+}
+
 class LocalDictionary {
   const LocalDictionary({required this.name, required this.adapter});
 
@@ -149,12 +192,24 @@ class LocalContentService {
 
   factory LocalContentService.forCurrentPlatform() {
     final platform = kIsWeb ? 'web' : defaultTargetPlatform.name.toLowerCase();
-    final supported =
-        ProductCapabilityProfile.production.localOcrEnabled &&
+    final nativePlatform =
         !kIsWeb &&
-        defaultTargetPlatform != TargetPlatform.fuchsia;
+        const <TargetPlatform>{
+          TargetPlatform.android,
+          TargetPlatform.iOS,
+          TargetPlatform.macOS,
+          TargetPlatform.windows,
+        }.contains(defaultTargetPlatform);
+    final portableLinux =
+        !kIsWeb && defaultTargetPlatform == TargetPlatform.linux;
+    final enabled = ProductCapabilityProfile.production.localOcrEnabled;
     return LocalContentService(
-      ocrAdapter: supported
+      ocrAdapter: enabled && nativePlatform
+          ? LocalOcrAdapter.available(
+              engine: PlatformOcrEngine(),
+              platform: platform,
+            )
+          : enabled && portableLinux
           ? LocalOcrAdapter.portable(platform: platform)
           : LocalOcrAdapter.unavailable(platform: platform),
     );
@@ -169,7 +224,7 @@ class LocalContentService {
     'cb7',
   ];
   static const dictionaryExtensions = <String>['mdx'];
-  static const imageExtensions = <String>['png'];
+  static const imageExtensions = <String>['png', 'jpg', 'jpeg'];
 
   static const _maxBookBytes = 64 * 1024 * 1024;
   static const _maxDictionaryBytes = 32 * 1024 * 1024;
@@ -181,6 +236,8 @@ class LocalContentService {
   final ComicPageExtractor comicPageExtractor;
 
   bool get isOcrAvailable => ocrAdapter.isAvailable;
+  bool get isOcrVisible =>
+      !kIsWeb && defaultTargetPlatform != TargetPlatform.fuchsia;
   List<String> get ocrLanguages => ocrAdapter.supportedLanguages;
 
   Future<LocalContentBook> importBook(LocalPickedFile file) async {
@@ -257,7 +314,11 @@ class LocalContentService {
     try {
       return ocrAdapter.start(
         imageBytes,
-        locale: ocrLanguages.contains('en') ? 'en' : null,
+        locale: ocrLanguages.contains('zh-Hans')
+            ? 'zh-Hans'
+            : ocrLanguages.contains('en')
+            ? 'en'
+            : null,
       );
     } on Object catch (error) {
       throw LocalContentException(_messageFor(error));
@@ -316,7 +377,7 @@ String _selectionMessageFor(List<String> extensions) {
     return '请选择本地 MDX 词典文件';
   }
   if (setEquals(allowed, LocalContentService.imageExtensions.toSet())) {
-    return '本地 OCR 仅支持 PNG 图片；JPEG 暂不支持';
+    return '本地 OCR 仅支持 PNG、JPG 或 JPEG 图片';
   }
   return '请选择 ${extensions.map((extension) => extension.toUpperCase()).join('、')} 文件';
 }

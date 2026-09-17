@@ -30,7 +30,10 @@ class ProductCapabilityProfile {
       'OOHSTORY_LOCAL_DICTIONARY_ENABLED',
       defaultValue: true,
     ),
-    localOcrEnabled: bool.fromEnvironment('OOHSTORY_LOCAL_OCR_ENABLED'),
+    localOcrEnabled: bool.fromEnvironment(
+      'OOHSTORY_LOCAL_OCR_ENABLED',
+      defaultValue: true,
+    ),
     accountProgressSyncEnabled: bool.fromEnvironment(
       'OOHSTORY_PROGRESS_SYNC_ENABLED',
     ),
@@ -103,7 +106,15 @@ class ProductCapabilityProfile {
         providerId: 'local-ocr-$platform',
         supported: const <AdapterCapability>[AdapterCapability.localOcr],
       ),
-      enabled: localOcrEnabled,
+      enabled:
+          localOcrEnabled &&
+          const <String>{
+            'android',
+            'ios',
+            'macos',
+            'windows',
+            'linux',
+          }.contains(platform.toLowerCase()),
     );
     registry.register(
       ProviderCapabilities(

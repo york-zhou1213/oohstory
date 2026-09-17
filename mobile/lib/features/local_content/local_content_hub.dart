@@ -10,20 +10,27 @@ import 'local_content_service.dart';
 
 typedef LocalContentPicker =
     Future<LocalPickedFile?> Function(List<String> extensions);
+typedef OcrImagePicker = Future<LocalPickedFile?> Function();
 
 Future<LocalPickedFile?> _defaultPicker(List<String> extensions) =>
     pickLocalContentFile(extensions: extensions);
+Future<LocalPickedFile?> _defaultCameraPicker() => captureOcrImage();
+Future<LocalPickedFile?> _defaultGalleryPicker() => pickOcrImageFromGallery();
 
 class LocalContentHubScreen extends StatefulWidget {
   const LocalContentHubScreen({
     super.key,
     this.service,
     this.picker = _defaultPicker,
+    this.cameraPicker = _defaultCameraPicker,
+    this.galleryPicker = _defaultGalleryPicker,
     this.initialBook,
   });
 
   final LocalContentService? service;
   final LocalContentPicker picker;
+  final OcrImagePicker cameraPicker;
+  final OcrImagePicker galleryPicker;
   final LocalContentBook? initialBook;
 
   @override
@@ -120,15 +127,25 @@ class _LocalContentHubScreenState extends State<LocalContentHubScreen> {
     }
   }
 
-  Future<void> _runOcr() async {
+  Future<void> _runOcr({bool camera = false, bool gallery = false}) async {
     if (_busy) return;
     if (!_service.isOcrAvailable) {
       _showError('此平台暂不支持本地 OCR，图片不会上传到远程服务');
       return;
     }
-    _setBusy('正在选择 OCR 图片…');
+    _setBusy(
+      camera
+          ? '正在打开相机…'
+          : gallery
+          ? '正在打开相册…'
+          : '正在选择 OCR 图片…',
+    );
     try {
-      final file = await widget.picker(LocalContentService.imageExtensions);
+      final file = camera
+          ? await widget.cameraPicker()
+          : gallery
+          ? await widget.galleryPicker()
+          : await widget.picker(LocalContentService.imageExtensions);
       if (file == null) {
         _clearBusy();
         return;
@@ -306,16 +323,17 @@ class _LocalContentHubScreenState extends State<LocalContentHubScreen> {
                   : Icons.menu_book_rounded,
             ),
           ),
-          IconButton(
-            constraints: const BoxConstraints.tightFor(width: 48, height: 48),
-            style: IconButton.styleFrom(
-              minimumSize: const Size.square(48),
-              fixedSize: const Size.square(48),
+          if (_service.isOcrVisible)
+            IconButton(
+              constraints: const BoxConstraints.tightFor(width: 48, height: 48),
+              style: IconButton.styleFrom(
+                minimumSize: const Size.square(48),
+                fixedSize: const Size.square(48),
+              ),
+              onPressed: _busy ? null : _runOcr,
+              tooltip: _service.isOcrAvailable ? '本地 OCR' : '本地 OCR 不可用',
+              icon: const Icon(Icons.document_scanner_outlined),
             ),
-            onPressed: _busy ? null : _runOcr,
-            tooltip: _service.isOcrAvailable ? '本地 OCR' : '本地 OCR 不可用',
-            icon: const Icon(Icons.document_scanner_outlined),
-          ),
           const SizedBox(width: 8),
         ],
       ),
@@ -391,7 +409,7 @@ class _LocalContentHubScreenState extends State<LocalContentHubScreen> {
                             ),
                             const SizedBox(height: 10),
                             Text(
-                              '打开无 DRM 的 Kindle 与漫画文件，挂载本地 MDX 词典，并用 PNG 图片离线识图。',
+                              '打开无 DRM 的 Kindle 与漫画文件，挂载本地 MDX 词典，并用图片离线识别中英文。',
                               style: theme.textTheme.bodyLarge?.copyWith(
                                 color: Colors.white.withValues(alpha: .82),
                               ),
@@ -430,23 +448,44 @@ class _LocalContentHubScreenState extends State<LocalContentHubScreen> {
                           actionLabel: _dictionary == null ? '挂载词典' : '更换词典',
                           onPressed: _busy ? null : _attachDictionary,
                         ),
-                        _CapabilityCard(
-                          width: wide ? 284 : constraints.maxWidth,
-                          icon: Icons.document_scanner_outlined,
-                          title: '可取消本地 OCR',
-                          description: _service.isOcrAvailable
-                              ? '仅 PNG；支持 ${_service.ocrLanguages.join('、')}；图片不上传'
-                              : '此平台不可用；没有远程回退',
-                          actionLabel: _service.isOcrAvailable
-                              ? '识别图片'
-                              : '当前不可用',
-                          onPressed: _busy || !_service.isOcrAvailable
-                              ? null
-                              : _runOcr,
-                        ),
+                        if (_service.isOcrVisible)
+                          _CapabilityCard(
+                            width: wide ? 284 : constraints.maxWidth,
+                            icon: Icons.document_scanner_outlined,
+                            title: '可取消本地 OCR',
+                            description: _service.isOcrAvailable
+                                ? _service.ocrLanguages.contains('zh-Hans')
+                                      ? 'PNG/JPEG；支持简体中文、英文；图片不上传'
+                                      : '仅 PNG；支持英文；图片不上传'
+                                : '此平台不可用；没有远程回退',
+                            actionLabel: _service.isOcrAvailable
+                                ? '识别图片'
+                                : '当前不可用',
+                            onPressed: _busy || !_service.isOcrAvailable
+                                ? null
+                                : _runOcr,
+                            secondaryActionLabel: canCaptureOcrImage
+                                ? '从相册选择'
+                                : null,
+                            onSecondaryPressed:
+                                _busy ||
+                                    !_service.isOcrAvailable ||
+                                    !canCaptureOcrImage
+                                ? null
+                                : () => _runOcr(gallery: true),
+                            tertiaryActionLabel: canCaptureOcrImage
+                                ? '拍照扫描'
+                                : null,
+                            onTertiaryPressed:
+                                _busy ||
+                                    !_service.isOcrAvailable ||
+                                    !canCaptureOcrImage
+                                ? null
+                                : () => _runOcr(camera: true),
+                          ),
                       ],
                     ),
-                    if (_ocrText != null) ...[
+                    if (_service.isOcrVisible && _ocrText != null) ...[
                       const SizedBox(height: 20),
                       _OcrResultCard(text: _ocrText!),
                     ],
@@ -648,6 +687,10 @@ class _CapabilityCard extends StatelessWidget {
     required this.description,
     required this.actionLabel,
     required this.onPressed,
+    this.secondaryActionLabel,
+    this.onSecondaryPressed,
+    this.tertiaryActionLabel,
+    this.onTertiaryPressed,
   });
 
   final double width;
@@ -656,6 +699,10 @@ class _CapabilityCard extends StatelessWidget {
   final String description;
   final String actionLabel;
   final VoidCallback? onPressed;
+  final String? secondaryActionLabel;
+  final VoidCallback? onSecondaryPressed;
+  final String? tertiaryActionLabel;
+  final VoidCallback? onTertiaryPressed;
 
   @override
   Widget build(BuildContext context) {
@@ -674,7 +721,28 @@ class _CapabilityCard extends StatelessWidget {
               const SizedBox(height: 7),
               Text(description, style: theme.textTheme.bodySmall),
               const SizedBox(height: 16),
-              OutlinedButton(onPressed: onPressed, child: Text(actionLabel)),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  OutlinedButton(
+                    onPressed: onPressed,
+                    child: Text(actionLabel),
+                  ),
+                  if (secondaryActionLabel != null)
+                    TextButton.icon(
+                      onPressed: onSecondaryPressed,
+                      icon: const Icon(Icons.photo_library_outlined),
+                      label: Text(secondaryActionLabel!),
+                    ),
+                  if (tertiaryActionLabel != null)
+                    TextButton.icon(
+                      onPressed: onTertiaryPressed,
+                      icon: const Icon(Icons.camera_alt_outlined),
+                      label: Text(tertiaryActionLabel!),
+                    ),
+                ],
+              ),
             ],
           ),
         ),

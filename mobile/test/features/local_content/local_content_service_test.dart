@@ -37,7 +37,11 @@ void main() {
     });
 
     test('pickers expose only truthful local formats', () {
-      expect(LocalContentService.imageExtensions, <String>['png']);
+      expect(LocalContentService.imageExtensions, <String>[
+        'png',
+        'jpg',
+        'jpeg',
+      ]);
       expect(
         LocalContentService.bookExtensions,
         containsAll(<String>['cbr', 'cb7']),
@@ -45,7 +49,7 @@ void main() {
     });
 
     test(
-      'Android uses a broad native route for books and MDX but keeps PNG filtered',
+      'Android uses a broad native route for books and MDX but filters OCR images',
       () async {
         debugDefaultTargetPlatformOverride = TargetPlatform.android;
         addTearDown(() => debugDefaultTargetPlatformOverride = null);
@@ -57,7 +61,7 @@ void main() {
           (
             LocalContentService.imageExtensions,
             FileType.custom,
-            <String>['png'],
+            <String>['png', 'jpg', 'jpeg'],
           ),
         ]) {
           final picker = _RecordingFilePicker();
@@ -288,21 +292,19 @@ void main() {
       expect(compressed.pages.single.bytes, isNotEmpty);
     });
 
-    test('rejects JPEG before OCR and keeps the picker PNG-only', () async {
+    test('accepts bounded JPEG input for native OCR', () async {
       final service = _service();
+      final bytes = await service.readOcrImage(
+        LocalPickedFile.fromBytes(
+          'scan.jpg',
+          _jpegHeader(width: 32, height: 24),
+        ),
+      );
 
-      expect(LocalContentService.imageExtensions, <String>['png']);
-      await expectLater(
-        service.readOcrImage(
-          LocalPickedFile.fromBytes('scan.jpg', const <int>[0xff, 0xd8, 0xff]),
-        ),
-        throwsA(
-          isA<LocalContentException>().having(
-            (error) => error.message,
-            'message',
-            allOf(contains('PNG'), contains('JPEG 暂不支持')),
-          ),
-        ),
+      expect(bytes, isNotEmpty);
+      expect(
+        LocalContentService.imageExtensions,
+        containsAll(<String>['jpg', 'jpeg']),
       );
     });
 
@@ -380,11 +382,13 @@ void main() {
       );
     });
 
-    test('production OCR stays disabled until release evidence enables it', () {
+    test('production OCR enables the documented Linux portable fallback', () {
+      debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
       final service = LocalContentService.forCurrentPlatform();
 
-      expect(service.isOcrAvailable, isFalse);
-      expect(service.ocrLanguages, isEmpty);
+      expect(service.isOcrAvailable, isTrue);
+      expect(service.ocrLanguages, <String>['en']);
     });
   });
 }
@@ -392,6 +396,26 @@ void main() {
 LocalContentService _service() => LocalContentService(
   ocrAdapter: LocalOcrAdapter.unavailable(platform: 'web'),
 );
+
+List<int> _jpegHeader({required int width, required int height}) => <int>[
+  0xff,
+  0xd8,
+  0xff,
+  0xc0,
+  0x00,
+  0x0b,
+  0x08,
+  (height >> 8) & 0xff,
+  height & 0xff,
+  (width >> 8) & 0xff,
+  width & 0xff,
+  0x01,
+  0x01,
+  0x11,
+  0x00,
+  0xff,
+  0xd9,
+];
 
 class _RecordingFilePicker extends FilePicker {
   _RecordingFilePicker({this.result, this.error});

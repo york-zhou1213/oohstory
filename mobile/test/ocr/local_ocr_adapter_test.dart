@@ -1,8 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
-
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:oohstory/adapters/ocr/ocr.dart';
 import 'package:oohstory/core/capabilities.dart';
@@ -10,6 +9,8 @@ import 'package:oohstory/core/errors.dart';
 import 'package:oohstory/core/models.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   group('LocalOcrAdapter', () {
     test('recognizes text from a real PNG golden locally', () async {
       final adapter = LocalOcrAdapter.portable(platform: 'Linux');
@@ -86,9 +87,9 @@ void main() {
     });
 
     test(
-      'timed cancellation interrupts real 4000x4000 bitmap OCR',
+      'timed cancellation interrupts real 3000x3000 bitmap OCR',
       () async {
-        final image = _largeGrayscalePng(width: 4000, height: 4000);
+        final image = _largeGrayscalePng(width: 3000, height: 3000);
         final adapter = LocalOcrAdapter.portable(platform: 'linux');
         final watch = Stopwatch()..start();
         final cancelIssued = Completer<Duration>();
@@ -203,6 +204,37 @@ void main() {
         expect(source, isNot(contains('remoteOcr')), reason: file.path);
       }
     });
+
+    test(
+      'platform engine sends bounded bytes in-process and reads Chinese',
+      () async {
+        const channel = MethodChannel('com.oohstory.oohstory/local_ocr');
+        final messenger =
+            TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+        messenger.setMockMethodCallHandler(channel, (call) async {
+          expect(call.method, 'recognize');
+          final arguments = call.arguments as Map<Object?, Object?>;
+          expect(arguments['locale'], 'zh-Hans');
+          expect(arguments['bytes'], isA<Uint8List>());
+          expect(arguments['requestId'], isA<String>());
+          return <String, Object?>{'text': '离线 OCR', 'confidence': 0.97};
+        });
+        addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+        final adapter = LocalOcrAdapter.available(
+          engine: PlatformOcrEngine(channel: channel),
+          platform: 'android',
+        );
+
+        final result = await adapter.recognize(
+          _png(width: 2, height: 2),
+          locale: 'zh-Hans',
+        );
+
+        expect(result.text, '离线 OCR');
+        expect(result.confidence, 0.97);
+        expect(adapter.supportedLanguages, <String>['en', 'zh-Hans']);
+      },
+    );
   });
 }
 

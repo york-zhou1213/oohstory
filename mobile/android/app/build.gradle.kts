@@ -78,3 +78,9 @@ android {
 flutter {
     source = "../.."
 }
+
+dependencies {
+    // Bundled on-device models: OCR never requires an image upload.
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
+}
