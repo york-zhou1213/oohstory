@@ -75,4 +75,7 @@ export NO_STRIP=1
 
 test -s "$artifact"
 chmod 0755 "$artifact"
-sha256sum "$artifact" >"$artifact.sha256"
+(
+  cd "$output_directory"
+  sha256sum "$(basename "$artifact")" >"$(basename "$artifact").sha256"
+)

@@ -94,4 +94,7 @@ rpm -qp --queryformat '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n' "$source_rpm" \
 mkdir -p "$output_directory"
 artifact="$output_directory/OOHStory-v${version}-Linux-x86_64.rpm"
 cp "$source_rpm" "$artifact"
-sha256sum "$artifact" >"$artifact.sha256"
+(
+  cd "$output_directory"
+  sha256sum "$(basename "$artifact")" >"$(basename "$artifact").sha256"
+)

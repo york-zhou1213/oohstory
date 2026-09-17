@@ -74,8 +74,11 @@ jobs:
             exit 1
           fi
           cp "$aab" "artifacts/OOHStory-v${version}-Android-unsigned.aab"
-          sha256sum artifacts/* > artifacts/SHA256SUMS
-          sha256sum --check artifacts/SHA256SUMS
+          (
+            cd artifacts
+            sha256sum -- *.apk *.aab > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
       - uses: actions/upload-artifact@v4
         with:
           name: OOHStory-v1.27.0+75-Android-unsigned
@@ -157,10 +160,13 @@ jobs:
           dpkg-deb --info "artifacts/OOHStory-v${version}-Linux-amd64.deb" >/dev/null
           rpm -qpi "artifacts/OOHStory-v${version}-Linux-x86_64.rpm" >/dev/null
           test -x "artifacts/OOHStory-v${version}-Linux-x86_64.AppImage"
-          find artifacts -maxdepth 1 -type f \
-            ! -name '*.sha256' ! -name SHA256SUMS -print0 \
-            | sort -z | xargs -0 sha256sum > artifacts/SHA256SUMS
-          sha256sum --check artifacts/SHA256SUMS
+          (
+            cd artifacts
+            find . -maxdepth 1 -type f \
+              ! -name '*.sha256' ! -name SHA256SUMS -printf '%f\0' \
+              | sort -z | xargs -0 sha256sum > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
       - uses: actions/upload-artifact@v4
         with:
           name: OOHStory-v1.27.0+75-Linux-x64

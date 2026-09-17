@@ -63,4 +63,7 @@ EOF
 mkdir -p "$output_directory"
 artifact="$output_directory/OOHStory-v${version}-Linux-${architecture}.deb"
 dpkg-deb --root-owner-group --build "$package_root" "$artifact"
-sha256sum "$artifact" >"$artifact.sha256"
+(
+  cd "$output_directory"
+  sha256sum "$(basename "$artifact")" >"$(basename "$artifact").sha256"
+)
