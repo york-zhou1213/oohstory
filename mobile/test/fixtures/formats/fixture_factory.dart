@@ -32,11 +32,230 @@ Uint8List kindleFixture({
   _write32Be(bytes, mobi + 12, 65001);
   _write32Be(bytes, mobi + 16, 42);
   _write32Be(bytes, mobi + 20, mobiVersion);
-  _write32Be(bytes, mobi + 84, titleOffset);
-  _write32Be(bytes, mobi + 88, titleBytes.length);
-  _write32Be(bytes, mobi + 168, 0xffffffff);
+  _write32Be(bytes, mobi + 68, titleOffset);
+  _write32Be(bytes, mobi + 72, titleBytes.length);
+  _write32Be(bytes, mobi + 152, 0xffffffff);
   bytes.setRange(record0Offset + titleOffset, record1Offset, titleBytes);
   bytes.setRange(record1Offset, bytes.length, bodyBytes);
+  return bytes;
+}
+
+Uint8List huffCdicKindleFixture({
+  String title = 'HUFF Fixture',
+  String body = '<p>HUFF chapter</p><p>Dictionary text.</p>',
+}) {
+  final titleBytes = utf8.encode(title);
+  final bodyBytes = utf8.encode(body);
+  if (bodyBytes.length > 256) {
+    throw ArgumentError.value(
+      body,
+      'body',
+      'fixture body must fit 256 symbols',
+    );
+  }
+
+  final huff = Uint8List(24 + 256 * 4 + 32 * 8);
+  _writeAscii(huff, 0, 'HUFF');
+  _write32Be(huff, 4, 24);
+  _write32Be(huff, 8, 24);
+  _write32Be(huff, 12, 24 + 256 * 4);
+  for (var index = 0; index < 256; index++) {
+    // Eight-bit terminal codes. Every prefix shares max code 255, so byte
+    // 255 maps to dictionary entry 0, byte 254 to entry 1, and so on.
+    _write32Be(huff, 24 + index * 4, (255 << 8) | 0x80 | 8);
+  }
+
+  const cdicHeaderLength = 16;
+  const dictionaryEntries = 256;
+  final offsets = <int>[];
+  var dataLength = dictionaryEntries * 2;
+  for (var index = 0; index < dictionaryEntries; index++) {
+    offsets.add(dataLength);
+    dataLength += 2 + (index < bodyBytes.length ? 1 : 0);
+  }
+  final cdic = Uint8List(cdicHeaderLength + dataLength);
+  _writeAscii(cdic, 0, 'CDIC');
+  _write32Be(cdic, 4, cdicHeaderLength);
+  _write32Be(cdic, 8, dictionaryEntries);
+  _write32Be(cdic, 12, 8);
+  for (var index = 0; index < dictionaryEntries; index++) {
+    _write16Be(cdic, cdicHeaderLength + index * 2, offsets[index]);
+    final phrase = cdicHeaderLength + offsets[index];
+    final length = index < bodyBytes.length ? 1 : 0;
+    _write16Be(cdic, phrase, 0x8000 | length);
+    if (length == 1) cdic[phrase + 2] = bodyBytes[index];
+  }
+
+  final compressed = Uint8List.fromList(
+    List<int>.generate(bodyBytes.length, (index) => 255 - index),
+  );
+  const record0Offset = 112;
+  const titleOffset = 280;
+  final record0Length = titleOffset + titleBytes.length;
+  final record1Offset = record0Offset + record0Length;
+  final record2Offset = record1Offset + compressed.length;
+  final record3Offset = record2Offset + huff.length;
+  final bytes = Uint8List(record3Offset + cdic.length);
+  _writeAscii(bytes, 0, 'HUFF Fixture');
+  _writeAscii(bytes, 60, 'BOOKMOBI');
+  _write16Be(bytes, 76, 4);
+  for (final item in <(int, int)>[
+    (0, record0Offset),
+    (1, record1Offset),
+    (2, record2Offset),
+    (3, record3Offset),
+  ]) {
+    _write32Be(bytes, 78 + item.$1 * 8, item.$2);
+  }
+  _write16Be(bytes, record0Offset, 17480);
+  _write32Be(bytes, record0Offset + 4, bodyBytes.length);
+  _write16Be(bytes, record0Offset + 8, 1);
+  _write16Be(bytes, record0Offset + 10, 4096);
+  final mobi = record0Offset + 16;
+  _writeAscii(bytes, mobi, 'MOBI');
+  _write32Be(bytes, mobi + 4, 228);
+  _write32Be(bytes, mobi + 8, 2);
+  _write32Be(bytes, mobi + 12, 65001);
+  _write32Be(bytes, mobi + 16, 17480);
+  _write32Be(bytes, mobi + 20, 6);
+  _write32Be(bytes, mobi + 68, titleOffset);
+  _write32Be(bytes, mobi + 72, titleBytes.length);
+  _write32Be(bytes, mobi + 96, 2);
+  _write32Be(bytes, mobi + 100, 2);
+  _write32Be(bytes, mobi + 152, 0xffffffff);
+  bytes.setRange(record0Offset + titleOffset, record1Offset, titleBytes);
+  bytes.setRange(record1Offset, record2Offset, compressed);
+  bytes.setRange(record2Offset, record3Offset, huff);
+  bytes.setRange(record3Offset, bytes.length, cdic);
+  return bytes;
+}
+
+Uint8List indexedKf8KindleFixture({
+  String title = 'Indexed KF8 Fixture',
+  String text = 'Reconstructed KF8 text.',
+}) {
+  final titleBytes = utf8.encode(title);
+  final fragment = utf8.encode(text);
+  final prefix = utf8.encode('<html><body><p>');
+  final suffix = utf8.encode('</p></body></html>');
+  final skeleton = Uint8List.fromList(<int>[...prefix, ...suffix]);
+  final raw = Uint8List.fromList(<int>[...skeleton, ...fragment]);
+
+  final skeletonRoot = _kf8IndexRoot(const <List<int>>[
+    <int>[1, 1, 1, 0],
+    <int>[6, 2, 2, 0],
+  ]);
+  final skeletonEntry = _kf8IndexEntry('', <int>[
+    3,
+    0x81,
+    0x80,
+    0x80 | skeleton.length,
+  ]);
+  final fragmentRoot = _kf8IndexRoot(const <List<int>>[
+    <int>[4, 1, 1, 0],
+    <int>[6, 2, 2, 0],
+  ]);
+  final fragmentEntry = _kf8IndexEntry(prefix.length.toString(), <int>[
+    3,
+    0x80,
+    0x80,
+    0x80 | fragment.length,
+  ]);
+
+  const record0Offset = 128;
+  const titleOffset = 300;
+  final records = <Uint8List>[
+    Uint8List(titleOffset + titleBytes.length),
+    raw,
+    skeletonRoot,
+    skeletonEntry,
+    fragmentRoot,
+    fragmentEntry,
+  ];
+  final offsets = <int>[];
+  var cursor = record0Offset;
+  for (final record in records) {
+    offsets.add(cursor);
+    cursor += record.length;
+  }
+  final bytes = Uint8List(cursor);
+  _writeAscii(bytes, 0, 'KF8 Fixture');
+  _writeAscii(bytes, 60, 'BOOKMOBI');
+  _write16Be(bytes, 76, records.length);
+  for (var index = 0; index < offsets.length; index++) {
+    _write32Be(bytes, 78 + index * 8, offsets[index]);
+  }
+
+  final record0 = records.first;
+  _write16Be(record0, 0, 1);
+  _write32Be(record0, 4, raw.length);
+  _write16Be(record0, 8, 1);
+  _write16Be(record0, 10, 4096);
+  const mobi = 16;
+  _writeAscii(record0, mobi, 'MOBI');
+  _write32Be(record0, mobi + 4, 264);
+  _write32Be(record0, mobi + 8, 2);
+  _write32Be(record0, mobi + 12, 65001);
+  _write32Be(record0, mobi + 16, 8080);
+  _write32Be(record0, mobi + 20, 8);
+  _write32Be(record0, mobi + 68, titleOffset);
+  _write32Be(record0, mobi + 72, titleBytes.length);
+  _write32Be(record0, mobi + 152, 0xffffffff);
+  _write32Be(record0, mobi + 176, 0xffffffff);
+  _write32Be(record0, mobi + 232, 4);
+  _write32Be(record0, mobi + 236, 2);
+  record0.setRange(titleOffset, titleOffset + titleBytes.length, titleBytes);
+  for (var index = 0; index < records.length; index++) {
+    bytes.setRange(
+      offsets[index],
+      offsets[index] + records[index].length,
+      records[index],
+    );
+  }
+  return bytes;
+}
+
+Uint8List _kf8IndexRoot(List<List<int>> definitions) {
+  const headerLength = 56;
+  final tagxLength = 12 + definitions.length * 4;
+  final bytes = Uint8List(headerLength + tagxLength);
+  _writeAscii(bytes, 0, 'INDX');
+  _write32Be(bytes, 4, headerLength);
+  _write32Be(bytes, 20, headerLength + tagxLength);
+  _write32Be(bytes, 24, 1);
+  _write32Be(bytes, 28, 65001);
+  _writeAscii(bytes, headerLength, 'TAGX');
+  _write32Be(bytes, headerLength + 4, tagxLength);
+  _write32Be(bytes, headerLength + 8, 1);
+  var cursor = headerLength + 12;
+  for (final definition in definitions) {
+    bytes.setRange(cursor, cursor + 4, definition);
+    cursor += 4;
+  }
+  return bytes;
+}
+
+Uint8List _kf8IndexEntry(String name, List<int> payload) {
+  const headerLength = 56;
+  final nameBytes = utf8.encode(name);
+  final entryOffset = headerLength;
+  final entryLength = 1 + nameBytes.length + payload.length;
+  final idxtOffset = entryOffset + entryLength;
+  final bytes = Uint8List(idxtOffset + 6);
+  _writeAscii(bytes, 0, 'INDX');
+  _write32Be(bytes, 4, headerLength);
+  _write32Be(bytes, 20, idxtOffset);
+  _write32Be(bytes, 24, 1);
+  _write32Be(bytes, 28, 65001);
+  bytes[entryOffset] = nameBytes.length;
+  bytes.setRange(
+    entryOffset + 1,
+    entryOffset + 1 + nameBytes.length,
+    nameBytes,
+  );
+  bytes.setRange(entryOffset + 1 + nameBytes.length, idxtOffset, payload);
+  _writeAscii(bytes, idxtOffset, 'IDXT');
+  _write16Be(bytes, idxtOffset + 4, entryOffset);
   return bytes;
 }
 

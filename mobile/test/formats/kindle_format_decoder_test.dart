@@ -47,6 +47,47 @@ void main() {
     expect(document.sections, isNotEmpty);
   });
 
+  test('decompresses HUFF/CDIC text records', () async {
+    final result = await decoder.decodeBook(
+      Stream<List<int>>.value(huffCdicKindleFixture()),
+    );
+
+    expect(result.metadata.title, 'HUFF Fixture');
+    expect(result.metadata.format, 'mobi');
+    expect(result.document.sections, <String>[
+      'HUFF chapter',
+      'Dictionary text.',
+    ]);
+  });
+
+  test('reconstructs indexed KF8 skeletons and fragments', () async {
+    final result = await decoder.decodeBook(
+      Stream<List<int>>.value(indexedKf8KindleFixture()),
+    );
+
+    expect(result.metadata.title, 'Indexed KF8 Fixture');
+    expect(result.metadata.format, 'azw3');
+    expect(result.document.sections, <String>['Reconstructed KF8 text.']);
+  });
+
+  test('rejects corrupt HUFF/CDIC tables as malformed input', () async {
+    final fixture = huffCdicKindleFixture();
+    final huffOffset = _findHuffRecord(fixture);
+    expect(huffOffset, isNonNegative);
+    fixture[huffOffset] = 0;
+
+    await expectLater(
+      decoder.decode(Stream<List<int>>.value(fixture)),
+      throwsA(
+        isA<CoreException>().having(
+          (error) => error.code,
+          'code',
+          CoreErrorCode.validationError,
+        ),
+      ),
+    );
+  });
+
   test('rejects encrypted Kindle content with unsupported error', () async {
     await expectLater(
       decoder.decode(Stream<List<int>>.value(kindleFixture(encryptionType: 1))),
@@ -92,4 +133,36 @@ void main() {
       );
     }
   });
+}
+
+int _findAscii(List<int> bytes, String value, {int start = 0}) {
+  final pattern = value.codeUnits;
+  for (var offset = start; offset + pattern.length <= bytes.length; offset++) {
+    var matches = true;
+    for (var index = 0; index < pattern.length; index++) {
+      if (bytes[offset + index] != pattern[index]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return offset;
+  }
+  return -1;
+}
+
+int _findHuffRecord(List<int> bytes) {
+  var start = 68;
+  while (start < bytes.length) {
+    final offset = _findAscii(bytes, 'HUFF', start: start);
+    if (offset < 0) return -1;
+    if (offset + 8 <= bytes.length &&
+        bytes[offset + 4] == 0 &&
+        bytes[offset + 5] == 0 &&
+        bytes[offset + 6] == 0 &&
+        bytes[offset + 7] == 24) {
+      return offset;
+    }
+    start = offset + 4;
+  }
+  return -1;
 }

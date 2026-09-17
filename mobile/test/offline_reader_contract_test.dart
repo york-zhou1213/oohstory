@@ -10,6 +10,9 @@ import 'package:oohstory/services/local_storage_service.dart';
 import 'package:oohstory/services/offline_book_parser.dart';
 import 'package:oohstory/services/opds_catalog_service.dart';
 import 'package:oohstory/utils/reader_pagination.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'fixtures/formats/fixture_factory.dart';
 
 void main() {
   test('reader modes have stable persisted values', () {
@@ -121,6 +124,45 @@ void main() {
     expect(parsedEpub.title, 'EPUB 书');
     expect(parsedEpub.author, '作者乙');
     expect(parsedEpub.content, contains('EPUB 正文'));
+  });
+
+  test('Kindle imports persist in the formal offline bookshelf', () async {
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final temp = await Directory.systemTemp.createTemp('oohstory-kindle-');
+    addTearDown(() => temp.delete(recursive: true));
+    final source = File('${temp.path}/dictionary.mobi')
+      ..writeAsBytesSync(huffCdicKindleFixture());
+    final storage = LocalStorageService(
+      documentsDirectory: () async => temp,
+      temporaryDirectory: () async => temp,
+    );
+    await storage.init();
+
+    final imported = await storage.importLocalBook(
+      source.path,
+      'dictionary.mobi',
+    );
+    expect(imported.title, 'HUFF Fixture');
+    expect(imported.format, 'mobi');
+    expect(imported.storageExtension, 'txt');
+    expect(
+      await storage.getLocalBookContent(imported.id),
+      contains('Dictionary text.'),
+    );
+
+    storage.updateLocalBookProgress(imported.id, .42);
+    final reopened = LocalStorageService(
+      documentsDirectory: () async => temp,
+      temporaryDirectory: () async => temp,
+    );
+    await reopened.init();
+    final persisted = reopened.getLocalBooks().single;
+    expect(persisted.id, imported.id);
+    expect(persisted.progress, .42);
+    expect(
+      await reopened.getLocalBookContent(imported.id),
+      contains('HUFF chapter'),
+    );
   });
 
   test(

@@ -6,6 +6,9 @@ import 'package:archive/archive.dart';
 import 'package:path/path.dart' as path;
 import 'package:xml/xml.dart';
 
+import '../adapters/formats/format_limits.dart';
+import '../adapters/formats/kindle_format_decoder.dart';
+
 class ParsedOfflineBook {
   final String title;
   final String author;
@@ -44,6 +47,9 @@ class OfflineBookParser {
     'epub',
     'pdf',
     'cbz',
+    'mobi',
+    'azw',
+    'azw3',
   };
 
   static const _maxSourceBytes = 256 * 1024 * 1024;
@@ -70,6 +76,7 @@ class OfflineBookParser {
     return switch (extension) {
       'pdf' => _parsePdf(bytes, fallbackTitle, size),
       'cbz' => _parseCbz(bytes, fallbackTitle, size),
+      'mobi' || 'azw' || 'azw3' => await _parseKindle(bytes, size),
       'epub' => _parseEpub(bytes, fallbackTitle, size),
       'docx' => _parseDocx(bytes, fallbackTitle, size),
       'fb2' => _parseFb2(_decodeText(bytes), fallbackTitle, size),
@@ -95,6 +102,23 @@ class OfflineBookParser {
         sourceSize: size,
       ),
     };
+  }
+
+  Future<ParsedOfflineBook> _parseKindle(Uint8List bytes, int size) async {
+    const decoder = KindleFormatDecoder(
+      limits: FormatLimits(
+        maxInputBytes: _maxSourceBytes,
+        maxExpandedBytes: _maxExpandedBytes,
+      ),
+    );
+    final decoded = await decoder.decodeBook(Stream<List<int>>.value(bytes));
+    return ParsedOfflineBook(
+      title: decoded.metadata.title,
+      author: decoded.metadata.author,
+      format: decoded.metadata.format,
+      content: decoded.document.sections.join('\n\n'),
+      sourceSize: size,
+    );
   }
 
   ParsedOfflineBook _parsePdf(Uint8List bytes, String fallbackTitle, int size) {

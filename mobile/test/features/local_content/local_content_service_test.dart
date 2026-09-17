@@ -154,28 +154,18 @@ void main() {
       expect(book.sections, <String>['Chapter 1', 'Hello reader.']);
     });
 
-    test(
-      'rejects HUFF/CDIC Kindle compression with the narrowed contract',
-      () async {
-        final service = _service();
+    test('imports and renders HUFF/CDIC Kindle compression', () async {
+      final service = _service();
 
-        await expectLater(
-          service.importBook(
-            LocalPickedFile.fromBytes(
-              'huff.mobi',
-              kindleFixture(compression: 17480),
-            ),
-          ),
-          throwsA(
-            isA<LocalContentException>().having(
-              (error) => error.message,
-              'message',
-              allOf(contains('HUFF/CDIC'), contains('PalmDOC')),
-            ),
-          ),
-        );
-      },
-    );
+      final book = await service.importBook(
+        LocalPickedFile.fromBytes('huff.mobi', huffCdicKindleFixture()),
+      );
+
+      expect(book.kind, LocalContentKind.text);
+      expect(book.title, 'HUFF Fixture');
+      expect(book.format, 'MOBI');
+      expect(book.sections, <String>['HUFF chapter', 'Dictionary text.']);
+    });
 
     test(
       'rejects DRM, malformed input and oversized streams clearly',
